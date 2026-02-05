@@ -59,6 +59,11 @@ class Workload : Callable {
     Wait_For_Sim_Finish,
     Forward_In_BackPass
   };
+  enum class PPSchedule {
+    GPipe,
+    OneFOneB
+  };
+  static void SetDefaultPPScheduleByString(const std::string& schedule);
   ~Workload();
   Layer** layers;
   int SIZE;
@@ -97,6 +102,8 @@ class Workload : Callable {
   int MicroBatches;
   int fwd_mb; //当前处理的fwd/bwd的microbatch_id
   int bwd_mb;
+  PPSchedule pp_schedule;
+  static PPSchedule s_default_pp_schedule;
 
   ParallelismPolicy parallelismPolicy;
   Tick waiting_for_comm;
