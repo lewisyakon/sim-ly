@@ -132,8 +132,8 @@ void sendflowclient::HandleRead(Ptr<Socket> socket)
                 m_recvHash.erase({tag,{src,dst}});
                 m_recvfunctable.erase({tag,{src,dst}});
                 m_request.erase({tag,{src,dst}});
-                NS_LOG_INFO("{tag,src,dst}= " << tag<<"  "<<src<<" "<<dst 
-                  << " 接收完成; TIME= "<<Simulator::Now().GetFemtoSeconds());
+                // NS_LOG_INFO("{tag,src,dst}= " << tag<<"  "<<src<<" "<<dst 
+                //   << " 接收完成; TIME= "<<Simulator::Now().GetFemtoSeconds());
               }
               // NS_LOG_INFO("flowid= " << flowid << " 接收完成 ");
               
@@ -162,8 +162,8 @@ void sendflowclient::HandleRead(Ptr<Socket> socket)
                   fuc_and_par fp = m_sendfunctable[{tag,{src,dst}}];
                   fp.msg_handler(fp.fun_arg); 
                   m_sendfunctable.erase({tag,{src,dst}});
-                  NS_LOG_INFO("{tag,src,dst}= " << tag<<"  "<<src<<" "<<dst 
-                    << " 发送完成; TIME= "<<Simulator::Now().GetFemtoSeconds());
+                  // NS_LOG_INFO("{tag,src,dst}= " << tag<<"  "<<src<<" "<<dst 
+                  //   << " 发送完成; TIME= "<<Simulator::Now().GetFemtoSeconds());
               } else {
                   NS_LOG_WARN("{tag,src,dst}= " << tag<<"  "<<src<<" "<<dst <<": (Sender) Callback not found for flowid.");
               }

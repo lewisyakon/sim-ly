@@ -9,6 +9,7 @@ LICENSE file in the root directory of this source tree.
 #include "astra-sim/system/MockNcclLog.h"
 #include "astra-sim/system/AstraNetworkAPI.hh"
 #include "astra-sim/system/RecvPacketEventHadndlerData.hh"
+#include <cctype>
 
 // ===== PP forward token (p2p) =====
 namespace {
@@ -157,6 +158,20 @@ static inline void send_pp_bwd_token_to_prev(AstraSim::Workload* wl, int token_i
 }
 
 namespace AstraSim {
+Workload::PPSchedule Workload::s_default_pp_schedule = Workload::PPSchedule::GPipe;
+
+void Workload::SetDefaultPPScheduleByString(const std::string& schedule) {
+  std::string s = schedule;
+  for (char& c : s) {
+    c = (char)std::tolower((unsigned char)c);
+  }
+  if (s == "1f1b" || s == "onefoneb") {
+    s_default_pp_schedule = PPSchedule::OneFOneB;
+  } else {
+    s_default_pp_schedule = PPSchedule::GPipe;
+  }
+}
+
 Workload::~Workload() {
   if (end_to_end != nullptr) {
     delete end_to_end;
@@ -206,6 +221,7 @@ Workload::Workload(
   this->dp_rank = 0;
   this->stage_start_layer = 0;
   this->stage_end_layer = -1;
+  this->pp_schedule = s_default_pp_schedule;
 
   end_to_end = nullptr;
   detailed = nullptr;
@@ -991,41 +1007,96 @@ void Workload::iterate_hybrid_parallel_Transformer_fwd_in_bckwd() {
     delay_loaded = false;
     collective_issued = false;
     if (index >= SIZE) {
-      // ===== 这里代表：本 stage 的一次 forward pass 已完成（最后一层 forward comm 也完成了）=====
-      // 用 pass_counter * MicroBatches + fwd_mb 作为 token_id（按“pass”级别触发下一 stage forward）
-      if(pp_size > 1 && pp_rank < pp_size-1){
-        send_pp_fwd_token_to_next(this, pass_counter * MicroBatches + fwd_mb);        
-      }
-      fwd_mb++;//推进下一个microbatch
+      if (pp_schedule == PPSchedule::OneFOneB) {
+        if (pp_size > 1 && pp_rank < pp_size - 1) {
+          send_pp_fwd_token_to_next(this, pass_counter * MicroBatches + fwd_mb);
+        }
+        fwd_mb++;
 
-      if(fwd_mb < MicroBatches){//fwd还没推进完
-        index = 0;
+        const int warmup_mbs = std::min(MicroBatches, std::max(0, pp_size - pp_rank - 1));
+        const bool can_start_bwd = (bwd_mb < MicroBatches) && (bwd_mb < (fwd_mb - warmup_mbs));
+        const bool has_more_fwd = (fwd_mb < MicroBatches);
+
+        // 1F1B: warmup 结束后，优先转入一个 backward；否则继续 forward。
+        if (can_start_bwd) {
+          index = SIZE - 1;
+          delay_loaded = false;
+          collective_issued = false;
+          checkpoint_initiated = false;
+          current_state = LoopState::Input_Gradient;
+
+          if (pp_size > 1 && pp_rank < pp_size - 1) {
+            post_pp_bwd_recv(this, pass_counter * MicroBatches + bwd_mb);
+            return;
+          }
+          generator->register_event(this, EventType::General, NULL, 1);
+          return;
+        }
+
+        if (has_more_fwd) {
+          index = 0;
+          delay_loaded = false;
+          collective_issued = false;
+          checkpoint_initiated = false;
+          current_state = LoopState::Forward_Pass;
+
+          if (pp_size > 1 && pp_rank > 0) {
+            post_pp_fwd_recv(this, pass_counter * MicroBatches + fwd_mb);
+            return;
+          }
+          generator->register_event(this, EventType::General, NULL, 1);
+          return;
+        }
+
+        // forward 已全部发完，进入 backward drain。
+        index = SIZE - 1;
         delay_loaded = false;
         collective_issued = false;
         checkpoint_initiated = false;
-        
-        if(pp_size > 1 && pp_rank > 0){
-          post_pp_fwd_recv(this, pass_counter * MicroBatches + fwd_mb);
-          return ;
+        current_state = LoopState::Input_Gradient;
+
+        if (pp_size > 1 && pp_rank < pp_size - 1) {
+          post_pp_bwd_recv(this, pass_counter * MicroBatches + bwd_mb);
+          return;
         }
         generator->register_event(this, EventType::General, NULL, 1);
-        return ;
-      }
-      
-      bwd_mb = MicroBatches - 1;//进入bwd状态
-      index = SIZE - 1;
-      delay_loaded = false;
-      collective_issued = false;
-      checkpoint_initiated = false;
-      current_state = LoopState::Input_Gradient;
-      
-      if(pp_size > 1 && pp_rank < pp_size - 1){//只有最后一个stage可以直接开始bwd
-        post_pp_bwd_recv(this, pass_counter * MicroBatches + bwd_mb);
-        return ;
-      }
-      generator->register_event(this, EventType::General, NULL, 1);
-      return ;
+        return;
+      } else {
+        // GPipe: 先完成所有 forward micro-batch，再开始 backward drain
+        if (pp_size > 1 && pp_rank < pp_size - 1) {
+          send_pp_fwd_token_to_next(this, pass_counter * MicroBatches + fwd_mb);
+        }
+        fwd_mb++;
 
+        if (fwd_mb < MicroBatches) {
+          index = 0;
+          delay_loaded = false;
+          collective_issued = false;
+          checkpoint_initiated = false;
+          current_state = LoopState::Forward_Pass;
+
+          if (pp_size > 1 && pp_rank > 0) {
+            post_pp_fwd_recv(this, pass_counter * MicroBatches + fwd_mb);
+            return;
+          }
+          generator->register_event(this, EventType::General, NULL, 1);
+          return;
+        }
+
+        bwd_mb = MicroBatches - 1;
+        index = SIZE - 1;
+        delay_loaded = false;
+        collective_issued = false;
+        checkpoint_initiated = false;
+        current_state = LoopState::Input_Gradient;
+
+        if (pp_size > 1 && pp_rank < pp_size - 1) {
+          post_pp_bwd_recv(this, pass_counter * MicroBatches + bwd_mb);
+          return;
+        }
+        generator->register_event(this, EventType::General, NULL, 1);
+        return;
+      }
     }
     // NcclLog->writeLog(NcclLogLevel::DEBUG,"workload::call fwd_pass register_event EventType::General ");
     generator->register_event(this, EventType::General, NULL, 1);
@@ -1055,24 +1126,58 @@ void Workload::iterate_hybrid_parallel_Transformer_fwd_in_bckwd() {
     }
     if (index == -1) {
       
-      if(pp_size > 1 && pp_rank > 0){
-       send_pp_bwd_token_to_prev(this, pass_counter * MicroBatches + bwd_mb);
-      }
+      if (pp_schedule == PPSchedule::OneFOneB) {
+        if (pp_size > 1 && pp_rank > 0) {
+          send_pp_bwd_token_to_prev(this, pass_counter * MicroBatches + bwd_mb);
+        }
+        bwd_mb++;
 
-      if(bwd_mb > 0){
-        bwd_mb--;
-        index = SIZE - 1;
-        delay_loaded = false;
-        collective_issued = false;
-        checkpoint_initiated = false;
-        current_state = LoopState::Input_Gradient;
-        
-        if(pp_size > 1 && pp_rank < pp_size - 1){
-          post_pp_bwd_recv(this, pass_counter * MicroBatches + bwd_mb);
+        if (bwd_mb < MicroBatches) {
+          const bool has_more_fwd = (fwd_mb < MicroBatches);
+          delay_loaded = false;
+          collective_issued = false;
+          checkpoint_initiated = false;
+
+          if (has_more_fwd) {
+            index = 0;
+            current_state = LoopState::Forward_Pass;
+            if (pp_size > 1 && pp_rank > 0) {
+              post_pp_fwd_recv(this, pass_counter * MicroBatches + fwd_mb);
+              return;
+            }
+            generator->register_event(this, EventType::General, NULL, 1);
+            return;
+          }
+
+          index = SIZE - 1;
+          current_state = LoopState::Input_Gradient;
+          if (pp_size > 1 && pp_rank < pp_size - 1) {
+            post_pp_bwd_recv(this, pass_counter * MicroBatches + bwd_mb);
+            return;
+          }
+          generator->register_event(this, EventType::General, NULL, 1);
+          return;
+        }
+      } else {
+        if(pp_size > 1 && pp_rank > 0){
+         send_pp_bwd_token_to_prev(this, pass_counter * MicroBatches + bwd_mb);
+        }
+
+        if(bwd_mb > 0){
+          bwd_mb--;
+          index = SIZE - 1;
+          delay_loaded = false;
+          collective_issued = false;
+          checkpoint_initiated = false;
+          current_state = LoopState::Input_Gradient;
+          
+          if(pp_size > 1 && pp_rank < pp_size - 1){
+            post_pp_bwd_recv(this, pass_counter * MicroBatches + bwd_mb);
+            return ;
+          }
+          generator->register_event(this, EventType::General, NULL, 1);
           return ;
         }
-        generator->register_event(this, EventType::General, NULL, 1);
-        return ;
       }
 
        // ===== 本 pass 的所有 micro-batch backward 完成，pass 结束 =====
@@ -1083,7 +1188,7 @@ void Workload::iterate_hybrid_parallel_Transformer_fwd_in_bckwd() {
 
       pass_counter++;
       fwd_mb = 0;
-      bwd_mb = MicroBatches - 1;
+      bwd_mb = (pp_schedule == PPSchedule::OneFOneB) ? 0 : (MicroBatches - 1);
       index = 0;
       delay_loaded = false;
       collective_issued = false;
@@ -1505,6 +1610,9 @@ bool Workload::initialize_workload(std::string name) {
   pp_commsize /= GA;
   if (generator->id == 0) {
       std::cout <<"pp_commize:"<< pp_commsize << std::endl;
+      std::cout << "pp_schedule:" 
+                << (pp_schedule == PPSchedule::OneFOneB ? "1f1b" : "gpipe")
+                << std::endl;
   }
   if(generator->id == 0){
     if (model_parallel_npu_group == 0 || expert_parallel_npu_group == 0 || pipeline_model_parallelism == 0 
@@ -1523,7 +1631,7 @@ bool Workload::initialize_workload(std::string name) {
   // ===== PP stage -> local layer range (balanced partition, no empty stage when pp_size <= lines) =====
   MicroBatches = GA;
   fwd_mb = 0;
-  bwd_mb = MicroBatches-1;
+  bwd_mb = (pp_schedule == PPSchedule::OneFOneB) ? 0 : (MicroBatches - 1);
 
   global_layers = lines;
   tp_size = (model_parallel_npu_group <= 0) ? 1 : model_parallel_npu_group;
