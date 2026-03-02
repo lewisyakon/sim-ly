@@ -1,5 +1,5 @@
 {
-  "workloadpath": "simworkload/microAllReduce.txt",
+  "workloadpath": "simworkload/bigworkload.txt",
   "thread": 1,
   "gpu_type": "A100",                
   "gpus_per_server": 4,
@@ -24,9 +24,9 @@
 
   "topology": {
     "model": "fattree",
-    "k": 4,
-    "subnet_model": 1,              
-    "subnet_k": 4,                             
+    "k": 8,
+    "subnet_model": 2,              
+    "subnet_k": 8,                             
     "hostperleaf": 2,                            
     "switch_delay_ns_override": 100 
   }
