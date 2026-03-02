@@ -422,7 +422,7 @@ void Workload::iterate_micro_benchmark() {
   if (current_state != LoopState::Wait_For_Sim_Finish) {
     for (pass_counter = 0; pass_counter < TOTAL_PASS; pass_counter++) {
       layers[index]->issue_weight_grad_comm(
-          SchedulingPolicy::None, CollectiveBarrier::Non_Blocking);
+          SchedulingPolicy::None, CollectiveBarrier::Blocking);
     }
   }
   check_for_sim_end();
@@ -464,7 +464,7 @@ void Workload::iterate_data_parallel() {
     }
     delay_loaded = false;
     layers[index]->issue_weight_grad_comm(
-        SchedulingPolicy::None, CollectiveBarrier::Non_Blocking);
+        SchedulingPolicy::None, CollectiveBarrier::Blocking);
     if (index == 0) {
       if (generator->id == 0) {
         std::cout << "pass: " << pass_counter
@@ -539,7 +539,7 @@ void Workload::iterate_hybrid_parallel_customized() {
     if (!collective_issued) {
       collective_issued = true;
       layers[index]->issue_weight_grad_comm(
-          SchedulingPolicy::FIFO, CollectiveBarrier::Non_Blocking);
+          SchedulingPolicy::FIFO, CollectiveBarrier::Blocking);
     }
     if (!layers[index]->is_input_grad_comm_finished_blocking()) {
       return;
@@ -575,7 +575,7 @@ void Workload::iterate_hybrid_parallel_customized() {
     if (!collective_issued && index > 0) {
       collective_issued = true;
       layers[index]->issue_input_grad_comm(
-          SchedulingPolicy::LIFO, CollectiveBarrier::Non_Blocking);
+          SchedulingPolicy::LIFO, CollectiveBarrier::Blocking);
     }
     collective_issued = false;
     delay_loaded = false;
@@ -629,7 +629,7 @@ void Workload::iterate_hybrid_parallel_data_model() {
     if (!collective_issued) {
       collective_issued = true;
       layers[index]->issue_weight_grad_comm(
-          SchedulingPolicy::FIFO, CollectiveBarrier::Non_Blocking);
+          SchedulingPolicy::FIFO, CollectiveBarrier::Blocking);
     }
     if (!layers[index]->is_input_grad_comm_finished_blocking()) {
       return;
@@ -665,7 +665,7 @@ void Workload::iterate_hybrid_parallel_data_model() {
     if (!collective_issued && index > 0) {
       collective_issued = true;
       layers[index]->issue_input_grad_comm(
-          SchedulingPolicy::LIFO, CollectiveBarrier::Non_Blocking);
+          SchedulingPolicy::LIFO, CollectiveBarrier::Blocking);
     }
     collective_issued = false;
     delay_loaded = false;
@@ -719,7 +719,7 @@ void Workload::iterate_hybrid_parallel_model_data() {
     if (!collective_issued) {
       collective_issued = true;
       layers[index]->issue_weight_grad_comm(
-          SchedulingPolicy::FIFO, CollectiveBarrier::Non_Blocking);
+          SchedulingPolicy::FIFO, CollectiveBarrier::Blocking);
     }
     if (!layers[index]->is_input_grad_comm_finished_blocking()) {
       return;
@@ -755,7 +755,7 @@ void Workload::iterate_hybrid_parallel_model_data() {
     if (!collective_issued && index > 0) {
       collective_issued = true;
       layers[index]->issue_input_grad_comm(
-          SchedulingPolicy::LIFO, CollectiveBarrier::Non_Blocking);
+          SchedulingPolicy::LIFO, CollectiveBarrier::Blocking);
     }
     collective_issued = false;
     delay_loaded = false;
@@ -876,7 +876,7 @@ void Workload::iterate_model_parallel() {
       collective_issued = true;
       std::vector<bool> involved_dimensions{true, true, true};
       layers[index]->issue_input_grad_comm(
-          SchedulingPolicy::LIFO, CollectiveBarrier::Non_Blocking);
+          SchedulingPolicy::LIFO, CollectiveBarrier::Blocking);
     }
     collective_issued = false;
     delay_loaded = false;
@@ -930,7 +930,7 @@ void Workload::iterate_hybrid_parallel_Transformer() {
     if (!collective_issued) {
       collective_issued = true;
       layers[index]->issue_weight_grad_comm(
-          SchedulingPolicy::FIFO, CollectiveBarrier::Non_Blocking);
+          SchedulingPolicy::FIFO, CollectiveBarrier::Blocking);
     }
     if (!layers[index]->is_input_grad_comm_finished_blocking()) {
       return;
@@ -1114,7 +1114,7 @@ void Workload::iterate_hybrid_parallel_Transformer_fwd_in_bckwd() {
     if (!collective_issued) {
       collective_issued = true;
       layers[index]->issue_weight_grad_comm(
-          SchedulingPolicy::FIFO, CollectiveBarrier::Non_Blocking);
+          SchedulingPolicy::FIFO, CollectiveBarrier::Blocking);
     }
     if (!layers[index]->is_input_grad_comm_finished_blocking()) {
       return;
@@ -1297,7 +1297,7 @@ void Workload::iterate_hybrid_parallel_DLRM() {
         layers[index]->fwd_pass_comm_type == ComType::All_to_All) {
       collective_issued = true;
       layers[index]->issue_forward_pass_comm(
-          SchedulingPolicy::HIGHEST, CollectiveBarrier::Non_Blocking);
+          SchedulingPolicy::HIGHEST, CollectiveBarrier::Blocking);
 
     } else if (index == DLRM_LAST_BOTTOM_LAYER) {
       if (!layers[0]->is_fwd_pass_comm_finished_blocking()) {
@@ -1330,7 +1330,7 @@ void Workload::iterate_hybrid_parallel_DLRM() {
     if (!collective_issued) {
       collective_issued = true;
       layers[index]->issue_weight_grad_comm(
-          SchedulingPolicy::None, CollectiveBarrier::Non_Blocking);
+          SchedulingPolicy::None, CollectiveBarrier::Blocking);
     }
     if (parallelismPolicy == ParallelismPolicy::DLRM &&
         !layers[index]->is_input_grad_comm_finished_blocking()) {
@@ -1361,7 +1361,7 @@ void Workload::iterate_hybrid_parallel_DLRM() {
     }
     if (index == DLRM_LAST_BOTTOM_LAYER + 1) {
       layers[0]->issue_input_grad_comm(
-          SchedulingPolicy::HIGHEST, CollectiveBarrier::Non_Blocking);
+          SchedulingPolicy::HIGHEST, CollectiveBarrier::Blocking);
     }
     index--;
     if (generator->id == 0) {

@@ -1183,6 +1183,23 @@ CollectivePhase Sys::generate_collective_phase(
               else if(workload->current_state == Workload::LoopState::Weight_Gradient){
                 comm_ps = static_cast<ParallelStrategy> (workload->layers[workload->index]->weight_grad_group_type);
               }
+              MockNccl::MockNcclComm* pComm = nullptr;
+              {
+                auto it = mock_nccl_comms.find(comm_ps);
+                if (it != mock_nccl_comms.end()) {
+                  pComm = it->second;
+                }
+              }
+              if (pComm == nullptr) {
+                NcclLog->writeLog(
+                    NcclLogLevel::WARNING,
+                    "NcclFlowModel communicator missing for comm_ps=%d (collective=%d, state=%d, layer=%d). Treating as no-op.",
+                    static_cast<int>(comm_ps),
+                    static_cast<int>(collective_type),
+                    static_cast<int>(workload->current_state),
+                    layer_num);
+                return CollectivePhase();
+              }
               MockNccl::ncclInfo *nccl_info;
               std::shared_ptr<void> ptr_FlowModels;
               {
@@ -1191,13 +1208,23 @@ CollectivePhase Sys::generate_collective_phase(
                 ptr_FlowModels = generate_flow_model(comm_ps, data_size, collective_type); 
                 cs.ExitSection();
               }
+              if (nccl_info == nullptr) {
+                NcclLog->writeLog(
+                    NcclLogLevel::WARNING,
+                    "NcclFlowModel nccl_info is null for comm_ps=%d (collective=%d, state=%d, layer=%d). Treating as no-op.",
+                    static_cast<int>(comm_ps),
+                    static_cast<int>(collective_type),
+                    static_cast<int>(workload->current_state),
+                    layer_num);
+                return CollectivePhase();
+              }
               
               if(nccl_info->algorithm == NCCL_ALGO_RING) {
                 std::shared_ptr<MockNccl::FlowModels> RingFlowModels = std::static_pointer_cast<MockNccl::FlowModels>(ptr_FlowModels);
                 std::map<int,std::map<int,std::vector<int>>> channels;
                 {
                   Sys::sysCriticalSection cs;
-                  channels = mock_nccl_comms[comm_ps]->get_rings();
+                  channels = pComm->get_rings();
                   cs.ExitSection();
                 }
                 NcclLog->writeLog(NcclLogLevel::DEBUG,"rank %d generate FlowModels",id);
@@ -1246,7 +1273,7 @@ CollectivePhase Sys::generate_collective_phase(
                 {
                   Sys::sysCriticalSection cs;
                   TreeFlowModels = std::static_pointer_cast<MockNccl::FlowModels>(ptr_FlowModels);
-                  treechannels = mock_nccl_comms[comm_ps]->get_treechannels();
+                  treechannels = pComm->get_treechannels();
                   cs.ExitSection();
                 }
                 CollectivePhase vn(
@@ -1271,7 +1298,7 @@ CollectivePhase Sys::generate_collective_phase(
                 MockNccl::TreeChannels treechannels;
                 {
                   Sys::sysCriticalSection cs;
-                  treechannels = mock_nccl_comms[comm_ps]->get_treechannels();
+                  treechannels = pComm->get_treechannels();
                   cs.ExitSection();
                 }
                 NcclLog->writeLog(NcclLogLevel::DEBUG,"rank %d generate FlowModels",id);
@@ -1453,11 +1480,19 @@ bool Sys::mock_nccl_comms_init(){
 }
 
 struct MockNccl::ncclInfo* Sys::get_nccl_Info(ParallelStrategy comm_ps, uint64_t data_size, ComType collective_type) {
-    return mock_nccl_comms[comm_ps]->get_algo_proto_info(data_size, collective_type );
+    auto it = mock_nccl_comms.find(comm_ps);
+    if (it == mock_nccl_comms.end() || it->second == nullptr) {
+      return nullptr;
+    }
+    return it->second->get_algo_proto_info(data_size, collective_type);
 }
 
 std::shared_ptr<void> Sys::generate_flow_model(ParallelStrategy comm_ps, uint64_t data_size, ComType collective_type) {
-    MockNccl::MockNcclComm* pComm = mock_nccl_comms[comm_ps];
+    auto it = mock_nccl_comms.find(comm_ps);
+    if (it == mock_nccl_comms.end() || it->second == nullptr) {
+      return nullptr;
+    }
+    MockNccl::MockNcclComm* pComm = it->second;
     MockNccl::State current_state;
     switch (this->workload->current_state) {
       case Workload::LoopState::Forward_Pass:
@@ -1573,8 +1608,10 @@ DataSet* Sys::generate_collective(
             InjectionPolicy::Normal,
             implementation_per_dimension[dim_mapper[dim]],
             boost_mode);
-        vect.push_back(phase);
-        tmp = phase.final_data_size;
+        if (phase.algorithm != nullptr) {
+          vect.push_back(phase);
+          tmp = phase.final_data_size;
+        }
       }
     } else if (
         inter_dimension_scheduling == InterDimensionScheduling::OfflineGreedy ||
@@ -1600,8 +1637,10 @@ DataSet* Sys::generate_collective(
             InjectionPolicy::Normal,
             implementation_per_dimension[dim_mapper[dim]],
             boost_mode);
-        vect.push_back(phase);
-        tmp = phase.final_data_size;
+        if (phase.algorithm != nullptr) {
+          vect.push_back(phase);
+          tmp = phase.final_data_size;
+        }
       }
       dim--;
       for (; dim >= 0; dim--) {
@@ -1622,8 +1661,10 @@ DataSet* Sys::generate_collective(
             InjectionPolicy::Normal,
             implementation_per_dimension[dim_mapper[dim]],
             boost_mode);
-        vect.push_back(phase);
-        tmp = phase.final_data_size;
+        if (phase.algorithm != nullptr) {
+          vect.push_back(phase);
+          tmp = phase.final_data_size;
+        }
       }
     } else {
       int dim = 0;
@@ -1652,8 +1693,10 @@ DataSet* Sys::generate_collective(
             InjectionPolicy::Normal,
             implementation_per_dimension[dim_mapper[dim]],
             boost_mode);
-        vect.push_back(phase);
-        tmp = phase.final_data_size;
+        if (phase.algorithm != nullptr) {
+          vect.push_back(phase);
+          tmp = phase.final_data_size;
+        }
       }
       while (dim > 0 &&
              (dimensions_involved[dim_mapper[dim]] == false ||
@@ -1675,8 +1718,10 @@ DataSet* Sys::generate_collective(
             InjectionPolicy::Normal,
             implementation_per_dimension[dim_mapper[dim]],
             boost_mode);
-        vect.push_back(phase);
-        tmp = phase.final_data_size;
+        if (phase.algorithm != nullptr) {
+          vect.push_back(phase);
+          tmp = phase.final_data_size;
+        }
       }
       dim--;
       for (; dim >= 0; dim--) {
@@ -1697,8 +1742,10 @@ DataSet* Sys::generate_collective(
             InjectionPolicy::Normal,
             implementation_per_dimension[dim_mapper[dim]],
             boost_mode);
-        vect.push_back(phase);
-        tmp = phase.final_data_size;
+        if (phase.algorithm != nullptr) {
+          vect.push_back(phase);
+          tmp = phase.final_data_size;
+        }
       }
     }
     if (vect.size() > 0) {
