@@ -65,6 +65,8 @@ private:
   std::vector<bool> m_pausedSubQueues;
   std::deque<Ptr<Item>> m_priority_que;
   uint32_t m_currentTotalPackets;
+  uint64_t m_dropPackets;
+  uint64_t m_dropBytes;
   bool m_lastDequeuedFromSubQueue;
   uint32_t m_lastDequeuedSubQueueId;
 
@@ -197,11 +199,13 @@ PppRoundRobinQueue<Item>::PppRoundRobinQueue ()
   : Queue<Item>(),
     m_rrIndex (0),
     m_currentTotalPackets (0),
+    m_dropPackets(0),
+    m_dropBytes(0),
     m_lastDequeuedFromSubQueue(false),
     m_lastDequeuedSubQueueId(0),
     m_numQueues (4),
     m_maxPacketsPerQueue (100),
-    work_model(0),
+    work_model(1),
     work2index(0),
     NS_LOG_TEMPLATE_DEFINE("PppRoundRobinQueue") // Logging definition
 {
@@ -216,6 +220,14 @@ template <typename Item>
 PppRoundRobinQueue<Item>::~PppRoundRobinQueue ()
 {
   NS_LOG_FUNCTION(this);
+  if (m_dropPackets > 0)
+    {
+      NS_LOG_UNCOND("[DROP][SUMMARY][RRQ] queue=" << this
+                    << " dropPkts=" << m_dropPackets
+                    << " dropBytes=" << m_dropBytes
+                    << " numSubQueues=" << m_numQueues
+                    << " maxPerQueue=" << m_maxPacketsPerQueue);
+    }
   m_subQueues.clear ();
 }
 
@@ -241,8 +253,6 @@ PppRoundRobinQueue<Item>::CalculateQueueIndex (Ptr<const Item> p)
   uint8_t buffer[6];
   mac.CopyTo (buffer);
   
-  work_model=2;
-
   //随机
   if (work_model==0){
     auto nowsys = std::chrono::system_clock::now();
@@ -283,7 +293,6 @@ PppRoundRobinQueue<Item>::GetQueueIndexByDst(Mac48Address mac)
 {
   uint8_t buffer[6];
   mac.CopyTo(buffer);
-  work_model=2;
   if (work_model==0){
     auto nowsys = std::chrono::system_clock::now();
     auto duration = nowsys.time_since_epoch();
@@ -362,7 +371,23 @@ PppRoundRobinQueue<Item>::Enqueue(Ptr<Item> item)
 
   if (m_subQueues[idx].size () >= m_maxPacketsPerQueue)
     {
-      NS_LOG_LOGIC ("Sub-queue " << idx << " full. Dropping item.");
+      ++m_dropPackets;
+      m_dropBytes += item->GetSize();
+      static uint64_t s_dropLogCount = 0;
+      if (s_dropLogCount < 20 || (s_dropLogCount % 1000) == 0)
+        {
+          NS_LOG_UNCOND("[DROP][RRQ][SUBQUEUE_FULL] queue=" << this
+                        << " qid=" << idx
+                        << " len=" << m_subQueues[idx].size()
+                        << " maxPerQueue=" << m_maxPacketsPerQueue
+                        << " queueTotalPkts=" << m_currentTotalPackets
+                        << " pktSize=" << item->GetSize()
+                        << " src=" << Mac48Address::ConvertFrom(pppHeader.GetSrcMac())
+                        << " dst=" << Mac48Address::ConvertFrom(pppHeader.GetDstMac())
+                        << " queueDropPkts=" << m_dropPackets
+                        << " queueDropBytes=" << m_dropBytes);
+        }
+      ++s_dropLogCount;
       this->DropBeforeEnqueue (item); 
       return false;
     }

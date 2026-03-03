@@ -28,6 +28,36 @@ NS_LOG_COMPONENT_DEFINE("PointToPointNetDevice");
 
 NS_OBJECT_ENSURE_REGISTERED(PointToPointNetDevice);
 
+namespace {
+struct P2pDropStats
+{
+    uint64_t linkDownDrops = 0;
+    uint64_t enqueueFailDrops = 0;
+    uint64_t enqueueFailDropBytes = 0;
+    bool summaryScheduled = false;
+};
+
+P2pDropStats g_p2pDropStats;
+
+void
+PrintP2pDropSummary()
+{
+    NS_LOG_UNCOND("[DROP][SUMMARY][P2P] linkDownDrops=" << g_p2pDropStats.linkDownDrops
+                  << " enqueueFailDrops=" << g_p2pDropStats.enqueueFailDrops
+                  << " enqueueFailDropBytes=" << g_p2pDropStats.enqueueFailDropBytes);
+}
+
+void
+EnsureP2pDropSummaryScheduled()
+{
+    if (!g_p2pDropStats.summaryScheduled)
+    {
+        g_p2pDropStats.summaryScheduled = true;
+        Simulator::ScheduleDestroy(&PrintP2pDropSummary);
+    }
+}
+} // namespace
+
 TypeId
 PointToPointNetDevice::GetTypeId()
 {
@@ -465,13 +495,14 @@ PointToPointNetDevice::Receive(Ptr<Packet> packet)
         uint32_t h_size = packet -> PeekHeader(header);
         if(h_size > 0)
         {
-            NS_LOG_INFO("!! Find pause/resume at device " << Mac48Address::ConvertFrom(m_address));
             packet -> RemoveHeader(header);
             Mac48Address pauseDst = header.GetDstAddr();
             uint16_t pauseQid = header.GetQueueId();
             if(header.GetFrameType() == PauseHeader::PAUSE && pauseDst == m_address)
             {
-                NS_LOG_INFO("!! Pause frame received at "<<Simulator::Now().GetSeconds()<<"s");
+                NS_LOG_INFO("[PFC][RX][PAUSE] dev=" << Mac48Address::ConvertFrom(m_address)
+                            << " qid=" << pauseQid
+                            << " t=" << Simulator::Now().GetSeconds() << "s");
                 Ptr<PppRoundRobinQueue<Packet>> rrQueue =
                     DynamicCast<PppRoundRobinQueue<Packet>>(m_queue);
                 if (rrQueue)
@@ -486,7 +517,9 @@ PointToPointNetDevice::Receive(Ptr<Packet> packet)
             }
             else if(header.GetFrameType() == PauseHeader::RESUME && pauseDst == m_address)
             {
-                NS_LOG_INFO("!! Resume frame received at "<<Simulator::Now().GetSeconds()<<"s");
+                NS_LOG_INFO("[PFC][RX][RESUME] dev=" << Mac48Address::ConvertFrom(m_address)
+                            << " qid=" << pauseQid
+                            << " t=" << Simulator::Now().GetSeconds() << "s");
                 Ptr<PppRoundRobinQueue<Packet>> rrQueue =
                     DynamicCast<PppRoundRobinQueue<Packet>>(m_queue);
                 if (rrQueue)
@@ -669,6 +702,18 @@ PointToPointNetDevice::Send(Ptr<Packet> packet, const Address& dest, uint16_t pr
     //
     if (!IsLinkUp())
     {
+        EnsureP2pDropSummaryScheduled();
+        ++g_p2pDropStats.linkDownDrops;
+        static uint64_t sLinkDownLogCount = 0;
+        if (sLinkDownLogCount < 20 || (sLinkDownLogCount % 1000) == 0)
+        {
+            NS_LOG_UNCOND("[DROP][P2P][LINK_DOWN] dev=" << Mac48Address::ConvertFrom(m_address)
+                          << " src=" << Mac48Address::ConvertFrom(m_address)
+                          << " dst=" << Mac48Address::ConvertFrom(dest)
+                          << " proto=0x" << std::hex << protocolNumber << std::dec
+                          << " totalLinkDownDrops=" << g_p2pDropStats.linkDownDrops);
+        }
+        ++sLinkDownLogCount;
         m_macTxDropTrace(packet);
         return false;
     }
@@ -695,6 +740,22 @@ PointToPointNetDevice::Send(Ptr<Packet> packet, const Address& dest, uint16_t pr
     }
 
     // Enqueue may fail (overflow)
+    EnsureP2pDropSummaryScheduled();
+    ++g_p2pDropStats.enqueueFailDrops;
+    g_p2pDropStats.enqueueFailDropBytes += packet->GetSize();
+    static uint64_t sEnqueueFailLogCount = 0;
+    if (sEnqueueFailLogCount < 20 || (sEnqueueFailLogCount % 1000) == 0)
+    {
+        NS_LOG_UNCOND("[DROP][P2P][ENQUEUE_FAIL] dev=" << Mac48Address::ConvertFrom(m_address)
+                      << " src=" << Mac48Address::ConvertFrom(m_address)
+                      << " dst=" << Mac48Address::ConvertFrom(dest)
+                      << " proto=0x" << std::hex << protocolNumber << std::dec
+                      << " queuePkts=" << (m_queue ? m_queue->GetNPackets() : 0)
+                      << " pktSize=" << packet->GetSize()
+                      << " totalEnqueueFailDrops=" << g_p2pDropStats.enqueueFailDrops
+                      << " totalEnqueueFailDropBytes=" << g_p2pDropStats.enqueueFailDropBytes);
+    }
+    ++sEnqueueFailLogCount;
 
     m_macTxDropTrace(packet);
     return false;
@@ -713,6 +774,18 @@ PointToPointNetDevice::SendFrom(Ptr<Packet> packet,
     //
     if (!IsLinkUp())
     {
+        EnsureP2pDropSummaryScheduled();
+        ++g_p2pDropStats.linkDownDrops;
+        static uint64_t sLinkDownLogCount = 0;
+        if (sLinkDownLogCount < 20 || (sLinkDownLogCount % 1000) == 0)
+        {
+            NS_LOG_UNCOND("[DROP][P2P][LINK_DOWN] dev=" << Mac48Address::ConvertFrom(m_address)
+                          << " src=" << Mac48Address::ConvertFrom(source)
+                          << " dst=" << Mac48Address::ConvertFrom(dest)
+                          << " proto=0x" << std::hex << protocolNumber << std::dec
+                          << " totalLinkDownDrops=" << g_p2pDropStats.linkDownDrops);
+        }
+        ++sLinkDownLogCount;
         m_macTxDropTrace(packet);
         return false;
     }
@@ -735,6 +808,22 @@ PointToPointNetDevice::SendFrom(Ptr<Packet> packet,
     }
 
     // Enqueue may fail (overflow)
+    EnsureP2pDropSummaryScheduled();
+    ++g_p2pDropStats.enqueueFailDrops;
+    g_p2pDropStats.enqueueFailDropBytes += packet->GetSize();
+    static uint64_t sEnqueueFailLogCount = 0;
+    if (sEnqueueFailLogCount < 20 || (sEnqueueFailLogCount % 1000) == 0)
+    {
+        NS_LOG_UNCOND("[DROP][P2P][ENQUEUE_FAIL] dev=" << Mac48Address::ConvertFrom(m_address)
+                      << " src=" << Mac48Address::ConvertFrom(source)
+                      << " dst=" << Mac48Address::ConvertFrom(dest)
+                      << " proto=0x" << std::hex << protocolNumber << std::dec
+                      << " queuePkts=" << (m_queue ? m_queue->GetNPackets() : 0)
+                      << " pktSize=" << packet->GetSize()
+                      << " totalEnqueueFailDrops=" << g_p2pDropStats.enqueueFailDrops
+                      << " totalEnqueueFailDropBytes=" << g_p2pDropStats.enqueueFailDropBytes);
+    }
+    ++sEnqueueFailLogCount;
 
     m_macTxDropTrace(packet);
     // return false;

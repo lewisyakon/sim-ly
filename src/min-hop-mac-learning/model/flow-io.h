@@ -8,10 +8,13 @@
 #include "ns3/address.h"
 #include "ns3/packet.h"
 #include "ns3/callback.h"
+#include "ns3/event-id.h"
+#include "ns3/nstime.h"
 
 #include <unordered_map>
 #include <vector>
 #include <cstdint>
+#include <deque>
 
 namespace ns3 {
 
@@ -37,6 +40,8 @@ public:
   using SocketRxCallback = Callback<void, Ptr<Socket>>;
 
   static TypeId GetTypeId();
+  static void PauseNodeQueue(Ptr<Node> node, uint32_t queueId);
+  static void ResumeNodeQueue(Ptr<Node> node, uint32_t queueId);
 
   FlowIo();
   ~FlowIo() override;
@@ -60,9 +65,25 @@ public:
             Ptr<Packet> pkt,
             FlowSendMode mode,
             uint32_t rxInDevIndexForLoopback = UINT32_MAX);
+  void PauseTxQueue(uint32_t queueId);
+  void ResumeTxQueue(uint32_t queueId);
 
 private:
-  void SendOnDevice(uint32_t devIndex, const Address& dest, Ptr<Packet> pkt);
+  struct BufferedTx
+  {
+    uint32_t devIndex;
+    uint32_t queueId;
+    Address dest;
+    Ptr<Packet> pkt;
+  };
+
+  uint32_t ClassifyQueueId(const Address& dest) const;
+  bool IsTxQueuePaused(uint32_t queueId) const;
+  bool SendOnDevice(uint32_t devIndex, const Address& dest, Ptr<Packet> pkt);
+  void EnqueueBuffered(uint32_t devIndex, uint32_t queueId, const Address& dest, Ptr<Packet> pkt);
+  void DrainBuffered();
+  void ScheduleDrain();
+  void EnsureQueueState();
 
   void DoDispose() override;
 
@@ -79,6 +100,15 @@ private:
 
   std::vector<Ptr<Socket>> m_socks;
   std::unordered_map<Socket*, uint32_t> m_sock2dev; // PeekPointer(sock) -> devIndex
+
+  // Software tx buffering for pause/backpressure periods.
+  std::deque<BufferedTx> m_txBuffer;
+  std::vector<bool> m_pausedTxQueues;
+  uint32_t m_numTxQueues = 16;
+  EventId m_drainEvent;
+  bool m_enableTxBuffer = true;
+  Time m_retryInterval = MicroSeconds(2);
+  uint32_t m_maxBufferedPackets = 200000;
 };
 
 } // namespace ns3
