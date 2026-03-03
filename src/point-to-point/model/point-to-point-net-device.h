@@ -120,6 +120,7 @@ class PointToPointNetDevice : public NetDevice
      * @returns Ptr to the queue.
      */
     Ptr<Queue<Packet>> GetQueue() const;
+    Address GetPeerAddress() const;
 
     /**
      * Attach a receive ErrorModel to the PointToPointNetDevice.
@@ -188,7 +189,7 @@ class PointToPointNetDevice : public NetDevice
     bool SupportsSendFrom() const override;
 
     TracedCallback<> m_highWatermarkCallback;
-    TracedCallback<> m_lowWatermarkCallback;
+    TracedCallback<uint32_t> m_lowWatermarkCallback;
 
     void AddPauseCount(uint32_t increment);
     void SubPauseCount(uint32_t decrement);
@@ -232,6 +233,7 @@ class PointToPointNetDevice : public NetDevice
      */
     bool ProcessHeader(Ptr<Packet> p, uint16_t& param);
     bool ProcessHeader(Ptr<Packet> p, uint16_t& param,Address& source,Address& dest);
+    void TryStartNextTransmission();
     
 
     /**
@@ -433,6 +435,8 @@ class PointToPointNetDevice : public NetDevice
     bool m_isPaused;
     double m_highWaterMark;
     double m_lowWaterMark;
+    bool m_currentPktFromSubQueue;
+    uint32_t m_currentPktSubQueueId;
 
     static const uint16_t DEFAULT_MTU = 1500; //!< Default MTU
 

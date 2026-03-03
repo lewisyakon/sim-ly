@@ -37,6 +37,14 @@ public:
 
   uint32_t GetNPackets (void) const;
   uint32_t GetNBytes (void) const;
+  uint32_t GetNumQueues() const;
+  uint32_t GetMaxPacketsPerQueue() const;
+  uint32_t GetSubQueueLength(uint32_t qid) const;
+  uint32_t GetQueueIndexByDst(Mac48Address dst);
+  void PauseSubQueue(uint32_t qid);
+  void ResumeSubQueue(uint32_t qid);
+  bool IsSubQueuePaused(uint32_t qid) const;
+  bool GetLastDequeuedSubQueueId(uint32_t& qid) const;
 
 private:
   // Private members (using explicit template definition in .h)
@@ -54,8 +62,11 @@ private:
   uint32_t m_maxPacketsPerQueue;
   
   std::vector<std::deque<Ptr<Item>>> m_subQueues;
+  std::vector<bool> m_pausedSubQueues;
   std::deque<Ptr<Item>> m_priority_que;
   uint32_t m_currentTotalPackets;
+  bool m_lastDequeuedFromSubQueue;
+  uint32_t m_lastDequeuedSubQueueId;
 
   Ptr<UniformRandomVariable> m_queueSelector;
 
@@ -84,6 +95,82 @@ PppRoundRobinQueue<Item>::GetNBytes (void) const
     return 0; 
 }
 
+template <typename Item>
+uint32_t
+PppRoundRobinQueue<Item>::GetNumQueues() const
+{
+    return m_numQueues;
+}
+
+template <typename Item>
+uint32_t
+PppRoundRobinQueue<Item>::GetMaxPacketsPerQueue() const
+{
+    return m_maxPacketsPerQueue;
+}
+
+template <typename Item>
+uint32_t
+PppRoundRobinQueue<Item>::GetSubQueueLength(uint32_t qid) const
+{
+    if (qid >= m_subQueues.size())
+    {
+        return 0;
+    }
+    return static_cast<uint32_t>(m_subQueues[qid].size());
+}
+
+template <typename Item>
+void
+PppRoundRobinQueue<Item>::PauseSubQueue(uint32_t qid)
+{
+    if (m_pausedSubQueues.size() != m_numQueues)
+    {
+        m_pausedSubQueues.assign(m_numQueues, false);
+    }
+    if (qid < m_pausedSubQueues.size())
+    {
+        m_pausedSubQueues[qid] = true;
+    }
+}
+
+template <typename Item>
+void
+PppRoundRobinQueue<Item>::ResumeSubQueue(uint32_t qid)
+{
+    if (m_pausedSubQueues.size() != m_numQueues)
+    {
+        m_pausedSubQueues.assign(m_numQueues, false);
+    }
+    if (qid < m_pausedSubQueues.size())
+    {
+        m_pausedSubQueues[qid] = false;
+    }
+}
+
+template <typename Item>
+bool
+PppRoundRobinQueue<Item>::IsSubQueuePaused(uint32_t qid) const
+{
+    if (qid >= m_pausedSubQueues.size())
+    {
+        return false;
+    }
+    return m_pausedSubQueues[qid];
+}
+
+template <typename Item>
+bool
+PppRoundRobinQueue<Item>::GetLastDequeuedSubQueueId(uint32_t& qid) const
+{
+    if (!m_lastDequeuedFromSubQueue)
+    {
+        return false;
+    }
+    qid = m_lastDequeuedSubQueueId;
+    return true;
+}
+
 
 template <typename Item>
 TypeId
@@ -110,6 +197,8 @@ PppRoundRobinQueue<Item>::PppRoundRobinQueue ()
   : Queue<Item>(),
     m_rrIndex (0),
     m_currentTotalPackets (0),
+    m_lastDequeuedFromSubQueue(false),
+    m_lastDequeuedSubQueueId(0),
     m_numQueues (4),
     m_maxPacketsPerQueue (100),
     work_model(0),
@@ -118,6 +207,9 @@ PppRoundRobinQueue<Item>::PppRoundRobinQueue ()
 {
   NS_LOG_FUNCTION(this);
   m_queueSelector = CreateObject<UniformRandomVariable> ();
+  m_pausedSubQueues.assign(m_numQueues, false);
+  // Keep QueueBase max size aligned so generic users (e.g., NetDevice) can read capacity.
+  this->SetMaxSize(QueueSize(QueueSizeUnit::PACKETS, m_numQueues * m_maxPacketsPerQueue));
 }
 
 template <typename Item>
@@ -182,9 +274,36 @@ PppRoundRobinQueue<Item>::CalculateQueueIndex (Ptr<const Item> p)
       return work2index;
     }
   }
+  return 0;
+}
 
-
-  
+template <typename Item>
+uint32_t
+PppRoundRobinQueue<Item>::GetQueueIndexByDst(Mac48Address mac)
+{
+  uint8_t buffer[6];
+  mac.CopyTo(buffer);
+  work_model=2;
+  if (work_model==0){
+    auto nowsys = std::chrono::system_clock::now();
+    auto duration = nowsys.time_since_epoch();
+    uint64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
+    uint32_t seed = static_cast<uint32_t>(now);
+    return seed % m_numQueues;
+  }
+  if (work_model==1){
+    uint64_t mac_as_u64 = 0;
+    for (int i = 0; i < 6; ++i){
+      mac_as_u64 = (mac_as_u64 << 8) | buffer[i];
+    }
+    std::hash<uint64_t> hasher;
+    uint32_t final_hash = static_cast<uint32_t>(hasher(mac_as_u64));
+    return final_hash % m_numQueues;
+  }
+  if (address_to_index.find(mac) != address_to_index.end()) return address_to_index[mac];
+  work2index = (work2index + 1) % m_numQueues;
+  address_to_index[mac] = work2index;
+  return work2index;
 }
 
 
@@ -196,22 +315,45 @@ PppRoundRobinQueue<Item>::Enqueue(Ptr<Item> item)
 {
   NS_LOG_FUNCTION(this << item);
 
+  // Attributes can be changed after construction; refresh derived max size.
+  this->SetMaxSize(QueueSize(QueueSizeUnit::PACKETS, m_numQueues * m_maxPacketsPerQueue));
+
   if (m_subQueues.size () != m_numQueues)
     {
       m_subQueues.resize (m_numQueues);
+    }
+  if (m_pausedSubQueues.size() != m_numQueues)
+    {
+      m_pausedSubQueues.assign(m_numQueues, false);
     }
   
   Ptr<const Packet> packet = DynamicCast<const Packet, const Item>(item);
   Ptr<Packet> pp = packet->Copy();
   PppHeader pppHeader;
+  pp->RemoveHeader(pppHeader);
+
+  // Non-flow-control/data protocols (e.g., PAUSE 0x8808) go to high priority queue.
+  if (pppHeader.GetProtocol() != 0x9999) {
+    m_currentTotalPackets++;
+    m_priority_que.push_back(item);
+    this->m_nPackets++;
+    this->m_nBytes += item->GetSize();
+    this->m_nTotalReceivedPackets++;
+    this->m_nTotalReceivedBytes += item->GetSize();
+    return true;
+  }
+
   HopCountHeader hopHeader;
   ThreePHeader TPheader;
-  pp->RemoveHeader(pppHeader);
   pp->RemoveHeader(hopHeader);  // 移除头部以读取状态
   pp->RemoveHeader(TPheader);  // 移除头部以读取状态
   if (TPheader.GetState()==ThreePHeader::REQUEST or TPheader.GetState()==ThreePHeader::ACT){
     m_currentTotalPackets++;
     m_priority_que.push_back(item);
+    this->m_nPackets++;
+    this->m_nBytes += item->GetSize();
+    this->m_nTotalReceivedPackets++;
+    this->m_nTotalReceivedBytes += item->GetSize();
     return true;
   }
   
@@ -227,6 +369,10 @@ PppRoundRobinQueue<Item>::Enqueue(Ptr<Item> item)
 
   m_subQueues[idx].push_back (item);
   m_currentTotalPackets++;
+  this->m_nPackets++;
+  this->m_nBytes += item->GetSize();
+  this->m_nTotalReceivedPackets++;
+  this->m_nTotalReceivedBytes += item->GetSize();
   
   return true;
 }
@@ -241,16 +387,61 @@ PppRoundRobinQueue<Item>::Dequeue()
     Ptr<Item> p=m_priority_que.front();
     m_priority_que.pop_front();
     m_currentTotalPackets--;
+    m_lastDequeuedFromSubQueue = false;
+    if (this->m_nPackets.Get() == 0)
+      {
+        NS_LOG_WARN("Queue packet counter underflow on priority dequeue; repairing to 0.");
+      }
+    else
+      {
+        this->m_nPackets--;
+      }
+    if (this->m_nBytes.Get() < p->GetSize())
+      {
+        NS_LOG_WARN("Queue byte counter mismatch on priority dequeue, bytes="
+                    << this->m_nBytes.Get() << " pktSize=" << p->GetSize()
+                    << ". repairing to 0.");
+        this->m_nBytes = 0;
+      }
+    else
+      {
+        this->m_nBytes -= p->GetSize();
+      }
     return p;
   }
   for (uint32_t i = 0; i < m_numQueues; ++i)
     {
       uint32_t currentIdx = (m_rrIndex + i) % m_numQueues;
+      if (currentIdx < m_pausedSubQueues.size() && m_pausedSubQueues[currentIdx])
+        {
+          continue;
+        }
       if (!m_subQueues[currentIdx].empty ())
         {
           Ptr<Item> p = m_subQueues[currentIdx].front ();
           m_subQueues[currentIdx].pop_front ();
           m_currentTotalPackets--;
+          m_lastDequeuedFromSubQueue = true;
+          m_lastDequeuedSubQueueId = currentIdx;
+          if (this->m_nPackets.Get() == 0)
+            {
+              NS_LOG_WARN("Queue packet counter underflow on sub-queue dequeue; repairing to 0.");
+            }
+          else
+            {
+              this->m_nPackets--;
+            }
+          if (this->m_nBytes.Get() < p->GetSize())
+            {
+              NS_LOG_WARN("Queue byte counter mismatch on sub-queue dequeue, bytes="
+                          << this->m_nBytes.Get() << " pktSize=" << p->GetSize()
+                          << " qid=" << currentIdx << ". repairing to 0.");
+              this->m_nBytes = 0;
+            }
+          else
+            {
+              this->m_nBytes -= p->GetSize();
+            }
           
           m_rrIndex = (currentIdx + 1) % m_numQueues;
           // this->Dequeued(p);
@@ -260,6 +451,7 @@ PppRoundRobinQueue<Item>::Dequeue()
           return p;
         }
     }
+  m_lastDequeuedFromSubQueue = false;
   return nullptr;
 }
 
@@ -283,7 +475,9 @@ Ptr<const Item>
 PppRoundRobinQueue<Item>::Peek() const
 {
   NS_LOG_FUNCTION(this);
-  if (m_currentTotalPackets == 0 || m_subQueues.empty()) return nullptr;
+  if (m_currentTotalPackets == 0) return nullptr;
+  if (!m_priority_que.empty()) return m_priority_que.front();
+  if (m_subQueues.empty()) return nullptr;
 
   for (uint32_t i = 0; i < m_numQueues; ++i)
     {

@@ -26,13 +26,22 @@ PauseHeader::GetInstanceTypeId() const
 }
 
 PauseHeader::PauseHeader()
-    : m_frameType(PAUSE) // 默认为PAUSE
+    : m_frameType(PAUSE), // 默认为PAUSE
+      m_queueId(0)
 {
 }
 
 PauseHeader::PauseHeader(FrameType type, Mac48Address addr)
     : m_frameType(type),
-      m_dst(addr)
+      m_dst(addr),
+      m_queueId(0)
+{
+}
+
+PauseHeader::PauseHeader(FrameType type, Mac48Address addr, uint16_t queueId)
+    : m_frameType(type),
+      m_dst(addr),
+      m_queueId(queueId)
 {
 }
 
@@ -61,17 +70,29 @@ PauseHeader::GetDstAddr() const
 }
 
 void
+PauseHeader::SetQueueId(uint16_t queueId)
+{
+    m_queueId = queueId;
+}
+
+uint16_t
+PauseHeader::GetQueueId() const
+{
+    return m_queueId;
+}
+
+void
 PauseHeader::Print(std::ostream& os) const
 {
     os << "PauseHeader (Type: " << (m_frameType == PAUSE ? "PAUSE" : "RESUME") 
-       << ", Dst: " << m_dst << ")";
+       << ", Dst: " << m_dst << ", Queue: " << m_queueId << ")";
 }
 
 uint32_t
 PauseHeader::GetSerializedSize() const
 {
-    // 1字节魔数 + 1字节帧类型 + 6字节MAC地址
-    return 1 + 1 + 6;
+    // 1字节魔数 + 1字节帧类型 + 6字节MAC地址 + 2字节队列ID
+    return 1 + 1 + 6 + 2;
 }
 
 void
@@ -83,6 +104,7 @@ PauseHeader::Serialize(Buffer::Iterator start) const
     uint8_t buffer[6];
     m_dst.CopyTo(buffer);
     start.Write(buffer, 6);
+    start.WriteU16(m_queueId);
 }
 
 uint32_t
@@ -111,6 +133,7 @@ PauseHeader::Deserialize(Buffer::Iterator start)
     uint8_t buffer[6];
     start.Read(buffer, 6);
     m_dst.CopyFrom(buffer);
+    m_queueId = start.ReadU16();
     
     // 4. 返回成功读取的总字节数
     return GetSerializedSize();
