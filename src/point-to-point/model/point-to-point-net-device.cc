@@ -19,6 +19,7 @@
 #include "ns3/trace-source-accessor.h"
 #include "ns3/uinteger.h"
 #include "ns3/pause-header.h"
+#include "ns3/PppRoundRobinQueue.h"
 
 namespace ns3
 {
@@ -184,6 +185,8 @@ PointToPointNetDevice::PointToPointNetDevice()
       m_isPaused(false),
       m_highWaterMark(0.8),
       m_lowWaterMark(0.2),
+      m_currentPktFromSubQueue(false),
+      m_currentPktSubQueueId(0),
       m_currentPkt(nullptr)
 {
     NS_LOG_FUNCTION(this);
@@ -269,7 +272,60 @@ PointToPointNetDevice::AddPauseCount(uint32_t increment)
 void
 PointToPointNetDevice::SubPauseCount(uint32_t decrement)
 {
+    if (decrement >= m_PauseCount)
+    {
+        m_PauseCount = 0;
+        return;
+    }
     m_PauseCount -= decrement;
+}
+
+void
+PointToPointNetDevice::TryStartNextTransmission()
+{
+    if (!m_queue || m_txMachineState != READY)
+    {
+        return;
+    }
+
+    // Under pause we only allow control frames (0x8808) to drain.
+    if (m_isPaused)
+    {
+        Ptr<const Packet> head = m_queue->Peek();
+        if (!head)
+        {
+            return;
+        }
+        Ptr<Packet> headCopy = head->Copy();
+        uint16_t headProto = 0;
+        if (!ProcessHeader(headCopy, headProto) || headProto != 0x8808)
+        {
+            return;
+        }
+    }
+
+    Ptr<Packet> p = m_queue->Dequeue();
+    if (!p)
+    {
+        return;
+    }
+
+    m_currentPktFromSubQueue = false;
+    m_currentPktSubQueueId = 0;
+    Ptr<PppRoundRobinQueue<Packet>> rrQueue = DynamicCast<PppRoundRobinQueue<Packet>>(m_queue);
+    if (rrQueue)
+    {
+        uint32_t qid = 0;
+        if (rrQueue->GetLastDequeuedSubQueueId(qid))
+        {
+            m_currentPktFromSubQueue = true;
+            m_currentPktSubQueueId = qid;
+        }
+    }
+
+    m_snifferTrace(p);
+    m_promiscSnifferTrace(p);
+    TransmitStart(p);
 }
 
 bool
@@ -319,30 +375,16 @@ PointToPointNetDevice::TransmitComplete()
     NS_ASSERT_MSG(m_currentPkt, "PointToPointNetDevice::TransmitComplete(): m_currentPkt zero");
 
     m_phyTxEndTrace(m_currentPkt);
+
+    if (m_queue && m_PauseCount > 0 && m_currentPktFromSubQueue)
+    {
+        m_lowWatermarkCallback(m_currentPktSubQueueId);
+    }
+    m_currentPktFromSubQueue = false;
+    m_currentPktSubQueueId = 0;
     m_currentPkt = nullptr;
 
-    Ptr<Packet> p = m_queue->Dequeue();
-
-    // uint32_t currentSize = m_queue -> GetNPackets();
-    // uint32_t maxSize = m_queue -> GetMaxSize().GetValue();
-    // double ratio = (double)currentSize/(double)maxSize;
-    // if(m_PauseCount > 0 &&  ratio <= m_lowWaterMark)
-    // {
-    //     m_lowWatermarkCallback();
-    // }
-
-    if (!p)
-    {
-        NS_LOG_LOGIC("No pending packets in device queue after tx complete");
-        return;
-    }
-
-    //
-    // Got another packet off of the queue, so start the transmit process again.
-    //
-    m_snifferTrace(p);
-    m_promiscSnifferTrace(p);
-    TransmitStart(p);
+    TryStartNextTransmission();
 }
 
 bool
@@ -426,16 +468,36 @@ PointToPointNetDevice::Receive(Ptr<Packet> packet)
             NS_LOG_INFO("!! Find pause/resume at device " << Mac48Address::ConvertFrom(m_address));
             packet -> RemoveHeader(header);
             Mac48Address pauseDst = header.GetDstAddr();
+            uint16_t pauseQid = header.GetQueueId();
             if(header.GetFrameType() == PauseHeader::PAUSE && pauseDst == m_address)
             {
                 NS_LOG_INFO("!! Pause frame received at "<<Simulator::Now().GetSeconds()<<"s");
-                m_isPaused = true;
+                Ptr<PppRoundRobinQueue<Packet>> rrQueue =
+                    DynamicCast<PppRoundRobinQueue<Packet>>(m_queue);
+                if (rrQueue)
+                {
+                    rrQueue->PauseSubQueue(pauseQid);
+                }
+                else
+                {
+                    m_isPaused = true;
+                }
                 return ;
             }
             else if(header.GetFrameType() == PauseHeader::RESUME && pauseDst == m_address)
             {
                 NS_LOG_INFO("!! Resume frame received at "<<Simulator::Now().GetSeconds()<<"s");
-                m_isPaused = false;
+                Ptr<PppRoundRobinQueue<Packet>> rrQueue =
+                    DynamicCast<PppRoundRobinQueue<Packet>>(m_queue);
+                if (rrQueue)
+                {
+                    rrQueue->ResumeSubQueue(pauseQid);
+                }
+                else
+                {
+                    m_isPaused = false;
+                }
+                TryStartNextTransmission();
                 return ;
             }
         }
@@ -468,6 +530,12 @@ PointToPointNetDevice::GetQueue() const
 {
     NS_LOG_FUNCTION(this);
     return m_queue;
+}
+
+Address
+PointToPointNetDevice::GetPeerAddress() const
+{
+    return GetRemote();
 }
 
 void
@@ -605,23 +673,6 @@ PointToPointNetDevice::Send(Ptr<Packet> packet, const Address& dest, uint16_t pr
         return false;
     }
 
-    if (m_isPaused == true)
-    {
-        NS_LOG_INFO("At time: "<< Simulator::Now().GetSeconds() << "s, Device: " 
-                    << Mac48Address::ConvertFrom(m_address) << " is paused to send packet");
-        m_macTxDropTrace(packet);
-        return false;
-    }
-
-    // uint32_t currentSize = m_queue -> GetNPackets();
-    // uint32_t maxSize = m_queue -> GetMaxSize().GetValue();
-    // double ratio = (double)currentSize/(double)maxSize;
-    // if(m_peerIsPaused == false && ratio >= m_highWaterMark)
-    // {
-    //     m_peerIsPaused = true;
-    //     m_highWatermarkCallback();
-    // }
-    //
     // Stick a point to point protocol header on the packet in preparation for
     // shoving it out the door.
     //
@@ -639,17 +690,7 @@ PointToPointNetDevice::Send(Ptr<Packet> packet, const Address& dest, uint16_t pr
     //
     if (m_queue->Enqueue(packet))
     {
-        //
-        // If the channel is ready for transition we send the packet right now
-        //
-        if (m_txMachineState == READY)
-        {
-            packet = m_queue->Dequeue();
-            m_snifferTrace(packet);
-            m_promiscSnifferTrace(packet);
-            bool ret = TransmitStart(packet);
-            return ret;
-        }
+        TryStartNextTransmission();
         return true;
     }
 
@@ -676,23 +717,6 @@ PointToPointNetDevice::SendFrom(Ptr<Packet> packet,
         return false;
     }
 
-    if (m_isPaused == true)
-    {
-        NS_LOG_INFO("At time: "<< Simulator::Now().GetSeconds() << "s, Device: " 
-                    << Mac48Address::ConvertFrom(m_address) << "is paused to send packet");
-        m_macTxDropTrace(packet);
-        return false;
-    }
-
-    // uint32_t currentSize = m_queue -> GetNPackets();
-    // uint32_t maxSize = m_queue -> GetMaxSize().GetValue();
-    // double ratio = (double)currentSize/(double)maxSize;
-    // if(m_peerIsPaused == false && ratio >= m_highWaterMark)
-    // {
-    //     m_peerIsPaused = true;
-    //     m_highWatermarkCallback();
-    // }
-
     //
     // Stick a point to point protocol header on the packet in preparation for
     // shoving it out the door.
@@ -706,17 +730,7 @@ PointToPointNetDevice::SendFrom(Ptr<Packet> packet,
     //
     if (m_queue->Enqueue(packet))
     {
-        //
-        // If the channel is ready for transition we send the packet right now
-        //
-        if (m_txMachineState == READY)
-        {
-            packet = m_queue->Dequeue();
-            m_snifferTrace(packet);
-            m_promiscSnifferTrace(packet);
-            bool ret = TransmitStart(packet);
-            return ret;
-        }
+        TryStartNextTransmission();
         return true;
     }
 

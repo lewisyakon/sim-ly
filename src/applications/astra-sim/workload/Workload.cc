@@ -1115,6 +1115,9 @@ void Workload::iterate_hybrid_parallel_Transformer_fwd_in_bckwd() {
       collective_issued = true;
       layers[index]->issue_weight_grad_comm(
           SchedulingPolicy::FIFO, CollectiveBarrier::Blocking);
+      // For NONE collectives this call may synchronously re-enter workload->call().
+      // Return here to avoid applying state transitions twice in one stack.
+      return;
     }
     if (!layers[index]->is_input_grad_comm_finished_blocking()) {
       return;

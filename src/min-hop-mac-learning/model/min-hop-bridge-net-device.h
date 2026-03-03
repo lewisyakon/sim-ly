@@ -2,6 +2,7 @@
 #define MIN_HOP_BRIDGE_NET_DEVICE_H
 
 #include <map>
+#include <set>
 #include <vector>
 #include <fstream>
 #include "ns3/channel.h"
@@ -149,9 +150,13 @@ class MinHopBridgeNetDevice : public NetDevice
     bool m_enableLearning;
 
     double m_highWatermark;
-    std::map<Ptr<NetDevice>, std::set<Mac48Address> > port_to_src;
-    void handleHighWatermark(Ptr<NetDevice> port, Mac48Address src);
-    void handleLowWatermark(Ptr<NetDevice> port);
+    double m_lowWatermark;
+    std::map<Ptr<NetDevice>, std::map<Ptr<NetDevice>, std::set<uint32_t>>> m_pausedIngressQueueIds;
+    void maybePauseUpstreamPort(Ptr<NetDevice> congestedEgress,
+                                Ptr<NetDevice> ingressPort,
+                                Mac48Address dst);
+    void sendPauseFrameToUpstream(Ptr<NetDevice> ingressPort, uint32_t queueId, bool pause);
+    void handleLowWatermark(Ptr<NetDevice> port, uint32_t queueId);
 
     int ecmpmodel=0;
     //0 随机发送 

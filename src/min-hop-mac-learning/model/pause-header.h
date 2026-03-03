@@ -23,12 +23,15 @@ class PauseHeader : public Header
 
     PauseHeader();
     PauseHeader(FrameType type, Mac48Address addr);
+    PauseHeader(FrameType type, Mac48Address addr, uint16_t queueId);
 
     void SetFrameType(FrameType type);
     FrameType GetFrameType() const;
 
     void SetDstAddr(Mac48Address addr);
     Mac48Address GetDstAddr() const;
+    void SetQueueId(uint16_t queueId);
+    uint16_t GetQueueId() const;
 
     void Print(std::ostream& os) const override;
     uint32_t GetSerializedSize() const override;
@@ -38,6 +41,7 @@ class PauseHeader : public Header
   private:
     uint8_t m_frameType;
     Mac48Address m_dst;
+    uint16_t m_queueId;
 };
 
 } // namespace ns3
