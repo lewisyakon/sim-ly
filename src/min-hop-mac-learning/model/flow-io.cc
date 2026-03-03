@@ -1,18 +1,64 @@
 #include "flow-io.h"
 
+#include "ns3/boolean.h"
 #include "ns3/log.h"
-#include "ns3/ptr.h" // PeekPointer
+#include "ns3/mac48-address.h"
 #include "ns3/node.h"
-
 #include "ns3/packet-socket-address.h"
 #include "ns3/packet-socket-factory.h"
+#include "ns3/ptr.h" // PeekPointer
+#include "ns3/simulator.h"
+#include "ns3/uinteger.h"
 
 #include <algorithm>
+#include <functional>
+#include <utility>
 
 namespace ns3 {
 
 NS_LOG_COMPONENT_DEFINE("FlowIo");
 NS_OBJECT_ENSURE_REGISTERED(FlowIo);
+
+namespace {
+// Non-owning registry: avoid reference cycles/re-entrancy during global destruction.
+std::unordered_map<uint32_t, FlowIo*> g_flowIoRegistryByNodeId;
+
+struct FlowIoDropStats
+{
+  uint64_t bufferOverflowDrops = 0;
+  uint64_t bufferOverflowDropBytes = 0;
+  std::unordered_map<uint32_t, uint64_t> perNodeBufferOverflowDrops;
+  bool summaryScheduled = false;
+};
+
+FlowIoDropStats g_flowIoDropStats;
+
+void
+PrintFlowIoDropSummary()
+{
+  NS_LOG_UNCOND("[DROP][SUMMARY][FLOWIO] bufOverflowPkts="
+                << g_flowIoDropStats.bufferOverflowDrops
+                << " bufOverflowBytes="
+                << g_flowIoDropStats.bufferOverflowDropBytes
+                << " nodesWithDrops="
+                << g_flowIoDropStats.perNodeBufferOverflowDrops.size());
+  for (const auto& entry : g_flowIoDropStats.perNodeBufferOverflowDrops)
+  {
+    NS_LOG_UNCOND("[DROP][SUMMARY][FLOWIO][NODE] node=" << entry.first
+                  << " bufOverflowPkts=" << entry.second);
+  }
+}
+
+void
+EnsureFlowIoDropSummaryScheduled()
+{
+  if (!g_flowIoDropStats.summaryScheduled)
+  {
+    g_flowIoDropStats.summaryScheduled = true;
+    Simulator::ScheduleDestroy(&PrintFlowIoDropSummary);
+  }
+}
+}
 
 TypeId
 FlowIo::GetTypeId()
@@ -21,8 +67,56 @@ FlowIo::GetTypeId()
       TypeId("ns3::FlowIo")
           .SetParent<Object>()
           .SetGroupName("Applications")
+          .AddAttribute("EnableTxBuffer",
+                        "Enable FlowIo software tx buffering/retry when NetDevice send fails.",
+                        BooleanValue(true),
+                        MakeBooleanAccessor(&FlowIo::m_enableTxBuffer),
+                        MakeBooleanChecker())
+          .AddAttribute("TxRetryInterval",
+                        "Retry interval for draining buffered packets.",
+                        TimeValue(MicroSeconds(2)),
+                        MakeTimeAccessor(&FlowIo::m_retryInterval),
+                        MakeTimeChecker())
+          .AddAttribute("MaxBufferedPackets",
+                        "Maximum buffered packets in FlowIo before dropping new packets.",
+                        UintegerValue(20000000),
+                        MakeUintegerAccessor(&FlowIo::m_maxBufferedPackets),
+                        MakeUintegerChecker<uint32_t>())
+          .AddAttribute("NumTxQueues",
+                        "Number of software queue ids used for local pause mapping.",
+                        UintegerValue(16),
+                        MakeUintegerAccessor(&FlowIo::m_numTxQueues),
+                        MakeUintegerChecker<uint32_t>(1))
           .AddConstructor<FlowIo>();
   return tid;
+}
+
+void
+FlowIo::PauseNodeQueue(Ptr<Node> node, uint32_t queueId)
+{
+  if (!node)
+  {
+    return;
+  }
+  auto it = g_flowIoRegistryByNodeId.find(node->GetId());
+  if (it != g_flowIoRegistryByNodeId.end() && it->second)
+  {
+    it->second->PauseTxQueue(queueId);
+  }
+}
+
+void
+FlowIo::ResumeNodeQueue(Ptr<Node> node, uint32_t queueId)
+{
+  if (!node)
+  {
+    return;
+  }
+  auto it = g_flowIoRegistryByNodeId.find(node->GetId());
+  if (it != g_flowIoRegistryByNodeId.end() && it->second)
+  {
+    it->second->ResumeTxQueue(queueId);
+  }
 }
 
 FlowIo::FlowIo() = default;
@@ -91,6 +185,89 @@ FlowIo::SetRxBindMode(RxBindMode mode)
 }
 
 void
+FlowIo::EnsureQueueState()
+{
+  if (m_numTxQueues == 0)
+  {
+    m_numTxQueues = 1;
+  }
+  if (m_pausedTxQueues.size() != m_numTxQueues)
+  {
+    m_pausedTxQueues.assign(m_numTxQueues, false);
+  }
+}
+
+uint32_t
+FlowIo::ClassifyQueueId(const Address& dest) const
+{
+  if (m_numTxQueues == 0 || !PacketSocketAddress::IsMatchingType(dest))
+  {
+    return 0;
+  }
+
+  PacketSocketAddress ps = PacketSocketAddress::ConvertFrom(dest);
+  Address physical = ps.GetPhysicalAddress();
+  if (!Mac48Address::IsMatchingType(physical))
+  {
+    return 0;
+  }
+
+  Mac48Address mac = Mac48Address::ConvertFrom(physical);
+  uint8_t buffer[6];
+  mac.CopyTo(buffer);
+  uint64_t macAsU64 = 0;
+  for (int i = 0; i < 6; ++i)
+  {
+    macAsU64 = (macAsU64 << 8) | buffer[i];
+  }
+  std::hash<uint64_t> hasher;
+  uint32_t finalHash = static_cast<uint32_t>(hasher(macAsU64));
+  return finalHash % m_numTxQueues;
+}
+
+bool
+FlowIo::IsTxQueuePaused(uint32_t queueId) const
+{
+  if (m_pausedTxQueues.empty())
+  {
+    return false;
+  }
+  return m_pausedTxQueues[queueId % m_pausedTxQueues.size()];
+}
+
+void
+FlowIo::PauseTxQueue(uint32_t queueId)
+{
+  EnsureQueueState();
+  uint32_t qid = queueId % m_numTxQueues;
+  if (!m_pausedTxQueues[qid])
+  {
+    m_pausedTxQueues[qid] = true;
+    NS_LOG_INFO("[FLOWIO][PAUSE] node=" << (m_node ? m_node->GetId() : 0)
+                << " qid=" << qid
+                << " t=" << Simulator::Now().GetSeconds() << "s");
+  }
+}
+
+void
+FlowIo::ResumeTxQueue(uint32_t queueId)
+{
+  EnsureQueueState();
+  uint32_t qid = queueId % m_numTxQueues;
+  if (m_pausedTxQueues[qid])
+  {
+    m_pausedTxQueues[qid] = false;
+    NS_LOG_INFO("[FLOWIO][RESUME] node=" << (m_node ? m_node->GetId() : 0)
+                << " qid=" << qid
+                << " t=" << Simulator::Now().GetSeconds() << "s");
+  }
+  if (!m_txBuffer.empty())
+  {
+    ScheduleDrain();
+  }
+}
+
+void
 FlowIo::Start(const SocketRxCallback& cb)
 {
   NS_ASSERT_MSG(m_node != nullptr, "FlowIo: node not set");
@@ -105,6 +282,7 @@ FlowIo::Start(const SocketRxCallback& cb)
   }
 
   m_sockRxCb = cb;
+  EnsureQueueState();
 
   // 若未设置 bridge 指针，则尝试用 innerDevIndex 推断
   if (!m_bridge)
@@ -146,11 +324,28 @@ FlowIo::Start(const SocketRxCallback& cb)
     m_socks.push_back(sock);
     m_sock2dev[PeekPointer(sock)] = devIdx;
   }
+
+  g_flowIoRegistryByNodeId[m_node->GetId()] = this;
 }
 
 void
 FlowIo::Stop()
 {
+  if (m_drainEvent.IsRunning())
+  {
+    Simulator::Cancel(m_drainEvent);
+  }
+  m_txBuffer.clear();
+
+  if (m_node)
+  {
+    auto it = g_flowIoRegistryByNodeId.find(m_node->GetId());
+    if (it != g_flowIoRegistryByNodeId.end() && it->second == this)
+    {
+      g_flowIoRegistryByNodeId.erase(it);
+    }
+  }
+
   for (auto& s : m_socks)
   {
     if (s)
@@ -162,13 +357,13 @@ FlowIo::Stop()
   m_sock2dev.clear();
 }
 
-
-void
+bool
 FlowIo::SendOnDevice(uint32_t devIndex, const Address& dest, Ptr<Packet> pkt)
 {
   NS_ASSERT_MSG(m_node != nullptr, "FlowIo: node not set");
   NS_ASSERT_MSG(pkt != nullptr, "FlowIo: null packet");
   NS_ASSERT_MSG(devIndex < m_node->GetNDevices(), "FlowIo: devIndex out of range");
+  NS_ASSERT_MSG(PacketSocketAddress::IsMatchingType(dest), "FlowIo: destination address type mismatch");
 
   Ptr<Socket> sock = nullptr;
   for (auto& s : m_socks)
@@ -186,7 +381,122 @@ FlowIo::SendOnDevice(uint32_t devIndex, const Address& dest, Ptr<Packet> pkt)
   ps.SetSingleDevice(devIndex);
   ps.SetProtocol(m_proto);
 
-  sock->SendTo(pkt, 0, ps);
+  // Keep caller packet immutable across retries (NetDevice may mutate headers).
+  int ret = sock->SendTo(pkt->Copy(), 0, ps);
+  return (ret >= 0);
+}
+
+void
+FlowIo::EnqueueBuffered(uint32_t devIndex, uint32_t queueId, const Address& dest, Ptr<Packet> pkt)
+{
+  EnsureQueueState();
+  uint32_t qid = queueId % m_numTxQueues;
+  if (m_txBuffer.size() >= m_maxBufferedPackets)
+  {
+    EnsureFlowIoDropSummaryScheduled();
+    ++g_flowIoDropStats.bufferOverflowDrops;
+    g_flowIoDropStats.bufferOverflowDropBytes += pkt->GetSize();
+    uint32_t nodeId = m_node ? m_node->GetId() : UINT32_MAX;
+    uint64_t nodeDrops = ++g_flowIoDropStats.perNodeBufferOverflowDrops[nodeId];
+
+    static uint64_t sOverflowLogCount = 0;
+    if (sOverflowLogCount < 20 || (sOverflowLogCount % 1000) == 0)
+    {
+      NS_LOG_UNCOND("[DROP][FLOWIO][BUF_OVERFLOW] node=" << nodeId
+                    << " dev=" << devIndex
+                    << " qid=" << qid
+                    << " totalBuf=" << m_txBuffer.size()
+                    << " maxBuf=" << m_maxBufferedPackets
+                    << " pktSize=" << pkt->GetSize()
+                    << " totalDropPkts=" << g_flowIoDropStats.bufferOverflowDrops
+                    << " totalDropBytes=" << g_flowIoDropStats.bufferOverflowDropBytes
+                    << " nodeDropPkts=" << nodeDrops);
+    }
+    ++sOverflowLogCount;
+    return;
+  }
+
+  m_txBuffer.push_back({devIndex, qid, dest, pkt->Copy()});
+
+  static uint64_t sEnqueueLogCount = 0;
+  if (sEnqueueLogCount < 200 || (sEnqueueLogCount % 10000) == 0)
+  {
+    NS_LOG_INFO("[FLOWIO][BUF][ENQ] dev=" << devIndex
+                << " qid=" << qid
+                << " size=" << pkt->GetSize()
+                << " totalBuf=" << m_txBuffer.size());
+  }
+  ++sEnqueueLogCount;
+}
+
+void
+FlowIo::ScheduleDrain()
+{
+  if (!m_drainEvent.IsRunning())
+  {
+    m_drainEvent = Simulator::Schedule(m_retryInterval, &FlowIo::DrainBuffered, this);
+  }
+}
+
+void
+FlowIo::DrainBuffered()
+{
+  EnsureQueueState();
+  if (m_txBuffer.empty() || m_numTxQueues == 0)
+  {
+    return;
+  }
+
+  uint32_t budget = 4096;
+  uint32_t sent = 0;
+  uint32_t rotateBudget = static_cast<uint32_t>(m_txBuffer.size());
+
+  while (!m_txBuffer.empty() && budget-- > 0 && rotateBudget > 0)
+  {
+    BufferedTx item = m_txBuffer.front();
+    m_txBuffer.pop_front();
+
+    if (IsTxQueuePaused(item.queueId))
+    {
+      m_txBuffer.push_back(std::move(item));
+      --rotateBudget;
+      continue;
+    }
+
+    if (!SendOnDevice(item.devIndex, item.dest, item.pkt))
+    {
+      static uint64_t sDrainBlockedLogCount = 0;
+      if (sDrainBlockedLogCount < 200 || (sDrainBlockedLogCount % 10000) == 0)
+      {
+        NS_LOG_INFO("[FLOWIO][BUF][BLOCKED] dev=" << item.devIndex
+                    << " qid=" << item.queueId
+                    << " totalBuf=" << m_txBuffer.size() + 1
+                    << " retryInUs=" << m_retryInterval.GetMicroSeconds());
+      }
+      ++sDrainBlockedLogCount;
+      m_txBuffer.push_front(std::move(item));
+      break;
+    }
+
+    ++sent;
+    rotateBudget = static_cast<uint32_t>(m_txBuffer.size());
+  }
+
+  if (sent > 0)
+  {
+    static uint64_t sDrainLogCount = 0;
+    if (sDrainLogCount < 200 || (sDrainLogCount % 10000) == 0)
+    {
+      NS_LOG_INFO("[FLOWIO][BUF][DRAIN] sent=" << sent
+                  << " remain=" << m_txBuffer.size());
+    }
+    ++sDrainLogCount;
+  }
+
+  if (!m_txBuffer.empty())
+  {
+    ScheduleDrain();
+  }
 }
 
 void
@@ -207,34 +517,54 @@ FlowIo::Send(const Address& dest,
     {
       NS_ASSERT_MSG(false, "FlowIo: External send requested but RxBindMode=BridgeOnly (no external port)");
     }
-    // Internal/Loopback 都走 innerDev
     dev = m_innerDev;
-    SendOnDevice(dev, dest, pkt);
+  }
+  else
+  {
+    // BridgeAndExternal：正常三模式
+    switch (mode)
+    {
+    case FlowSendMode::External:
+      dev = m_outDev;
+      break;
+    case FlowSendMode::Internal:
+      dev = m_innerDev;
+      break;
+    case FlowSendMode::Loopback:
+      NS_ASSERT_MSG(rxInDevIndexForLoopback != UINT32_MAX,
+                    "FlowIo: Loopback requires rxInDevIndexForLoopback");
+      dev = (rxInDevIndexForLoopback == m_outDev) ? m_outDev : m_innerDev;
+      break;
+    default:
+      NS_ASSERT_MSG(false, "FlowIo: unknown FlowSendMode");
+    }
+  }
+
+  if (!m_enableTxBuffer)
+  {
+    (void)SendOnDevice(dev, dest, pkt);
     return;
   }
 
-  // BridgeAndExternal：正常三模式
-  switch (mode)
+  EnsureQueueState();
+  uint32_t qid = ClassifyQueueId(dest);
+
+  if (IsTxQueuePaused(qid) || !m_txBuffer.empty())
   {
-  case FlowSendMode::External:
-    dev = m_outDev;
-    break;
-
-  case FlowSendMode::Internal:
-    dev = m_innerDev;
-    break;
-
-  case FlowSendMode::Loopback:
-    NS_ASSERT_MSG(rxInDevIndexForLoopback != UINT32_MAX,
-                  "FlowIo: Loopback requires rxInDevIndexForLoopback");
-    dev = (rxInDevIndexForLoopback == m_outDev) ? m_outDev : m_innerDev;
-    break;
-
-  default:
-    NS_ASSERT_MSG(false, "FlowIo: unknown FlowSendMode");
+    EnqueueBuffered(dev, qid, dest, pkt);
+    ScheduleDrain();
+    return;
   }
 
-  SendOnDevice(dev, dest, pkt);
+  if (!SendOnDevice(dev, dest, pkt))
+  {
+    NS_LOG_INFO("[FLOWIO][TXFAIL] dev=" << dev
+                << " qid=" << qid
+                << " size=" << pkt->GetSize()
+                << " action=buffer");
+    EnqueueBuffered(dev, qid, dest, pkt);
+    ScheduleDrain();
+  }
 }
 
 } // namespace ns3

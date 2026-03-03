@@ -152,11 +152,21 @@ class MinHopBridgeNetDevice : public NetDevice
     double m_highWatermark;
     double m_lowWatermark;
     std::map<Ptr<NetDevice>, std::map<Ptr<NetDevice>, std::set<uint32_t>>> m_pausedIngressQueueIds;
+    std::map<Ptr<NetDevice>, std::set<uint32_t>> m_pausedLocalQueueIds;
     void maybePauseUpstreamPort(Ptr<NetDevice> congestedEgress,
                                 Ptr<NetDevice> ingressPort,
                                 Mac48Address dst);
+    void maybePauseLocalFlowIo(Ptr<NetDevice> congestedEgress, Mac48Address dst);
     void sendPauseFrameToUpstream(Ptr<NetDevice> ingressPort, uint32_t queueId, bool pause);
     void handleLowWatermark(Ptr<NetDevice> port, uint32_t queueId);
+    bool sendFromWithDropStats(Ptr<NetDevice> outPort,
+                               Ptr<const Packet> packet,
+                               const Address& src,
+                               const Address& dst,
+                               uint16_t protocol,
+                               bool localInjection);
+    uint64_t m_forwardSendFailDrops;
+    uint64_t m_localSendFailDrops;
 
     int ecmpmodel=0;
     //0 随机发送 
