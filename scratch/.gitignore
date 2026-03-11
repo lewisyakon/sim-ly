@@ -6,3 +6,9 @@
 !subdir/
 !scratch-simulator.cc
 !CMakeLists.txt
+!my_AstraSimNetwork.cc
+!my_AstraSimNetwork.h
+!my_common.h
+!my_entry.h
+!test.cc
+!test1.cc

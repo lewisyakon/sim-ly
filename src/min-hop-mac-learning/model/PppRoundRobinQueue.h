@@ -341,8 +341,9 @@ PppRoundRobinQueue<Item>::Enqueue(Ptr<Item> item)
   PppHeader pppHeader;
   pp->RemoveHeader(pppHeader);
 
-  // Non-flow-control/data protocols (e.g., PAUSE 0x8808) go to high priority queue.
-  if (pppHeader.GetProtocol() != 0x9999) {
+  // Non-flow/data protocols (e.g., PAUSE 0x8808) go to high priority queue.
+  // Keep simulated flow protocols (0x9999 legacy, 0x8915 RoCEv1-like) on RR sub-queues.
+  if (pppHeader.GetProtocol() != 0x9999 && pppHeader.GetProtocol() != 0x8915) {
     m_currentTotalPackets++;
     m_priority_que.push_back(item);
     this->m_nPackets++;
