@@ -20,9 +20,17 @@
 #include "ns3/hop-count-header.h"
 #include "3PHeader.h"
 #include<map>
+#include <memory>
 #include"min-hop-bridge-net-device.h"
 #include "FlowTagHeader.h"
 #include "flow-io.h"
+#include "roce-sim-types.h"
+
+namespace ns3 {
+class RoceQpEngine;
+class RoceThreePhaseFsm;
+class RoceSimHeader;
+}
 
 
 namespace ns3 {
@@ -55,6 +63,12 @@ public:
   void set_recvhash(int tag,int src,int dst,uint64_t countnum);
   bool check_recvfunc(int tag,int src,int dst);
   bool check_recvhash(int tag,int src,int dst);
+
+  // RoCE 配置入口；未启用时保持 legacy 行为。
+  void SetRoceConfig(const RoceConfig& cfg);
+  void SetRoceMode(RoceMode mode);
+  RoceMode GetRoceMode() const;
+  bool IsRoceEnabled() const;
   
 private:
   virtual void StartApplication(void);
@@ -64,6 +78,20 @@ private:
   void SendPacket(ThreePHeader::State state, const Address& dest,uint64_t datasize,
     uint32_t tag,uint32_t src,uint32_t dst,FlowSendMode sendmodel,int mindex=0);
   void realsend(Ptr<Packet> packet,const Address& dest,FlowSendMode sendmodel,int mindex=0);
+  // 发送侧：根据当前 3P 状态构建 RoCE 头（含 opcode / phase / psn 等）。
+  bool BuildRoceTxHeader_(ThreePHeader::State state,
+                          uint64_t totalDataSize,
+                          uint32_t payloadBytes,
+                          uint32_t tag,
+                          uint32_t src,
+                          uint32_t dst,
+                          RoceSimHeader* headerOut);
+  // 接收侧：校验并消费 RoCE 头，同时驱动 completion/FSM。
+  void HandleRoceRxHeader_(const RoceSimHeader& roceHeader,
+                           ThreePHeader::State state,
+                           uint32_t tag,
+                           uint32_t src,
+                           uint32_t dst);
 
 
   std::map<pair<int,pair<int,int> >, ns3::fuc_and_par> m_sendfunctable;  // key: flowid
@@ -90,6 +118,12 @@ private:
   int reqlen,acklen;
   uint32_t localbridgeindex;
   ns3::Ptr<ns3::FlowIo> m_io;
+
+  RoceConfig m_roceCfg; // 当前节点 RoCE 配置（来自 json）
+  RoceMode m_roceMode = RoceMode::Legacy;
+  std::unique_ptr<RoceQpEngine> m_roceQpEngine;   // QP 状态机 + CQ
+  std::unique_ptr<RoceThreePhaseFsm> m_roceFsm;   // REQUEST/DATA/ACT 语义状态机
+  bool m_roceActiveLogged = false;
 };
 
 

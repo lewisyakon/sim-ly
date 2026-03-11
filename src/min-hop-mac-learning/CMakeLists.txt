@@ -13,6 +13,9 @@ set(source_files
     model/PppRoundRobinQueue.cc
     model/FlowTagHeader.cc
     model/flow-io.cc
+    model/roce-sim-header.cc
+    model/roce-qp-engine.cc
+    model/roce-three-phase-fsm.cc
 )
 set(header_files
     model/min-hop-bridge-net-device.h
@@ -25,6 +28,10 @@ set(header_files
     model/PppRoundRobinQueue.h
     model/FlowTagHeader.h
     model/flow-io.h
+    model/roce-sim-types.h
+    model/roce-sim-header.h
+    model/roce-qp-engine.h
+    model/roce-three-phase-fsm.h
 )
 
 set(libstats

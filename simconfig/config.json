@@ -1,5 +1,5 @@
 {
-  "workloadpath": "simworkload/bigworkload.txt",
+  "workloadpath": "simworkload/microAllReduce.txt",
   "thread": 1,
   "gpu_type": "A100",                
   "gpus_per_server": 4,
@@ -19,15 +19,28 @@
   },
 
   "workload": {
-    "floadtime_s": 500               
+    "floadtime_s": 500,
+    "auto_stop_on_finish": true
   },
+
 
   "topology": {
     "model": "fattree",
-    "k": 8,
-    "subnet_model": 2,              
-    "subnet_k": 8,                             
+    "k": 4,
+    "subnet_model": 0,              
+    "subnet_k": 4,                             
     "hostperleaf": 2,                            
     "switch_delay_ns_override": 100 
-  }
+  },
+
+  "roce": {
+  "enable": true,
+  "mode": "rc_3phase",
+  "data_use_write": true,
+  "strict_completion": true,
+  "sq_depth": 1024,
+  "rq_depth": 1024,
+  "ether_type": "0x9999"
+}
+
 }
