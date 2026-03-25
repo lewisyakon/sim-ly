@@ -1,10 +1,11 @@
 #include "min-hop-bridge-net-device.h"
+#include "flow-io.h"
 #include "hop-count-header.h"
 #include "pause-header.h"
-#include "flow-io.h"
 
 #include "ns3/boolean.h"
 #include "ns3/bridge-channel.h"
+#include "ns3/double.h"
 #include "ns3/log.h"
 #include "ns3/node.h"
 #include "ns3/packet.h"
@@ -16,12 +17,93 @@
 #include <algorithm>
 #include <sstream>
 #include <chrono>
+#include <mutex>
+#include <iostream>
+#include <iomanip>
 
 namespace ns3
 {
 
 NS_LOG_COMPONENT_DEFINE("MinHopBridgeNetDevice");
 NS_OBJECT_ENSURE_REGISTERED(MinHopBridgeNetDevice);
+
+namespace
+{
+struct FloodWindowSummary
+{
+    bool seen = false;
+    bool printed = false;
+    Time startSim = Time(0);
+    Time endSim = Time(0);
+    std::chrono::steady_clock::time_point startWall;
+    std::chrono::steady_clock::time_point endWall;
+};
+
+FloodWindowSummary g_floodWindowSummary;
+std::mutex g_floodWindowSummaryMutex;
+
+void
+RecordFloodWindowTouch()
+{
+    std::lock_guard<std::mutex> guard(g_floodWindowSummaryMutex);
+    Time nowSim = Simulator::Now();
+    auto nowWall = std::chrono::steady_clock::now();
+    if (!g_floodWindowSummary.seen)
+    {
+        g_floodWindowSummary.seen = true;
+        g_floodWindowSummary.startSim = nowSim;
+        g_floodWindowSummary.endSim = nowSim;
+        g_floodWindowSummary.startWall = nowWall;
+        g_floodWindowSummary.endWall = nowWall;
+        return;
+    }
+    g_floodWindowSummary.endSim = nowSim;
+    g_floodWindowSummary.endWall = nowWall;
+}
+
+void
+TryPrintFloodWindowSummaryOnce(bool printToStdout)
+{
+    std::lock_guard<std::mutex> guard(g_floodWindowSummaryMutex);
+    if (!g_floodWindowSummary.seen)
+    {
+        if (printToStdout)
+        {
+            std::cout << "[FLOOD][WINDOW][GLOBAL] status=no_data_yet (unit: sim_time=ns, wall_time=ns/ms)\n";
+        }
+        return;
+    }
+    if (g_floodWindowSummary.printed)
+    {
+        return;
+    }
+    g_floodWindowSummary.printed = true;
+    int64_t simDurationNs = (g_floodWindowSummary.endSim - g_floodWindowSummary.startSim).GetNanoSeconds();
+    int64_t wallDurationNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 g_floodWindowSummary.endWall - g_floodWindowSummary.startWall)
+                                 .count();
+    double wallDurationS = static_cast<double>(wallDurationNs) / 1e9;
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(3)
+        << "[FLOOD][WINDOW][GLOBAL]"
+        << " startSim=" << g_floodWindowSummary.startSim.GetNanoSeconds() << " ns"
+        << " endSim=" << g_floodWindowSummary.endSim.GetNanoSeconds() << " ns"
+        << " simDuration=" << simDurationNs << " ns"
+        << " wallDuration=" << wallDurationNs << " ns"
+        << " (" << wallDurationS << " s)";
+    NS_LOG_UNCOND(oss.str());
+    if (printToStdout)
+    {
+        std::cout << oss.str() << std::endl;
+    }
+}
+} // namespace
+
+void
+MinHopBridgeNetDevice::PrintFloodWindowSummary(bool printToStdout)
+{
+    TryPrintFloodWindowSummaryOnce(printToStdout);
+}
 
 TypeId
 MinHopBridgeNetDevice::GetTypeId()
@@ -42,6 +124,16 @@ MinHopBridgeNetDevice::GetTypeId()
                           BooleanValue(true),
                           MakeBooleanAccessor(&MinHopBridgeNetDevice::m_enableLearning),
                           MakeBooleanChecker())
+            .AddAttribute("PfcHighWatermark",
+                          "Pause threshold ratio for ingress/egress queue occupancy.",
+                          DoubleValue(0.8),
+                          MakeDoubleAccessor(&MinHopBridgeNetDevice::m_highWatermark),
+                          MakeDoubleChecker<double>(0.0, 1.0))
+            .AddAttribute("PfcLowWatermark",
+                          "Resume threshold ratio for ingress/egress queue occupancy.",
+                          DoubleValue(0.2),
+                          MakeDoubleAccessor(&MinHopBridgeNetDevice::m_lowWatermark),
+                          MakeDoubleChecker<double>(0.0, 1.0))
             .AddAttribute("ExpirationTime",
                           "Time it takes for learned MAC state entry to expire.",
                           TimeValue(Seconds(99999)),
@@ -58,6 +150,8 @@ MinHopBridgeNetDevice::MinHopBridgeNetDevice()
       m_enableLearning(true),
       m_highWatermark(0.8),
       m_lowWatermark(0.2),
+      m_ingressQueueDrops(0),
+      m_ingressQueueDropBytes(0),
       m_forwardSendFailDrops(0),
       m_localSendFailDrops(0)
 {
@@ -77,6 +171,38 @@ void
 MinHopBridgeNetDevice::DoDispose()
 {
     NS_LOG_FUNCTION_NOARGS();
+    uint64_t ingressRemain = 0;
+    for (auto& entry : m_ingressQueues)
+    {
+        if (entry.second)
+        {
+            ingressRemain += entry.second->GetNPackets();
+            entry.second = nullptr;
+        }
+    }
+    if (m_ingressQueueDrops > 0 || ingressRemain > 0)
+    {
+        Mac48Address bridgeMac = Mac48Address::IsMatchingType(m_address)
+                                     ? Mac48Address::ConvertFrom(m_address)
+                                     : Mac48Address("00:00:00:00:00:00");
+        NS_LOG_UNCOND("[DROP][SUMMARY][BRIDGE][INGRESS] bridge="
+                      << bridgeMac
+                      << " ingressDrops=" << m_ingressQueueDrops
+                      << " ingressDropBytes=" << m_ingressQueueDropBytes
+                      << " ingressRemain=" << ingressRemain);
+    }
+    m_ingressQueues.clear();
+    for (auto& retryEvent : m_ingressRetryEvents)
+    {
+        if (retryEvent.second.IsPending())
+        {
+            Simulator::Cancel(retryEvent.second);
+        }
+    }
+    m_ingressRetryEvents.clear();
+    m_pausedIngressQueueIds.clear();
+    m_ingressPauseUpstreamQueueIds.clear();
+    m_egressQueueCongested.clear();
     if (m_forwardSendFailDrops > 0 || m_localSendFailDrops > 0)
     {
         Mac48Address bridgeMac = Mac48Address::IsMatchingType(m_address)
@@ -87,6 +213,7 @@ MinHopBridgeNetDevice::DoDispose()
                       << " fwdSendFailDrops=" << m_forwardSendFailDrops
                       << " localSendFailDrops=" << m_localSendFailDrops);
     }
+    TryPrintFloodWindowSummaryOnce(false);
     for (auto iter = m_ports.begin(); iter != m_ports.end(); iter++)
     {
         *iter = nullptr;
@@ -102,7 +229,7 @@ void MinHopBridgeNetDevice::set_maxjump(int jump){
 }
 void MinHopBridgeNetDevice::hostsend(Ptr<NetDevice> incomingPort,Ptr<const Packet> packet,uint16_t protocol,
                     const Address& src,const Address& dst){
-    ScheduleReceive(incomingPort,packet,protocol,src,dst,PacketType::PACKET_OTHERHOST);
+    EnqueueIngressPacket(incomingPort, packet, protocol, src, dst, PacketType::PACKET_OTHERHOST);
 }
 void
 MinHopBridgeNetDevice::ReceiveFromDevice(Ptr<NetDevice> incomingPort,
@@ -112,19 +239,542 @@ MinHopBridgeNetDevice::ReceiveFromDevice(Ptr<NetDevice> incomingPort,
                                          const Address& dst,
                                          PacketType packetType)
 {
-    // NS_LOG_FUNCTION_NOARGS();
-    // NS_LOG_DEBUG("UID is " << packet->GetUid());
+    EnqueueIngressPacket(incomingPort, packet, protocol, src, dst, packetType);
+}
 
-    Ptr<Packet> p = packet->Copy();
-    Simulator::Schedule(m_switchDelay,
-                        &MinHopBridgeNetDevice::ScheduleReceive,
-                        this,
-                        incomingPort,
-                        p,
-                        protocol,
-                        src,
-                        dst,
-                        packetType);
+bool
+MinHopBridgeNetDevice::EnqueueIngressPacket(Ptr<NetDevice> incomingPort,
+                                            Ptr<const Packet> packet,
+                                            uint16_t protocol,
+                                            const Address& src,
+                                            const Address& dst,
+                                            PacketType packetType,
+                                            bool addSwitchDelay)
+{
+    auto qIt = m_ingressQueues.find(incomingPort);
+    if (qIt == m_ingressQueues.end() || !qIt->second)
+    {
+        ++m_ingressQueueDrops;
+        m_ingressQueueDropBytes += packet ? packet->GetSize() : 0;
+        static uint64_t sIngressNoQueueDropLogCount = 0;
+        std::ostringstream ingressPortDesc;
+        if (incomingPort)
+        {
+            ingressPortDesc << Mac48Address::ConvertFrom(incomingPort->GetAddress());
+        }
+        else
+        {
+            ingressPortDesc << "LOCAL";
+        }
+        if (sIngressNoQueueDropLogCount < 20 || (sIngressNoQueueDropLogCount % 1000) == 0)
+        {
+            NS_LOG_UNCOND("[DROP][BRIDGE][INGRESS_QUEUE_MISSING] bridge="
+                          << Mac48Address::ConvertFrom(m_address)
+                          << " inPort=" << ingressPortDesc.str()
+                          << " src=" << Mac48Address::ConvertFrom(src)
+                          << " dst=" << Mac48Address::ConvertFrom(dst)
+                          << " proto=0x" << std::hex << protocol << std::dec
+                          << " pktSize=" << (packet ? packet->GetSize() : 0)
+                          << " totalDrops=" << m_ingressQueueDrops);
+        }
+        ++sIngressNoQueueDropLogCount;
+        return false;
+    }
+
+    Ptr<Packet> ingressPacket = packet->Copy();
+    PppHeader ingressHeader;
+    ingressHeader.SetProtocol(protocol);
+    ingressHeader.SetSrcMac(src);
+    ingressHeader.SetDstMac(dst);
+    ingressPacket->AddHeader(ingressHeader);
+
+    if (!qIt->second->Enqueue(ingressPacket))
+    {
+        ++m_ingressQueueDrops;
+        m_ingressQueueDropBytes += ingressPacket->GetSize();
+        static uint64_t sIngressDropLogCount = 0;
+        std::ostringstream ingressPortDesc;
+        if (incomingPort)
+        {
+            ingressPortDesc << Mac48Address::ConvertFrom(incomingPort->GetAddress());
+        }
+        else
+        {
+            ingressPortDesc << "LOCAL";
+        }
+        if (sIngressDropLogCount < 20 || (sIngressDropLogCount % 1000) == 0)
+        {
+            NS_LOG_UNCOND("[DROP][BRIDGE][INGRESS_QUEUE_FULL] bridge="
+                          << Mac48Address::ConvertFrom(m_address)
+                          << " inPort=" << ingressPortDesc.str()
+                          << " src=" << Mac48Address::ConvertFrom(src)
+                          << " dst=" << Mac48Address::ConvertFrom(dst)
+                          << " proto=0x" << std::hex << protocol << std::dec
+                          << " pktSize=" << ingressPacket->GetSize()
+                          << " totalDrops=" << m_ingressQueueDrops);
+        }
+        ++sIngressDropLogCount;
+        return false;
+    }
+
+    if (Mac48Address::IsMatchingType(dst))
+    {
+        UpdateIngressPauseStateOnEnqueue(incomingPort, Mac48Address::ConvertFrom(dst));
+    }
+
+    auto& ev = m_ingressRetryEvents[incomingPort];
+    if (!ev.IsPending())
+    {
+        if (addSwitchDelay && m_switchDelay.IsStrictlyPositive())
+        {
+            ev = Simulator::Schedule(m_switchDelay,
+                                     &MinHopBridgeNetDevice::DrainIngressQueue,
+                                     this,
+                                     incomingPort);
+        }
+        else
+        {
+            ev = Simulator::ScheduleNow(&MinHopBridgeNetDevice::DrainIngressQueue,
+                                        this,
+                                        incomingPort);
+        }
+    }
+    return true;
+}
+
+void
+MinHopBridgeNetDevice::ScheduleIngressDrainRetry(Ptr<NetDevice> incomingPort)
+{
+    auto& ev = m_ingressRetryEvents[incomingPort];
+    if (!ev.IsPending())
+    {
+        Time retryDelay = (m_switchDelay.IsStrictlyPositive() ? m_switchDelay : MicroSeconds(1));
+        ev = Simulator::Schedule(retryDelay,
+                                 &MinHopBridgeNetDevice::DrainIngressQueue,
+                                 this,
+                                 incomingPort);
+    }
+}
+
+bool
+MinHopBridgeNetDevice::RefreshEgressQueueCongestionStateByQid(Ptr<NetDevice> egressPort,
+                                                               uint32_t queueId,
+                                                               bool anticipateEnqueue)
+{
+    Ptr<PointToPointNetDevice> egressP2p = DynamicCast<PointToPointNetDevice>(egressPort);
+    Ptr<PppRoundRobinQueue<Packet>> egressQueue =
+        egressP2p ? DynamicCast<PppRoundRobinQueue<Packet>>(egressP2p->GetQueue()) : nullptr;
+    if (!egressQueue)
+    {
+        return false;
+    }
+
+    const uint32_t maxPerQueue = egressQueue->GetMaxPacketsPerQueue();
+    if (maxPerQueue == 0)
+    {
+        return false;
+    }
+
+    uint32_t qLen = egressQueue->GetSubQueueLength(queueId);
+    if (anticipateEnqueue)
+    {
+        ++qLen;
+    }
+    double ratio = static_cast<double>(qLen) / static_cast<double>(maxPerQueue);
+
+    bool& congested = m_egressQueueCongested[egressPort][queueId];
+    if (!congested && ratio >= m_highWatermark)
+    {
+        congested = true;
+    }
+    else if (congested && ratio <= m_lowWatermark)
+    {
+        congested = false;
+    }
+    return congested;
+}
+
+bool
+MinHopBridgeNetDevice::IsEgressQueueCongested(Ptr<NetDevice> egressPort,
+                                              Mac48Address dst,
+                                              bool anticipateEnqueue)
+{
+    Ptr<PointToPointNetDevice> egressP2p = DynamicCast<PointToPointNetDevice>(egressPort);
+    Ptr<PppRoundRobinQueue<Packet>> egressQueue =
+        egressP2p ? DynamicCast<PppRoundRobinQueue<Packet>>(egressP2p->GetQueue()) : nullptr;
+    if (!egressQueue)
+    {
+        return false;
+    }
+
+    uint32_t queueId = egressQueue->GetQueueIndexByDst(dst);
+    return RefreshEgressQueueCongestionStateByQid(egressPort, queueId, anticipateEnqueue);
+}
+
+void
+MinHopBridgeNetDevice::UpdateIngressPauseStateOnEnqueue(Ptr<NetDevice> ingressPort, Mac48Address dst)
+{
+    auto qIt = m_ingressQueues.find(ingressPort);
+    if (qIt == m_ingressQueues.end() || !qIt->second)
+    {
+        return;
+    }
+
+    const uint32_t ingressNumQueues = qIt->second->GetNumQueues();
+    if (ingressNumQueues == 0)
+    {
+        return;
+    }
+    const uint32_t ingressMaxPerQueue = qIt->second->GetMaxPacketsPerQueue();
+    if (ingressMaxPerQueue == 0)
+    {
+        return;
+    }
+
+    uint32_t ingressQueueId = qIt->second->GetQueueIndexByDst(dst) % ingressNumQueues;
+    double ratio = static_cast<double>(qIt->second->GetSubQueueLength(ingressQueueId)) /
+                   static_cast<double>(ingressMaxPerQueue);
+    auto& pausedQids = m_pausedIngressQueueIds[ingressPort];
+    if (ratio >= m_highWatermark && pausedQids.insert(ingressQueueId).second)
+    {
+        if (!ingressPort)
+        {
+            FlowIo::PauseNodeQueue(m_node, ingressQueueId);
+            if (IsPfcFullLogEnabled())
+            {
+                NS_LOG_UNCOND("[PFC][THRESH][LOCAL][PAUSE] bridge="
+                              << Mac48Address::ConvertFrom(GetAddress())
+                              << " node=" << (m_node ? m_node->GetId() : 0)
+                              << " qid=" << ingressQueueId
+                              << " ratio=" << ratio
+                              << " len=" << qIt->second->GetSubQueueLength(ingressQueueId)
+                              << " maxPerQueue=" << ingressMaxPerQueue
+                              << " dst=" << dst
+                              << " t=" << Simulator::Now().GetSeconds() << "s");
+            }
+            return;
+        }
+
+        uint32_t upstreamQueueId = ingressQueueId;
+        Ptr<PointToPointNetDevice> ingressP2p = DynamicCast<PointToPointNetDevice>(ingressPort);
+        Ptr<PppRoundRobinQueue<Packet>> upstreamQueue =
+            ingressP2p ? DynamicCast<PppRoundRobinQueue<Packet>>(ingressP2p->GetQueue()) : nullptr;
+        if (upstreamQueue)
+        {
+            const uint32_t upstreamNumQueues = upstreamQueue->GetNumQueues();
+            if (upstreamNumQueues > 0)
+            {
+                upstreamQueueId = upstreamQueue->GetQueueIndexByDst(dst) % upstreamNumQueues;
+            }
+        }
+        m_ingressPauseUpstreamQueueIds[ingressPort][ingressQueueId] = upstreamQueueId;
+        if (IsPfcFullLogEnabled())
+        {
+            NS_LOG_UNCOND("[PFC][THRESH][NONLOCAL][PAUSE] bridge="
+                          << Mac48Address::ConvertFrom(GetAddress())
+                          << " ingressPort=" << Mac48Address::ConvertFrom(ingressPort->GetAddress())
+                          << " ingressQid=" << ingressQueueId
+                          << " upstreamQid=" << upstreamQueueId
+                          << " ratio=" << ratio
+                          << " len=" << qIt->second->GetSubQueueLength(ingressQueueId)
+                          << " maxPerQueue=" << ingressMaxPerQueue
+                          << " dst=" << dst
+                          << " t=" << Simulator::Now().GetSeconds() << "s");
+        }
+        sendPauseFrameToUpstream(ingressPort, upstreamQueueId, true);
+    }
+}
+
+void
+MinHopBridgeNetDevice::UpdateIngressPauseStateOnDequeue(Ptr<NetDevice> ingressPort, uint32_t queueId)
+{
+    auto qIt = m_ingressQueues.find(ingressPort);
+    auto pausedIt = m_pausedIngressQueueIds.find(ingressPort);
+    if (qIt == m_ingressQueues.end() || !qIt->second || pausedIt == m_pausedIngressQueueIds.end())
+    {
+        return;
+    }
+
+    const uint32_t ingressNumQueues = qIt->second->GetNumQueues();
+    if (ingressNumQueues == 0)
+    {
+        return;
+    }
+    queueId %= ingressNumQueues;
+
+    const uint32_t ingressMaxPerQueue = qIt->second->GetMaxPacketsPerQueue();
+    if (ingressMaxPerQueue == 0)
+    {
+        return;
+    }
+
+    double ratio = static_cast<double>(qIt->second->GetSubQueueLength(queueId)) /
+                   static_cast<double>(ingressMaxPerQueue);
+    if (ratio <= m_lowWatermark && pausedIt->second.erase(queueId) > 0)
+    {
+        if (!ingressPort)
+        {
+            FlowIo::ResumeNodeQueue(m_node, queueId);
+            if (IsPfcFullLogEnabled())
+            {
+                NS_LOG_UNCOND("[PFC][THRESH][LOCAL][RESUME] bridge="
+                              << Mac48Address::ConvertFrom(GetAddress())
+                              << " node=" << (m_node ? m_node->GetId() : 0)
+                              << " qid=" << queueId
+                              << " ratio=" << ratio
+                              << " len=" << qIt->second->GetSubQueueLength(queueId)
+                              << " maxPerQueue=" << ingressMaxPerQueue
+                              << " t=" << Simulator::Now().GetSeconds() << "s");
+            }
+            if (pausedIt->second.empty())
+            {
+                m_pausedIngressQueueIds.erase(pausedIt);
+                m_ingressPauseUpstreamQueueIds.erase(ingressPort);
+            }
+            return;
+        }
+
+        uint32_t upstreamQueueId = queueId;
+        auto upstreamMapIt = m_ingressPauseUpstreamQueueIds.find(ingressPort);
+        if (upstreamMapIt != m_ingressPauseUpstreamQueueIds.end())
+        {
+            auto qidMapIt = upstreamMapIt->second.find(queueId);
+            if (qidMapIt != upstreamMapIt->second.end())
+            {
+                upstreamQueueId = qidMapIt->second;
+                upstreamMapIt->second.erase(qidMapIt);
+            }
+            if (upstreamMapIt->second.empty())
+            {
+                m_ingressPauseUpstreamQueueIds.erase(upstreamMapIt);
+            }
+        }
+        if (IsPfcFullLogEnabled())
+        {
+            NS_LOG_UNCOND("[PFC][THRESH][NONLOCAL][RESUME] bridge="
+                          << Mac48Address::ConvertFrom(GetAddress())
+                          << " ingressPort=" << Mac48Address::ConvertFrom(ingressPort->GetAddress())
+                          << " ingressQid=" << queueId
+                          << " upstreamQid=" << upstreamQueueId
+                          << " ratio=" << ratio
+                          << " len=" << qIt->second->GetSubQueueLength(queueId)
+                          << " maxPerQueue=" << ingressMaxPerQueue
+                          << " t=" << Simulator::Now().GetSeconds() << "s");
+        }
+        sendPauseFrameToUpstream(ingressPort, upstreamQueueId, false);
+    }
+    if (pausedIt->second.empty())
+    {
+        m_pausedIngressQueueIds.erase(pausedIt);
+        m_ingressPauseUpstreamQueueIds.erase(ingressPort);
+    }
+}
+
+bool
+MinHopBridgeNetDevice::HasAvailableUnicastPath(Ptr<NetDevice> incomingPort, Mac48Address dst)
+{
+    std::vector<Ptr<NetDevice>> learnedPorts = GetLearnedState(dst);
+    if (!learnedPorts.empty())
+    {
+        for (auto const& port : learnedPorts)
+        {
+            if (!port || port == incomingPort)
+            {
+                continue;
+            }
+            if (!IsEgressQueueCongested(port, dst, true))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    for (auto const& port : m_ports)
+    {
+        if (!port || port == incomingPort)
+        {
+            continue;
+        }
+        if (!IsEgressQueueCongested(port, dst, true))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool
+MinHopBridgeNetDevice::HasAvailableFloodPath(Ptr<NetDevice> incomingPort, Mac48Address dst)
+{
+    for (auto const& port : m_ports)
+    {
+        if (!port || port == incomingPort)
+        {
+            continue;
+        }
+        if (!IsEgressQueueCongested(port, dst, true))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+void
+MinHopBridgeNetDevice::DrainIngressQueue(Ptr<NetDevice> incomingPort)
+{
+    auto evIt = m_ingressRetryEvents.find(incomingPort);
+    if (evIt != m_ingressRetryEvents.end() && !evIt->second.IsPending())
+    {
+        evIt->second = EventId();
+    }
+
+    auto qIt = m_ingressQueues.find(incomingPort);
+    if (qIt == m_ingressQueues.end() || !qIt->second)
+    {
+        return;
+    }
+
+    Ptr<const Packet> head = qIt->second->Peek();
+    if (!head)
+    {
+        return;
+    }
+
+    Ptr<Packet> headCopy = head->Copy();
+    PppHeader headIngressHeader;
+    if (headCopy->RemoveHeader(headIngressHeader) == 0)
+    {
+        NS_LOG_WARN("Ingress queue head missing synthetic PPP header; dropping head.");
+        qIt->second->Dequeue();
+        if (qIt->second->GetNPackets() > 0)
+        {
+            auto& ev = m_ingressRetryEvents[incomingPort];
+            if (!ev.IsPending())
+            {
+                if (incomingPort && m_switchDelay.IsStrictlyPositive())
+                {
+                    ev = Simulator::Schedule(m_switchDelay,
+                                             &MinHopBridgeNetDevice::DrainIngressQueue,
+                                             this,
+                                             incomingPort);
+                }
+                else
+                {
+                    ev = Simulator::ScheduleNow(&MinHopBridgeNetDevice::DrainIngressQueue,
+                                                this,
+                                                incomingPort);
+                }
+            }
+        }
+        return;
+    }
+
+    Address headDst = headIngressHeader.GetDstMac();
+    PacketType headPacketType = InferPacketTypeFromDst(headDst, PacketType::PACKET_OTHERHOST);
+    if (Mac48Address::IsMatchingType(headDst))
+    {
+        Mac48Address dst48 = Mac48Address::ConvertFrom(headDst);
+        bool isFlood = false;
+        HopCountHeader hopHeader;
+        if (headCopy->PeekHeader(hopHeader) > 0)
+        {
+            isFlood = hopHeader.IsFlood();
+        }
+
+        bool shouldCheckAvailability = false;
+        bool hasPath = true;
+        if (headPacketType == PacketType::PACKET_OTHERHOST &&
+            dst48 != Mac48Address::ConvertFrom(m_address))
+        {
+            shouldCheckAvailability = true;
+            hasPath = isFlood ? HasAvailableFloodPath(incomingPort, dst48)
+                              : HasAvailableUnicastPath(incomingPort, dst48);
+        }
+        else if (headPacketType == PacketType::PACKET_BROADCAST ||
+                 headPacketType == PacketType::PACKET_MULTICAST)
+        {
+            shouldCheckAvailability = true;
+            hasPath = HasAvailableFloodPath(incomingPort, dst48);
+        }
+
+        if (shouldCheckAvailability && !hasPath)
+        {
+            ScheduleIngressDrainRetry(incomingPort);
+            return;
+        }
+    }
+
+    Ptr<Packet> p = qIt->second->Dequeue();
+    if (!p)
+    {
+        return;
+    }
+
+    uint32_t dequeuedQueueId = 0;
+    if (qIt->second->GetLastDequeuedSubQueueId(dequeuedQueueId))
+    {
+        UpdateIngressPauseStateOnDequeue(incomingPort, dequeuedQueueId);
+    }
+
+    PppHeader ingressHeader;
+    if (p->RemoveHeader(ingressHeader) == 0)
+    {
+        NS_LOG_WARN("Ingress packet missing synthetic PPP header; dropping.");
+        return;
+    }
+
+    uint16_t protocol = ingressHeader.GetProtocol();
+    Address src = ingressHeader.GetSrcMac();
+    Address dst = ingressHeader.GetDstMac();
+    PacketType packetType = InferPacketTypeFromDst(dst, PacketType::PACKET_OTHERHOST);
+    ScheduleReceive(incomingPort, p, protocol, src, dst, packetType);
+
+    if (qIt->second->GetNPackets() > 0)
+    {
+        auto& ev = m_ingressRetryEvents[incomingPort];
+        if (!ev.IsPending())
+        {
+            if (incomingPort && m_switchDelay.IsStrictlyPositive())
+            {
+                ev = Simulator::Schedule(m_switchDelay,
+                                         &MinHopBridgeNetDevice::DrainIngressQueue,
+                                         this,
+                                         incomingPort);
+            }
+            else
+            {
+                ev = Simulator::ScheduleNow(&MinHopBridgeNetDevice::DrainIngressQueue,
+                                            this,
+                                            incomingPort);
+            }
+        }
+    }
+}
+
+NetDevice::PacketType
+MinHopBridgeNetDevice::InferPacketTypeFromDst(const Address& dst, PacketType fallback) const
+{
+    if (!Mac48Address::IsMatchingType(dst))
+    {
+        return fallback;
+    }
+
+    Mac48Address dst48 = Mac48Address::ConvertFrom(dst);
+    if (dst48 == Mac48Address::GetBroadcast())
+    {
+        return NetDevice::PACKET_BROADCAST;
+    }
+    if (dst48.IsGroup())
+    {
+        return NetDevice::PACKET_MULTICAST;
+    }
+    if (dst48 == Mac48Address::ConvertFrom(m_address))
+    {
+        return NetDevice::PACKET_HOST;
+    }
+    return NetDevice::PACKET_OTHERHOST;
 }
 
 void
@@ -138,6 +788,7 @@ MinHopBridgeNetDevice::ScheduleReceive(Ptr<NetDevice> incomingPort,
     Ptr<Packet> p = packet->Copy();
     HopCountHeader hopHeader;
     uint8_t currentHops = 0, newHops = 0;
+    bool allowFloodForwarding = true;
 
     Mac48Address src48 = Mac48Address::ConvertFrom(src);
     Mac48Address dst48 = Mac48Address::ConvertFrom(dst);
@@ -154,12 +805,18 @@ MinHopBridgeNetDevice::ScheduleReceive(Ptr<NetDevice> incomingPort,
             bool flagmin = Learn(src48, incomingPort, newHops);
 
             hopHeader.SetHopCount(newHops);      
-            if (newHops >= maxjump || flagmin == false)
+            if (newHops > maxjump)
             {
                 // NS_LOG_LOGIC("Packet " << p->GetUid() << " dropped, hop count limit reached ("
                 //                     << (uint32_t)newHops << " >= 4)");
                 return; // Stop processing this packet
-            }            
+            }
+            if (flagmin == false)
+            {
+                // Non-minimal flood replicas should not keep propagating,
+                // but they may still be destined to the local host.
+                allowFloodForwarding = false;
+            }
         }
         else{
             // Time now1=Simulator::Now();
@@ -190,22 +847,34 @@ MinHopBridgeNetDevice::ScheduleReceive(Ptr<NetDevice> incomingPort,
     case PACKET_MULTICAST:
         // Pass up to local applications, then flood to other ports.
         // m_rxCallback(this, p, protocol, src);
-        ForwardBroadcast(incomingPort, p, protocol, src48, dst48);
+        if (newHops == 0 || allowFloodForwarding)
+        {
+            ForwardBroadcast(incomingPort, p, protocol, src48, dst48);
+        }
         break;
 
     case PACKET_OTHERHOST:
         // Packet is unicast, but not for us. Forward it.
         if (dst48 != m_address)
         {
+            const bool localInjection = (incomingPort == nullptr);
             if (newHops > 0)
             {
+                if (!allowFloodForwarding)
+                {
+                    break;
+                }
+                RecordFloodWindowTouch();
                 for (auto iter = m_ports.begin(); iter != m_ports.end(); iter++)
                 {
                     Ptr<NetDevice> port = *iter;
                     if (port != incomingPort)
                     {
-                        maybePauseUpstreamPort(port, incomingPort, dst48);
-                        sendFromWithDropStats(port, p, src, dst, protocol, false);
+                        if (IsEgressQueueCongested(port, dst48, true))
+                        {
+                            continue;
+                        }
+                        sendFromWithDropStats(port, p, src, dst, protocol, localInjection);
                     }
                 }
             }
@@ -247,13 +916,33 @@ MinHopBridgeNetDevice::AddEntry(Mac48Address mac, const std::vector<uint32_t>& p
 
 Ptr<NetDevice>
 MinHopBridgeNetDevice::ecmp(std::vector<Ptr<NetDevice> > outPorts, Mac48Address src,  Mac48Address dst, uint64_t uid){
+    std::vector<Ptr<NetDevice>> candidatePorts;
+    candidatePorts.reserve(outPorts.size());
+    for (auto const& outPort : outPorts)
+    {
+        if (!outPort)
+        {
+            continue;
+        }
+        if (IsEgressQueueCongested(outPort, dst, true))
+        {
+            continue;
+        }
+        candidatePorts.push_back(outPort);
+    }
+
+    if (candidatePorts.empty())
+    {
+        return nullptr;
+    }
+
     if (ecmpmodel==0){//随机转发
         auto nowsys = std::chrono::system_clock::now();
         auto duration = nowsys.time_since_epoch();
         uint64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
         uint32_t seed = static_cast<uint32_t>(now);
-        uint32_t index = seed % outPorts.size();
-        Ptr<NetDevice> outPort = outPorts[index];
+        uint32_t index = seed % candidatePorts.size();
+        Ptr<NetDevice> outPort = candidatePorts[index];
 
         return outPort;
     }
@@ -273,9 +962,9 @@ MinHopBridgeNetDevice::ecmp(std::vector<Ptr<NetDevice> > outPorts, Mac48Address 
         size_t hash = hasher(key);
 
         // 取模得到输出端口索引
-        uint32_t index = hash % outPorts.size();
+        uint32_t index = hash % candidatePorts.size();
         // NS_LOG_INFO("m_address (converted to MAC): " << m_address);
-        return outPorts[index];
+        return candidatePorts[index];
     }
     if (ecmpmodel==2){//哈希测试
         // --- 全部内嵌的小工具 ---
@@ -312,10 +1001,10 @@ MinHopBridgeNetDevice::ecmp(std::vector<Ptr<NetDevice> > outPorts, Mac48Address 
         h ^= fmix64(k3); h = rotl64(h,27) * 0x9ddfea08eb382d69ULL;
         h ^= fmix64(k4); h = fmix64(h);
 
-        uint32_t idx = fastrange64(h, (uint32_t)outPorts.size());
-        return outPorts[idx];
+        uint32_t idx = fastrange64(h, (uint32_t)candidatePorts.size());
+        return candidatePorts[idx];
     }
-    return nullptr;
+    return candidatePorts.front();
 }
 
 void
@@ -330,6 +1019,7 @@ MinHopBridgeNetDevice::ForwardUnicast(Ptr<NetDevice> incomingPort,
     //              << incomingPort->GetInstanceTypeId().GetName() << ", packet=" << packet
     //              << ", protocol=" << protocol << ", src=" << src << ", dst=" << dst << ")");
 
+    const bool localInjection = (incomingPort == nullptr);
     std::vector<Ptr<NetDevice> > outPort = GetLearnedState(dst);
     // for(auto p:outPort)
     // {
@@ -339,15 +1029,27 @@ MinHopBridgeNetDevice::ForwardUnicast(Ptr<NetDevice> incomingPort,
 
     if (!outPort.empty())
     {
-        Ptr<NetDevice> realoutport=ecmp(outPort,src,dst,packet->GetUid());
+        std::vector<Ptr<NetDevice>> ecmpCandidates;
+        ecmpCandidates.reserve(outPort.size());
+        for (auto const& port : outPort)
+        {
+            if (!port || port == incomingPort)
+            {
+                continue;
+            }
+            if (IsEgressQueueCongested(port, dst, true))
+            {
+                continue;
+            }
+            ecmpCandidates.push_back(port);
+        }
+        Ptr<NetDevice> realoutport = ecmp(ecmpCandidates, src, dst, packet->GetUid());
 
-        if (realoutport!=incomingPort){
-            // Detect congestion on egress and pause the corresponding upstream ingress link.
-            maybePauseUpstreamPort(realoutport, incomingPort, dst);
-
+        if (realoutport)
+        {
             // NS_LOG_LOGIC("Learning bridge state says to use port `"
             //          << realoutport->GetInstanceTypeId().GetName() << "'");
-            sendFromWithDropStats(realoutport, packet, src, dst, protocol, false);
+            sendFromWithDropStats(realoutport, packet, src, dst, protocol, localInjection);
         }
         
         // for (int i=0;i<outPort.size();i++){
@@ -358,6 +1060,18 @@ MinHopBridgeNetDevice::ForwardUnicast(Ptr<NetDevice> incomingPort,
     }
     else
     {
+        RecordFloodWindowTouch();
+        // Unknown unicast: treat as flooded traffic so downstream bridges apply hop-limit
+        // and learning logic consistently.
+        Ptr<Packet> floodedPacket = packet->Copy();
+        HopCountHeader floodHeader;
+        if (floodedPacket->RemoveHeader(floodHeader) > 0)
+        {
+            floodHeader.SetIsFlood(true);
+            floodedPacket->AddHeader(floodHeader);
+        }
+        Ptr<const Packet> txPacket = floodedPacket;
+
         // NS_LOG_LOGIC("At time:"<<Simulator::Now().GetSeconds()<< "s");
         // NS_LOG_INFO("No learned state: send through all ports");
         for (auto iter = m_ports.begin(); iter != m_ports.end(); iter++)
@@ -365,13 +1079,16 @@ MinHopBridgeNetDevice::ForwardUnicast(Ptr<NetDevice> incomingPort,
             Ptr<NetDevice> port = *iter;
             if (port != incomingPort)
             {
-                maybePauseUpstreamPort(port, incomingPort, dst);
+                if (IsEgressQueueCongested(port, dst, true))
+                {
+                    continue;
+                }
                 // NS_LOG_LOGIC("LearningBridgeForward ("
                 //              << src << " => " << dst
                 //              << "): " << incomingPort->GetInstanceTypeId().GetName() << " --> "
                 //              << port->GetInstanceTypeId().GetName() << " (UID " << packet->GetUid()
                 //              << ").");
-                sendFromWithDropStats(port, packet, src, dst, protocol, false);
+                sendFromWithDropStats(port, txPacket, src, dst, protocol, localInjection);
             }
         }
     }
@@ -385,6 +1102,17 @@ MinHopBridgeNetDevice::ForwardBroadcast(Ptr<NetDevice> incomingPort,
                                         Mac48Address dst)
 {
     NS_LOG_FUNCTION_NOARGS();
+    const bool localInjection = (incomingPort == nullptr);
+    RecordFloodWindowTouch();
+
+    Ptr<Packet> floodedPacket = packet->Copy();
+    HopCountHeader floodHeader;
+    if (floodedPacket->RemoveHeader(floodHeader) > 0)
+    {
+        floodHeader.SetIsFlood(true);
+        floodedPacket->AddHeader(floodHeader);
+    }
+    Ptr<const Packet> txPacket = floodedPacket;
 
     // --- FIX: Learning is now done in ReceiveFromDevice, no need to do it here ---
 
@@ -393,11 +1121,14 @@ MinHopBridgeNetDevice::ForwardBroadcast(Ptr<NetDevice> incomingPort,
         Ptr<NetDevice> port = *iter;
         if (port != incomingPort)
         {
-            maybePauseUpstreamPort(port, incomingPort, dst);
+            if (IsEgressQueueCongested(port, dst, true))
+            {
+                continue;
+            }
             // NS_LOG_LOGIC("Flooding (" << src << " => " << dst << "): "
             //                           << " --> port " << port->GetIfIndex()
             //                           << " (UID " << packet->GetUid() << ").");
-            sendFromWithDropStats(port, packet, src, dst, protocol, false);
+            sendFromWithDropStats(port, txPacket, src, dst, protocol, localInjection);
         }
     }
 }
@@ -597,6 +1328,40 @@ MinHopBridgeNetDevice::GetBridgePort(uint32_t n) const
     return m_ports[n];
 }
 
+std::vector<MinHopBridgeNetDevice::IngressQueueSnapshot>
+MinHopBridgeNetDevice::GetIngressQueueSnapshots() const
+{
+    std::vector<IngressQueueSnapshot> snapshots;
+    snapshots.reserve(m_ports.size());
+
+    for (uint32_t portIndex = 0; portIndex < m_ports.size(); ++portIndex)
+    {
+        Ptr<NetDevice> port = m_ports[portIndex];
+        auto qIt = m_ingressQueues.find(port);
+        if (qIt == m_ingressQueues.end() || !qIt->second)
+        {
+            continue;
+        }
+
+        IngressQueueSnapshot snapshot;
+        snapshot.portIndex = portIndex;
+        snapshot.portMac = Mac48Address::ConvertFrom(port->GetAddress());
+        snapshot.maxPacketsPerQueue = qIt->second->GetMaxPacketsPerQueue();
+        const uint32_t numQueues = qIt->second->GetNumQueues();
+        snapshot.subQueueLengths.reserve(numQueues);
+        snapshot.subQueueDropPackets.reserve(numQueues);
+        for (uint32_t qid = 0; qid < numQueues; ++qid)
+        {
+            snapshot.subQueueLengths.push_back(qIt->second->GetSubQueueLength(qid));
+            snapshot.subQueueDropPackets.push_back(qIt->second->GetSubQueueDropPackets(qid));
+        }
+
+        snapshots.push_back(snapshot);
+    }
+
+    return snapshots;
+}
+
 void
 MinHopBridgeNetDevice::AddBridgePort(Ptr<NetDevice> bridgePort)
 {
@@ -615,17 +1380,50 @@ MinHopBridgeNetDevice::AddBridgePort(Ptr<NetDevice> bridgePort)
         m_address = Mac48Address::ConvertFrom(bridgePort->GetAddress());
         is_set_address = true;
     }
-    // bool connected = bridgePort -> TraceConnectWithoutContext("HighWatermark",
-    //                             MakeCallback(&MinHopBridgeNetDevice::handleHighWatermark,this).Bind(bridgePort));
-    // if(!connected){
-    //     NS_LOG_ERROR("fail to connect highwatermark");
-    // }     
-    
-    bool connected = bridgePort -> TraceConnectWithoutContext("LowWatermark",
-                                MakeCallback(&MinHopBridgeNetDevice::handleLowWatermark,this).Bind(bridgePort));
-    if(!connected){
-        NS_LOG_ERROR("fail to connect lowwatermark");
-    }                                    
+
+    Ptr<PointToPointNetDevice> bridgeP2p = DynamicCast<PointToPointNetDevice>(bridgePort);
+    if (!bridgeP2p)
+    {
+        NS_FATAL_ERROR("MinHopBridgeNetDevice only supports PointToPointNetDevice bridge ports when RRQ "
+                       "is enabled.");
+    }
+
+    Ptr<PppRoundRobinQueue<Packet>> egressQueue =
+        DynamicCast<PppRoundRobinQueue<Packet>>(bridgeP2p->GetQueue());
+    if (!egressQueue)
+    {
+        NS_FATAL_ERROR("Bridge expects P2P egress queue to be pre-configured as "
+                       "ns3::PppRoundRobinQueue in topology setup. port="
+                       << Mac48Address::ConvertFrom(bridgePort->GetAddress()));
+    }
+    const uint32_t ingressNumQueues = egressQueue->GetNumQueues();
+    const uint32_t ingressMaxPacketsPerQueue = egressQueue->GetMaxPacketsPerQueue();
+    if (ingressNumQueues == 0 || ingressMaxPacketsPerQueue == 0)
+    {
+        NS_FATAL_ERROR("Bridge found invalid RRQ egress config (NumQueues/MaxPacketsPerQueue == 0). "
+                       "port=" << Mac48Address::ConvertFrom(bridgePort->GetAddress()));
+    }
+
+    Ptr<PppRoundRobinQueue<Packet>> ingressQueue = CreateObject<PppRoundRobinQueue<Packet>>();
+    ingressQueue->SetAttribute("NumQueues", UintegerValue(ingressNumQueues));
+    ingressQueue->SetAttribute("MaxPacketsPerQueue", UintegerValue(ingressMaxPacketsPerQueue));
+    m_ingressQueues[bridgePort] = ingressQueue;
+
+    auto localIngressIt = m_ingressQueues.find(nullptr);
+    if (localIngressIt == m_ingressQueues.end() || !localIngressIt->second)
+    {
+        // nullptr key is a sentinel for locally injected packets via bridge SendFrom().
+        Ptr<PppRoundRobinQueue<Packet>> localIngressQueue = CreateObject<PppRoundRobinQueue<Packet>>();
+        m_ingressQueues[nullptr] = localIngressQueue;
+        localIngressIt = m_ingressQueues.find(nullptr);
+    }
+    if (localIngressIt != m_ingressQueues.end() && localIngressIt->second)
+    {
+        // Keep local ingress queue config aligned with bridge egress queue config.
+        localIngressIt->second->SetAttribute("NumQueues", UintegerValue(ingressNumQueues));
+        localIngressIt->second->SetAttribute("MaxPacketsPerQueue",
+                                             UintegerValue(ingressMaxPacketsPerQueue));
+    }
 
     NS_LOG_DEBUG("RegisterProtocolHandler for " << bridgePort->GetInstanceTypeId().GetName());
     m_node->RegisterProtocolHandler(MakeCallback(&MinHopBridgeNetDevice::ReceiveFromDevice, this),
@@ -761,36 +1559,8 @@ MinHopBridgeNetDevice::SendFrom(Ptr<Packet> packet,
                                 uint16_t protocolNumber)
 {
     NS_LOG_FUNCTION_NOARGS();
-    Mac48Address dst = Mac48Address::ConvertFrom(dest);
-
-    if (!dst.IsGroup())
-    {
-        std::vector<Ptr<NetDevice>> outPorts = GetLearnedState(dst);
-        if (!outPorts.empty())
-        {
-            bool allOk = true;
-            for (auto const& outPort : outPorts)
-            {
-                maybePauseLocalFlowIo(outPort, dst);
-                bool ok = sendFromWithDropStats(outPort, packet, src, dest, protocolNumber, true);
-                allOk = ok && allOk;
-            }
-            return allOk;
-        }
-    }
-
-    bool allOk = true;
-    bool sentAny = false;
-    for (auto iter = m_ports.begin(); iter != m_ports.end(); iter++)
-    {
-        Ptr<NetDevice> port = *iter;
-        sentAny = true;
-        maybePauseLocalFlowIo(port, dst);
-        bool ok = sendFromWithDropStats(port, packet, src, dest, protocolNumber, true);
-        allOk = ok && allOk;
-    }
-
-    return sentAny && allOk;
+    PacketType packetType = InferPacketTypeFromDst(dest, PacketType::PACKET_OTHERHOST);
+    return EnqueueIngressPacket(nullptr, packet, protocolNumber, src, dest, packetType, false);
 }
 
 bool
@@ -958,228 +1728,206 @@ MinHopBridgeNetDevice::sendPauseFrameToUpstream(Ptr<NetDevice> ingressPort, uint
                        upstreamPeerMac,
                        static_cast<uint16_t>(queueId));
     p->AddHeader(header);
-    bool ok = ingressPort->SendFrom(p, ingressPort->GetAddress(), upstreamPeer, 0x8808);
-    NS_LOG_INFO("[PFC][" << (pause ? "PAUSE" : "RESUME") << "] bridge="
-                << Mac48Address::ConvertFrom(GetAddress())
-                << " ingressPort=" << Mac48Address::ConvertFrom(ingressPort->GetAddress())
-                << " upstreamPeer=" << upstreamPeerMac
-                << " qid=" << queueId
-                << " sendOk=" << ok
-                << " t=" << Simulator::Now().GetSeconds() << "s");
-}
-
-void
-MinHopBridgeNetDevice::maybePauseUpstreamPort(Ptr<NetDevice> congestedEgress,
-                                              Ptr<NetDevice> ingressPort,
-                                              Mac48Address dst)
-{
-    if (!congestedEgress || !ingressPort || congestedEgress == ingressPort)
-    {
-        return;
-    }
-
-    Ptr<PointToPointNetDevice> egressP2p = DynamicCast<PointToPointNetDevice>(congestedEgress);
-    if (!egressP2p)
-    {
-        return;
-    }
-
-    Ptr<PppRoundRobinQueue<Packet>> egressQueue =
-        DynamicCast<PppRoundRobinQueue<Packet>>(egressP2p->GetQueue());
-    if (!egressQueue)
-    {
-        return;
-    }
-
-    const uint32_t qid = egressQueue->GetQueueIndexByDst(dst);
-    const uint32_t maxPerQueue = egressQueue->GetMaxPacketsPerQueue();
-    if (maxPerQueue == 0)
-    {
-        return;
-    }
-
-    // +1 anticipates the packet we are about to enqueue to this egress sub-queue.
-    double ratio = static_cast<double>(egressQueue->GetSubQueueLength(qid) + 1) /
-                   static_cast<double>(maxPerQueue);
-    if (ratio < m_highWatermark)
-    {
-        return;
-    }
-
-    auto& pausedByIngress = m_pausedIngressQueueIds[congestedEgress];
-    auto& pausedQids = pausedByIngress[ingressPort];
-    if (pausedQids.insert(qid).second)
-    {
-        egressP2p->AddPauseCount(1);
-        sendPauseFrameToUpstream(ingressPort, qid, true);
-    }
-}
-
-void
-MinHopBridgeNetDevice::maybePauseLocalFlowIo(Ptr<NetDevice> congestedEgress, Mac48Address dst)
-{
-    if (!congestedEgress || !m_node)
-    {
-        return;
-    }
-
-    Ptr<PointToPointNetDevice> egressP2p = DynamicCast<PointToPointNetDevice>(congestedEgress);
-    if (!egressP2p)
-    {
-        return;
-    }
-
-    Ptr<PppRoundRobinQueue<Packet>> egressQueue =
-        DynamicCast<PppRoundRobinQueue<Packet>>(egressP2p->GetQueue());
-    if (!egressQueue)
-    {
-        return;
-    }
-
-    const uint32_t qid = egressQueue->GetQueueIndexByDst(dst);
-    const uint32_t maxPerQueue = egressQueue->GetMaxPacketsPerQueue();
-    if (maxPerQueue == 0)
-    {
-        return;
-    }
-
-    // +1 anticipates the packet we are about to enqueue to this egress sub-queue.
-    double ratio = static_cast<double>(egressQueue->GetSubQueueLength(qid) + 1) /
-                   static_cast<double>(maxPerQueue);
-    if (ratio < m_highWatermark)
-    {
-        return;
-    }
-
-    auto& pausedQids = m_pausedLocalQueueIds[congestedEgress];
-    if (pausedQids.insert(qid).second)
-    {
-        egressP2p->AddPauseCount(1);
-        FlowIo::PauseNodeQueue(m_node, qid);
-        NS_LOG_INFO("[PFC][LOCAL][PAUSE] bridge="
-                    << Mac48Address::ConvertFrom(GetAddress())
-                    << " egress=" << Mac48Address::ConvertFrom(congestedEgress->GetAddress())
-                    << " qid=" << qid
-                    << " t=" << Simulator::Now().GetSeconds() << "s");
-    }
-}
-
-void
-MinHopBridgeNetDevice::handleLowWatermark(Ptr<NetDevice> port, uint32_t queueId)
-{
-    uint32_t count = 0;
-
-    Ptr<PointToPointNetDevice> egressP2p = DynamicCast<PointToPointNetDevice>(port);
-    Ptr<PppRoundRobinQueue<Packet>> egressQueue =
-        egressP2p ? DynamicCast<PppRoundRobinQueue<Packet>>(egressP2p->GetQueue()) : nullptr;
-    if (!egressQueue)
-    {
-        return;
-    }
-
-    const uint32_t maxPerQueue = egressQueue->GetMaxPacketsPerQueue();
-    if (maxPerQueue == 0)
-    {
-        return;
-    }
-
-    double ratio = static_cast<double>(egressQueue->GetSubQueueLength(queueId)) /
-                   static_cast<double>(maxPerQueue);
-    if (ratio > m_lowWatermark)
-    {
-        return;
-    }
-
-    auto ingressItMap = m_pausedIngressQueueIds.find(port);
-    if (ingressItMap != m_pausedIngressQueueIds.end())
-    {
-        for (auto& ingressEntry : ingressItMap->second)
-        {
-            Ptr<NetDevice> ingressPort = ingressEntry.first;
-            if (ingressEntry.second.find(queueId) != ingressEntry.second.end())
-            {
-                ingressEntry.second.erase(queueId);
-                sendPauseFrameToUpstream(ingressPort, queueId, false);
-                count++;
-            }
-        }
-
-        for (auto ingressIt = ingressItMap->second.begin(); ingressIt != ingressItMap->second.end();)
-        {
-            if (ingressIt->second.empty())
-            {
-                ingressIt = ingressItMap->second.erase(ingressIt);
-            }
-            else
-            {
-                ++ingressIt;
-            }
-        }
-        if (ingressItMap->second.empty())
-        {
-            m_pausedIngressQueueIds.erase(ingressItMap);
-        }
-    }
-
-    auto localIt = m_pausedLocalQueueIds.find(port);
-    if (localIt != m_pausedLocalQueueIds.end() &&
-        localIt->second.find(queueId) != localIt->second.end())
-    {
-        localIt->second.erase(queueId);
-        FlowIo::ResumeNodeQueue(m_node, queueId);
-        NS_LOG_INFO("[PFC][LOCAL][RESUME] bridge="
-                    << Mac48Address::ConvertFrom(GetAddress())
-                    << " egress=" << Mac48Address::ConvertFrom(port->GetAddress())
-                    << " qid=" << queueId
-                    << " t=" << Simulator::Now().GetSeconds() << "s");
-        ++count;
-        if (localIt->second.empty())
-        {
-            m_pausedLocalQueueIds.erase(localIt);
-        }
-    }
-
-    if (egressP2p && count > 0)
-    {
-        egressP2p->SubPauseCount(count);
-    }
+    (void) ingressPort->SendFrom(p, ingressPort->GetAddress(), upstreamPeer, 0x8808);
 }
 
 bool
 MinHopBridgeNetDevice::writemactable(std::string filepath){
-    //不好写而且没意义，搁置
-    std::ofstream fout(filepath); // 创建输出文件流并打开文件
-    if (!fout) { // 检查是否打开成功
-        NS_LOG_INFO("打开或创建mac表输出文件时失败");
-        return 0;
+    std::ofstream fout(filepath, std::ios::out | std::ios::trunc);
+    if (!fout)
+    {
+        NS_LOG_WARN("Failed to open mactable file for writing: " << filepath);
+        return false;
     }
-    int num_mac=m_learnState.size();
-    fout<<std::to_string(num_mac)<<std::endl;
-    for (const auto& [key, value] : m_learnState) {
-        uint8_t buf[6];
-        key.CopyTo(buf);
-        std::ostringstream oss;
-        for (int i = 0; i < 6; ++i) {
-            if (i > 0) oss << ":"; // 加冒号分隔
-            oss << std::hex << (int)buf[i];
-        }
-        std::string macStr = oss.str();
-        fout<<macStr<<std::endl;
 
-        fout<<value.size()<<std::endl;
-        for (auto ai:value){
-            fout<<ai.associatedPort->GetAddress()<<std::endl;
-            fout<<ai.minHopCount<<std::endl;
+    Time now = Simulator::Now();
+    uint32_t validMacCount = 0;
+    for (const auto& [mac, states] : m_learnState)
+    {
+        (void)mac;
+        bool hasValidPath = false;
+        for (const auto& st : states)
+        {
+            if (st.expirationTime <= now || !st.associatedPort)
+            {
+                continue;
+            }
+            for (const auto& p : m_ports)
+            {
+                if (p == st.associatedPort)
+                {
+                    hasValidPath = true;
+                    break;
+                }
+            }
+            if (hasValidPath)
+            {
+                break;
+            }
+        }
+        if (hasValidPath)
+        {
+            ++validMacCount;
         }
     }
-    fout.close(); // 关闭文件
-    return 1;
+
+    fout << "MINHOP_MACTABLE_V1\n";
+    fout << "bridge_mac " << Mac48Address::ConvertFrom(GetAddress()) << "\n";
+    fout << "entries " << validMacCount << "\n";
+
+    for (const auto& [mac, states] : m_learnState)
+    {
+        std::map<uint32_t, uint8_t> portHopMap;
+        for (const auto& st : states)
+        {
+            if (st.expirationTime <= now || !st.associatedPort)
+            {
+                continue;
+            }
+
+            int32_t portIndex = -1;
+            for (uint32_t i = 0; i < m_ports.size(); ++i)
+            {
+                if (m_ports[i] == st.associatedPort)
+                {
+                    portIndex = static_cast<int32_t>(i);
+                    break;
+                }
+            }
+            if (portIndex < 0)
+            {
+                continue;
+            }
+
+            auto it = portHopMap.find(static_cast<uint32_t>(portIndex));
+            if (it == portHopMap.end() || st.minHopCount < it->second)
+            {
+                portHopMap[static_cast<uint32_t>(portIndex)] = st.minHopCount;
+            }
+        }
+
+        if (portHopMap.empty())
+        {
+            continue;
+        }
+
+        fout << "mac " << mac << " paths " << portHopMap.size() << "\n";
+        for (const auto& [portIndex, hopCount] : portHopMap)
+        {
+            fout << "port " << portIndex << " hop " << static_cast<uint32_t>(hopCount) << "\n";
+        }
+    }
+
+    return true;
 }
 
 bool
 MinHopBridgeNetDevice::readmactable(std::string filepath){
-    //不好写而且没意义，搁置
-    return 1;
+    std::ifstream fin(filepath);
+    if (!fin)
+    {
+        NS_LOG_WARN("Failed to open mactable file for reading: " << filepath);
+        return false;
+    }
+
+    std::string token;
+    fin >> token;
+    if (!fin || token != "MINHOP_MACTABLE_V1")
+    {
+        NS_LOG_WARN("Invalid mactable header in file: " << filepath);
+        return false;
+    }
+
+    std::string bridgeMacToken;
+    std::string bridgeMacStr;
+    fin >> bridgeMacToken >> bridgeMacStr;
+    if (!fin || bridgeMacToken != "bridge_mac")
+    {
+        NS_LOG_WARN("Invalid bridge_mac section in mactable file: " << filepath);
+        return false;
+    }
+
+    std::string entriesToken;
+    uint32_t entryCount = 0;
+    fin >> entriesToken >> entryCount;
+    if (!fin || entriesToken != "entries")
+    {
+        NS_LOG_WARN("Invalid entries section in mactable file: " << filepath);
+        return false;
+    }
+
+    std::map<Mac48Address, std::vector<LearnedState>> loadedState;
+    for (uint32_t i = 0; i < entryCount; ++i)
+    {
+        std::string macToken;
+        std::string macStr;
+        std::string pathsToken;
+        uint32_t pathCount = 0;
+        fin >> macToken >> macStr >> pathsToken >> pathCount;
+        if (!fin || macToken != "mac" || pathsToken != "paths")
+        {
+            NS_LOG_WARN("Malformed entry header while reading mactable: " << filepath);
+            return false;
+        }
+
+        Mac48Address learnedMac(macStr.c_str());
+        std::map<uint32_t, uint8_t> portHopMap;
+        for (uint32_t p = 0; p < pathCount; ++p)
+        {
+            std::string portToken;
+            uint32_t portIndex = 0;
+            std::string hopToken;
+            uint32_t hopCount = 0;
+            fin >> portToken >> portIndex >> hopToken >> hopCount;
+            if (!fin || portToken != "port" || hopToken != "hop")
+            {
+                NS_LOG_WARN("Malformed path entry while reading mactable: " << filepath);
+                return false;
+            }
+
+            if (portIndex >= m_ports.size())
+            {
+                continue;
+            }
+            if (hopCount > 255)
+            {
+                hopCount = 255;
+            }
+
+            auto it = portHopMap.find(portIndex);
+            if (it == portHopMap.end() || hopCount < it->second)
+            {
+                portHopMap[portIndex] = static_cast<uint8_t>(hopCount);
+            }
+        }
+
+        if (portHopMap.empty())
+        {
+            continue;
+        }
+
+        std::vector<LearnedState> states;
+        states.reserve(portHopMap.size());
+        for (const auto& [portIndex, hopCount] : portHopMap)
+        {
+            LearnedState st;
+            st.associatedPort = m_ports[portIndex];
+            st.minHopCount = hopCount;
+            // Keep imported entries alive for the whole run unless re-learned.
+            st.expirationTime = Time::Max();
+            states.push_back(st);
+        }
+        loadedState[learnedMac] = states;
+    }
+
+    if (!fin.good() && !fin.eof())
+    {
+        NS_LOG_WARN("Error while reading mactable file: " << filepath);
+        return false;
+    }
+
+    m_learnState.swap(loadedState);
+    return true;
 }
 
 } // namespace ns3

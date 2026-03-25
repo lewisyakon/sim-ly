@@ -1,11 +1,16 @@
 #include "flow-io.h"
 
+#include "PppRoundRobinQueue.h"
+#include "3PHeader.h"
+#include "ns3/hop-count-header.h"
+#include "pause-header.h"
 #include "ns3/boolean.h"
 #include "ns3/log.h"
 #include "ns3/mac48-address.h"
 #include "ns3/node.h"
 #include "ns3/packet-socket-address.h"
 #include "ns3/packet-socket-factory.h"
+#include "ns3/point-to-point-net-device.h"
 #include "ns3/ptr.h" // PeekPointer
 #include "ns3/simulator.h"
 #include "ns3/uinteger.h"
@@ -195,6 +200,22 @@ FlowIo::EnsureQueueState()
   {
     m_pausedTxQueues.assign(m_numTxQueues, false);
   }
+  if (m_externalIngressQueues.size() != m_numTxQueues)
+  {
+    m_externalIngressQueues.assign(m_numTxQueues, {});
+  }
+  if (m_externalHoldQueues.size() != m_numTxQueues)
+  {
+    m_externalHoldQueues.assign(m_numTxQueues, {});
+  }
+  if (m_externalIngressPaused.size() != m_numTxQueues)
+  {
+    m_externalIngressPaused.assign(m_numTxQueues, false);
+  }
+  if (m_externalIngressRrIndex >= m_numTxQueues)
+  {
+    m_externalIngressRrIndex = 0;
+  }
 }
 
 uint32_t
@@ -243,9 +264,9 @@ FlowIo::PauseTxQueue(uint32_t queueId)
   if (!m_pausedTxQueues[qid])
   {
     m_pausedTxQueues[qid] = true;
-    NS_LOG_INFO("[FLOWIO][PAUSE] node=" << (m_node ? m_node->GetId() : 0)
-                << " qid=" << qid
-                << " t=" << Simulator::Now().GetSeconds() << "s");
+    NS_LOG_DEBUG("[FLOWIO][PAUSE] node=" << (m_node ? m_node->GetId() : 0)
+                 << " qid=" << qid
+                 << " t=" << Simulator::Now().GetSeconds() << "s");
   }
 }
 
@@ -257,9 +278,9 @@ FlowIo::ResumeTxQueue(uint32_t queueId)
   if (m_pausedTxQueues[qid])
   {
     m_pausedTxQueues[qid] = false;
-    NS_LOG_INFO("[FLOWIO][RESUME] node=" << (m_node ? m_node->GetId() : 0)
-                << " qid=" << qid
-                << " t=" << Simulator::Now().GetSeconds() << "s");
+    NS_LOG_DEBUG("[FLOWIO][RESUME] node=" << (m_node ? m_node->GetId() : 0)
+                 << " qid=" << qid
+                 << " t=" << Simulator::Now().GetSeconds() << "s");
   }
   if (!m_txBuffer.empty())
   {
@@ -335,7 +356,14 @@ FlowIo::Stop()
   {
     Simulator::Cancel(m_drainEvent);
   }
+  if (m_externalIngressDrainEvent.IsRunning())
+  {
+    Simulator::Cancel(m_externalIngressDrainEvent);
+  }
   m_txBuffer.clear();
+  m_externalIngressQueues.clear();
+  m_externalHoldQueues.clear();
+  m_externalIngressPaused.clear();
 
   if (m_node)
   {
@@ -386,11 +414,35 @@ FlowIo::SendOnDevice(uint32_t devIndex, const Address& dest, Ptr<Packet> pkt)
   return (ret >= 0);
 }
 
+bool
+FlowIo::IsHighPriorityControlPacket(Ptr<Packet> pkt) const
+{
+  if (pkt == nullptr)
+  {
+    return false;
+  }
+
+  Ptr<Packet> copy = pkt->Copy();
+  HopCountHeader hopHeader;
+  ThreePHeader tpHeader;
+  if (copy->GetSize() < hopHeader.GetSerializedSize() + tpHeader.GetSerializedSize())
+  {
+    return false;
+  }
+
+  copy->RemoveHeader(hopHeader);
+  copy->RemoveHeader(tpHeader);
+  return tpHeader.GetState() == ThreePHeader::REQUEST ||
+         tpHeader.GetState() == ThreePHeader::ACT ||
+         tpHeader.GetState() == ThreePHeader::IDLE;
+}
+
 void
 FlowIo::EnqueueBuffered(uint32_t devIndex, uint32_t queueId, const Address& dest, Ptr<Packet> pkt)
 {
   EnsureQueueState();
   uint32_t qid = queueId % m_numTxQueues;
+  const bool highPriority = IsHighPriorityControlPacket(pkt);
   if (m_txBuffer.size() >= m_maxBufferedPackets)
   {
     EnsureFlowIoDropSummaryScheduled();
@@ -416,7 +468,15 @@ FlowIo::EnqueueBuffered(uint32_t devIndex, uint32_t queueId, const Address& dest
     return;
   }
 
-  m_txBuffer.push_back({devIndex, qid, dest, pkt->Copy()});
+  BufferedTx item{devIndex, qid, dest, pkt->Copy(), highPriority};
+  if (highPriority)
+  {
+    m_txBuffer.push_front(std::move(item));
+  }
+  else
+  {
+    m_txBuffer.push_back(std::move(item));
+  }
 
   static uint64_t sEnqueueLogCount = 0;
   if (sEnqueueLogCount < 200 || (sEnqueueLogCount % 10000) == 0)
@@ -429,12 +489,314 @@ FlowIo::EnqueueBuffered(uint32_t devIndex, uint32_t queueId, const Address& dest
   ++sEnqueueLogCount;
 }
 
+uint32_t
+FlowIo::GetExternalIngressMaxPacketsPerQueue() const
+{
+  if (!m_node || m_outDev >= m_node->GetNDevices())
+  {
+    return 100;
+  }
+
+  Ptr<PointToPointNetDevice> p2p = DynamicCast<PointToPointNetDevice>(m_node->GetDevice(m_outDev));
+  if (!p2p)
+  {
+    return 100;
+  }
+
+  Ptr<Queue<Packet>> queue = p2p->GetQueue();
+  if (!queue)
+  {
+    return 100;
+  }
+
+  Ptr<PppRoundRobinQueue<Packet>> rrQueue = DynamicCast<PppRoundRobinQueue<Packet>>(queue);
+  if (rrQueue && rrQueue->GetMaxPacketsPerQueue() > 0)
+  {
+    return rrQueue->GetMaxPacketsPerQueue();
+  }
+
+  return 100;
+}
+
+uint32_t
+FlowIo::GetExternalHoldPacketCount() const
+{
+  uint32_t total = 0;
+  for (const auto& q : m_externalHoldQueues)
+  {
+    total += static_cast<uint32_t>(q.size());
+  }
+  return total;
+}
+
+bool
+FlowIo::HasPendingExternalIngressWork() const
+{
+  for (const auto& q : m_externalIngressQueues)
+  {
+    if (!q.empty())
+    {
+      return true;
+    }
+  }
+  for (const auto& q : m_externalHoldQueues)
+  {
+    if (!q.empty())
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+void
+FlowIo::UpdateExternalIngressPauseStateOnEnqueue(uint32_t queueId)
+{
+  EnsureQueueState();
+  if (queueId >= m_externalIngressQueues.size())
+  {
+    return;
+  }
+
+  const uint32_t maxPerQueue = GetExternalIngressMaxPacketsPerQueue();
+  if (maxPerQueue == 0)
+  {
+    return;
+  }
+
+  const uint32_t len = static_cast<uint32_t>(m_externalIngressQueues[queueId].size());
+  const double ratio = static_cast<double>(len) / static_cast<double>(maxPerQueue);
+  if (!m_externalIngressPaused[queueId] && ratio >= g_pfcHighWatermark)
+  {
+    m_externalIngressPaused[queueId] = true;
+    if (IsPfcFullLogEnabled())
+    {
+      NS_LOG_UNCOND("[PFC][THRESH][EXTERNAL][PAUSE] node="
+                    << (m_node ? m_node->GetId() : 0)
+                    << " qid=" << queueId
+                    << " len=" << len
+                    << " maxPerQueue=" << maxPerQueue
+                    << " ratio=" << ratio);
+    }
+  }
+}
+
+void
+FlowIo::UpdateExternalIngressPauseStateOnDequeue(uint32_t queueId)
+{
+  EnsureQueueState();
+  if (queueId >= m_externalIngressQueues.size())
+  {
+    return;
+  }
+
+  const uint32_t maxPerQueue = GetExternalIngressMaxPacketsPerQueue();
+  if (maxPerQueue == 0)
+  {
+    return;
+  }
+
+  const uint32_t len = static_cast<uint32_t>(m_externalIngressQueues[queueId].size());
+  const double ratio = static_cast<double>(len) / static_cast<double>(maxPerQueue);
+  if (m_externalIngressPaused[queueId] && ratio <= g_pfcLowWatermark)
+  {
+    m_externalIngressPaused[queueId] = false;
+    if (IsPfcFullLogEnabled())
+    {
+      NS_LOG_UNCOND("[PFC][THRESH][EXTERNAL][RESUME] node="
+                    << (m_node ? m_node->GetId() : 0)
+                    << " qid=" << queueId
+                    << " len=" << len
+                    << " maxPerQueue=" << maxPerQueue
+                    << " ratio=" << ratio);
+    }
+  }
+}
+
+void
+FlowIo::EnqueueExternalIngress(uint32_t queueId, const Address& dest, Ptr<Packet> pkt)
+{
+  EnsureQueueState();
+  const uint32_t qid = queueId % m_numTxQueues;
+  const uint32_t maxPerQueue = GetExternalIngressMaxPacketsPerQueue();
+
+  if (m_externalIngressQueues[qid].size() >= maxPerQueue)
+  {
+    ++m_externalIngressDrops;
+    m_externalIngressDropBytes += pkt->GetSize();
+    static uint64_t sExternalIngressDropLogCount = 0;
+    if (sExternalIngressDropLogCount < 20 || (sExternalIngressDropLogCount % 1000) == 0)
+    {
+      NS_LOG_UNCOND("[DROP][FLOWIO][EXT_INGRESS_FULL] node="
+                    << (m_node ? m_node->GetId() : 0)
+                    << " dev=" << m_outDev
+                    << " qid=" << qid
+                    << " len=" << m_externalIngressQueues[qid].size()
+                    << " maxPerQueue=" << maxPerQueue
+                    << " pktSize=" << pkt->GetSize()
+                    << " totalDrops=" << m_externalIngressDrops
+                    << " totalDropBytes=" << m_externalIngressDropBytes);
+    }
+    ++sExternalIngressDropLogCount;
+    return;
+  }
+
+  m_externalIngressQueues[qid].push_back({qid, dest, pkt->Copy()});
+  UpdateExternalIngressPauseStateOnEnqueue(qid);
+}
+
+void
+FlowIo::EnqueueExternalHold(uint32_t queueId, const Address& dest, Ptr<Packet> pkt)
+{
+  EnsureQueueState();
+  const uint32_t qid = queueId % m_numTxQueues;
+
+  if (GetExternalHoldPacketCount() >= m_maxBufferedPackets)
+  {
+    EnsureFlowIoDropSummaryScheduled();
+    ++g_flowIoDropStats.bufferOverflowDrops;
+    g_flowIoDropStats.bufferOverflowDropBytes += pkt->GetSize();
+    ++m_externalHoldDrops;
+    m_externalHoldDropBytes += pkt->GetSize();
+    static uint64_t sExternalHoldDropLogCount = 0;
+    if (sExternalHoldDropLogCount < 20 || (sExternalHoldDropLogCount % 1000) == 0)
+    {
+      NS_LOG_UNCOND("[DROP][FLOWIO][EXT_HOLD_OVERFLOW] node="
+                    << (m_node ? m_node->GetId() : 0)
+                    << " dev=" << m_outDev
+                    << " qid=" << qid
+                    << " totalHold=" << GetExternalHoldPacketCount()
+                    << " maxHold=" << m_maxBufferedPackets
+                    << " pktSize=" << pkt->GetSize()
+                    << " totalDrops=" << m_externalHoldDrops
+                    << " totalDropBytes=" << m_externalHoldDropBytes);
+    }
+    ++sExternalHoldDropLogCount;
+    return;
+  }
+
+  m_externalHoldQueues[qid].push_back({qid, dest, pkt->Copy()});
+}
+
+void
+FlowIo::TryRefillExternalIngress(uint32_t queueId)
+{
+  EnsureQueueState();
+  const uint32_t qid = queueId % m_numTxQueues;
+  if (m_externalIngressPaused[qid] || m_externalHoldQueues[qid].empty())
+  {
+    return;
+  }
+
+  const uint32_t maxPerQueue = GetExternalIngressMaxPacketsPerQueue();
+  if (m_externalIngressQueues[qid].size() >= maxPerQueue)
+  {
+    return;
+  }
+
+  ExternalBufferedTx item = std::move(m_externalHoldQueues[qid].front());
+  m_externalHoldQueues[qid].pop_front();
+  m_externalIngressQueues[qid].push_back(std::move(item));
+  UpdateExternalIngressPauseStateOnEnqueue(qid);
+}
+
 void
 FlowIo::ScheduleDrain()
 {
   if (!m_drainEvent.IsRunning())
   {
     m_drainEvent = Simulator::Schedule(m_retryInterval, &FlowIo::DrainBuffered, this);
+  }
+}
+
+void
+FlowIo::ScheduleExternalIngressDrain(bool delayed)
+{
+  if (m_externalIngressDrainEvent.IsRunning())
+  {
+    if (!delayed)
+    {
+      Simulator::Cancel(m_externalIngressDrainEvent);
+      m_externalIngressDrainEvent = Simulator::ScheduleNow(&FlowIo::DrainExternalIngress, this);
+    }
+    return;
+  }
+
+  if (delayed)
+  {
+    m_externalIngressDrainEvent = Simulator::Schedule(m_retryInterval, &FlowIo::DrainExternalIngress, this);
+  }
+  else
+  {
+    m_externalIngressDrainEvent = Simulator::ScheduleNow(&FlowIo::DrainExternalIngress, this);
+  }
+}
+
+void
+FlowIo::DrainExternalIngress()
+{
+  EnsureQueueState();
+  if (!HasPendingExternalIngressWork() || m_numTxQueues == 0)
+  {
+    return;
+  }
+
+  bool blocked = false;
+  uint32_t budget = 4096;
+  uint32_t visited = 0;
+  uint32_t sent = 0;
+
+  while (budget-- > 0 && visited < m_numTxQueues)
+  {
+    const uint32_t qid = m_externalIngressRrIndex % m_numTxQueues;
+    m_externalIngressRrIndex = (m_externalIngressRrIndex + 1) % m_numTxQueues;
+    ++visited;
+
+    TryRefillExternalIngress(qid);
+    if (m_externalIngressQueues[qid].empty())
+    {
+      continue;
+    }
+
+    ExternalBufferedTx item = m_externalIngressQueues[qid].front();
+    if (!SendOnDevice(m_outDev, item.dest, item.pkt))
+    {
+      blocked = true;
+      static uint64_t sExtBlockedLogCount = 0;
+      if (sExtBlockedLogCount < 200 || (sExtBlockedLogCount % 10000) == 0)
+      {
+        NS_LOG_INFO("[FLOWIO][EXTQ][BLOCKED] node=" << (m_node ? m_node->GetId() : 0)
+                    << " dev=" << m_outDev
+                    << " qid=" << qid
+                    << " ingressLen=" << m_externalIngressQueues[qid].size()
+                    << " holdLen=" << m_externalHoldQueues[qid].size()
+                    << " retryInUs=" << m_retryInterval.GetMicroSeconds());
+      }
+      ++sExtBlockedLogCount;
+      break;
+    }
+
+    m_externalIngressQueues[qid].pop_front();
+    ++sent;
+    UpdateExternalIngressPauseStateOnDequeue(qid);
+    TryRefillExternalIngress(qid);
+    visited = 0;
+  }
+
+  if (sent > 0)
+  {
+    static uint64_t sExtDrainLogCount = 0;
+    if (sExtDrainLogCount < 200 || (sExtDrainLogCount % 10000) == 0)
+    {
+      NS_LOG_INFO("[FLOWIO][EXTQ][DRAIN] sent=" << sent
+                  << " pending=" << HasPendingExternalIngressWork());
+    }
+    ++sExtDrainLogCount;
+  }
+
+  if (HasPendingExternalIngressWork())
+  {
+    ScheduleExternalIngressDrain(blocked);
   }
 }
 
@@ -540,14 +902,28 @@ FlowIo::Send(const Address& dest,
     }
   }
 
+  EnsureQueueState();
+  uint32_t qid = ClassifyQueueId(dest);
+
+  if (mode == FlowSendMode::External && m_bindMode != RxBindMode::BridgeOnly)
+  {
+    if (m_externalIngressPaused[qid] || !m_externalHoldQueues[qid].empty())
+    {
+      EnqueueExternalHold(qid, dest, pkt);
+    }
+    else
+    {
+      EnqueueExternalIngress(qid, dest, pkt);
+    }
+    ScheduleExternalIngressDrain(false);
+    return;
+  }
+
   if (!m_enableTxBuffer)
   {
     (void)SendOnDevice(dev, dest, pkt);
     return;
   }
-
-  EnsureQueueState();
-  uint32_t qid = ClassifyQueueId(dest);
 
   if (IsTxQueuePaused(qid) || !m_txBuffer.empty())
   {

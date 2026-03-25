@@ -16,6 +16,7 @@ set(source_files
     model/roce-sim-header.cc
     model/roce-qp-engine.cc
     model/roce-three-phase-fsm.cc
+    model/roce-tx-scheduler.cc
 )
 set(header_files
     model/min-hop-bridge-net-device.h
@@ -32,6 +33,7 @@ set(header_files
     model/roce-sim-header.h
     model/roce-qp-engine.h
     model/roce-three-phase-fsm.h
+    model/roce-tx-scheduler.h
 )
 
 set(libstats

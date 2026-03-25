@@ -12,6 +12,7 @@
 #include "ns3/log.h"
 #include "ns3/packet.h"
 #include "ns3/nstime.h"
+#include "ns3/event-id.h"
 
 #include "ns3/packet-socket.h"           // PacketSocket
 #include "ns3/packet-socket-factory.h"
@@ -21,6 +22,7 @@
 #include "3PHeader.h"
 #include<map>
 #include <memory>
+#include <set>
 #include"min-hop-bridge-net-device.h"
 #include "FlowTagHeader.h"
 #include "flow-io.h"
@@ -30,6 +32,8 @@ namespace ns3 {
 class RoceQpEngine;
 class RoceThreePhaseFsm;
 class RoceSimHeader;
+class RoceTxScheduler;
+struct RoceTxSlice;
 }
 
 
@@ -87,33 +91,105 @@ private:
                           uint32_t dst,
                           RoceSimHeader* headerOut);
   // 接收侧：校验并消费 RoCE 头，同时驱动 completion/FSM。
-  void HandleRoceRxHeader_(const RoceSimHeader& roceHeader,
+  bool HandleRoceRxHeader_(const RoceSimHeader& roceHeader,
                            ThreePHeader::State state,
                            uint32_t tag,
                            uint32_t src,
-                           uint32_t dst);
+                           uint32_t dst,
+                           const Address& from,
+                           uint32_t rxInDevIndexForLoopback,
+                           bool* bufferedForReorder = nullptr);
+  void EnqueueRoceWork_(ThreePHeader::State state,
+                        const Address& dest,
+                        uint64_t datasize,
+                        uint32_t tag,
+                        uint32_t src,
+                        uint32_t dst,
+                        FlowSendMode sendmodel,
+                        int mindex = 0);
+  void ScheduleRoceDispatch_();
+  void DispatchOneRoceSlice_();
+  bool BuildPacketForRoceSlice_(const RoceTxSlice& slice,
+                                Ptr<Packet>* packetOut,
+                                RoceSimHeader* headerOut = nullptr);
+  void FinalizeRoceSliceDispatch_(const RoceTxSlice& slice);
+  void DispatchPendingRoceRetransmissions_();
+  bool BuildRoceAckPacket_(uint32_t tag,
+                           uint32_t src,
+                           uint32_t dst,
+                           uint32_t qpn,
+                           Ptr<Packet>* packetOut);
+  void MaybeSendRoceAck_(const Address& dest,
+                         uint32_t tag,
+                         uint32_t src,
+                         uint32_t dst,
+                         uint32_t qpn,
+                         uint32_t rxInDevIndexForLoopback,
+                         RoceOpcode rxOpcode);
+  void TrackRoceOutstandingPacket_(const RoceTxSlice& slice,
+                                   const Ptr<Packet>& packet,
+                                   const RoceSimHeader& header);
+  void HandleRoceAck_(const RoceFlowKey& flowKey,
+                      const RoceQpKey& qpKey,
+                      const RoceSimHeader& roceHeader);
+  void HandleRoceRetransTimeout_(RoceQpKey qpKey);
+  void MaybeReleaseBufferedRocePackets_(const RoceQpKey& qpKey);
+  void ProcessThreePhasePayload_(Ptr<Packet> payload,
+                                 const ThreePHeader& TPheader,
+                                 const Address& from,
+                                 uint32_t formIndex);
+  void ArmRoceRetransTimer_(const RoceQpKey& qpKey);
+  void CancelRoceRetransTimer_(const RoceQpKey& qpKey);
+  uint32_t GetRoceOutstandingCount_(const RoceQpKey& qpKey) const;
+  uint32_t GetRoceTransportWindowPackets_() const;
+  std::set<RoceQpKey> CollectBlockedRoceQps_() const;
+  uint32_t GetOrAllocRoceQpn_(uint32_t tag, uint32_t src, uint32_t dst);
+  void RememberRoceQpn_(uint32_t tag, uint32_t src, uint32_t dst, uint32_t qpn);
 
 
-  std::map<pair<int,pair<int,int> >, ns3::fuc_and_par> m_sendfunctable;  // key: flowid
-  std::map<pair<int,pair<int,int> >,ns3::fuc_and_par>m_recvfunctable;
-  std::map<pair<int,pair<int,int> >,AstraSim::sim_request>m_request;
-  std::map<pair<int,pair<int,int> >,bool> m_recvfuncflag;
+  std::map<RoceFlowKey, ns3::fuc_and_par> m_sendfunctable;  // key: flowid
+  std::map<RoceFlowKey,ns3::fuc_and_par>m_recvfunctable;
+  std::map<RoceFlowKey,AstraSim::sim_request>m_request;
+  std::map<RoceFlowKey,bool> m_recvfuncflag;
 
 
   
-  std::map<pair<int,pair<int,int> >, uint64_t> m_recvHash;
+  std::map<RoceFlowKey, uint64_t> m_recvHash;
   
   // 预期 DATA 包的总数
-  std::map<pair<int,pair<int,int> >, uint64_t> m_dataPacketsExpected;
+  std::map<RoceFlowKey, uint64_t> m_dataPacketsExpected;
   // 当前已收到的 DATA 包数量
-  std::map<pair<int,pair<int,int> >, uint64_t> m_dataPacketsReceived;
+  std::map<RoceFlowKey, uint64_t> m_dataPacketsReceived;
 
 
   // 预期 ACT 包的总数
-  std::map<pair<int,pair<int,int> >, uint64_t> m_ackPacketsExpected;
+  std::map<RoceFlowKey, uint64_t> m_ackPacketsExpected;
   //当前已收到的 ACT 包数量
-  std::map<pair<int,pair<int,int> >, uint64_t> m_ackPacketsReceived;
-  std::map<pair<int,pair<int,int> >, uint64_t> m_alldatasize;
+  std::map<RoceFlowKey, uint64_t> m_ackPacketsReceived;
+  std::map<RoceFlowKey, uint64_t> m_alldatasize;
+
+  struct RoceOutstandingPacket {
+    Ptr<Packet> packet;
+    Address dest;
+    FlowSendMode sendMode = FlowSendMode::External;
+    int mindex = 0;
+    RoceFlowKey flowKey;
+    RoceQpKey qpKey;
+    uint32_t psn = 0;
+    uint32_t retries = 0;
+  };
+
+  struct RoceRetransTimerState {
+    EventId event;
+    uint32_t trackedPsn = 0;
+  };
+
+  struct BufferedRoceUpperPacket {
+    Ptr<Packet> payload;
+    ThreePHeader tpHeader;
+    Address from;
+    uint32_t formIndex = 0;
+  };
 
   int reqlen,acklen;
   uint32_t localbridgeindex;
@@ -123,6 +199,16 @@ private:
   RoceMode m_roceMode = RoceMode::Legacy;
   std::unique_ptr<RoceQpEngine> m_roceQpEngine;   // QP 状态机 + CQ
   std::unique_ptr<RoceThreePhaseFsm> m_roceFsm;   // REQUEST/DATA/ACT 语义状态机
+  std::unique_ptr<RoceTxScheduler> m_roceTxScheduler; // 发送调度器（第一阶段骨架）
+  std::map<RoceFlowKey, uint32_t> m_roceFlowToQpn; // flow -> synthetic qpn
+  std::map<RoceQpKey, std::map<uint32_t, RoceOutstandingPacket>> m_roceOutstandingPackets;
+  std::map<RoceQpKey, RoceRetransTimerState> m_roceRetransTimers;
+  std::map<RoceQpKey, std::map<uint32_t, BufferedRoceUpperPacket>> m_roceBufferedUpperPackets;
+  std::map<RoceQpKey, RoceOutstandingPacket> m_rocePendingRetransmissions;
+  std::map<RoceQpKey, uint32_t> m_roceRecoveryTargetPsns;
+  uint32_t m_nextSyntheticQpn = 1;
+  uint64_t m_nextRoceWorkId = 1;
+  EventId m_roceDispatchEvent;
   bool m_roceActiveLogged = false;
 };
 

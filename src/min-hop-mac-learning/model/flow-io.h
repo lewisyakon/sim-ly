@@ -75,15 +75,34 @@ private:
     uint32_t queueId;
     Address dest;
     Ptr<Packet> pkt;
+    bool highPriority = false;
+  };
+
+  struct ExternalBufferedTx
+  {
+    uint32_t queueId;
+    Address dest;
+    Ptr<Packet> pkt;
   };
 
   uint32_t ClassifyQueueId(const Address& dest) const;
   bool IsTxQueuePaused(uint32_t queueId) const;
   bool SendOnDevice(uint32_t devIndex, const Address& dest, Ptr<Packet> pkt);
+  bool IsHighPriorityControlPacket(Ptr<Packet> pkt) const;
   void EnqueueBuffered(uint32_t devIndex, uint32_t queueId, const Address& dest, Ptr<Packet> pkt);
   void DrainBuffered();
   void ScheduleDrain();
   void EnsureQueueState();
+  uint32_t GetExternalIngressMaxPacketsPerQueue() const;
+  uint32_t GetExternalHoldPacketCount() const;
+  bool HasPendingExternalIngressWork() const;
+  void EnqueueExternalIngress(uint32_t queueId, const Address& dest, Ptr<Packet> pkt);
+  void EnqueueExternalHold(uint32_t queueId, const Address& dest, Ptr<Packet> pkt);
+  void DrainExternalIngress();
+  void ScheduleExternalIngressDrain(bool delayed);
+  void TryRefillExternalIngress(uint32_t queueId);
+  void UpdateExternalIngressPauseStateOnEnqueue(uint32_t queueId);
+  void UpdateExternalIngressPauseStateOnDequeue(uint32_t queueId);
 
   void DoDispose() override;
 
@@ -106,6 +125,15 @@ private:
   std::vector<bool> m_pausedTxQueues;
   uint32_t m_numTxQueues = 16;
   EventId m_drainEvent;
+  std::vector<std::deque<ExternalBufferedTx>> m_externalIngressQueues;
+  std::vector<std::deque<ExternalBufferedTx>> m_externalHoldQueues;
+  std::vector<bool> m_externalIngressPaused;
+  EventId m_externalIngressDrainEvent;
+  uint32_t m_externalIngressRrIndex = 0;
+  uint64_t m_externalIngressDrops = 0;
+  uint64_t m_externalIngressDropBytes = 0;
+  uint64_t m_externalHoldDrops = 0;
+  uint64_t m_externalHoldDropBytes = 0;
   bool m_enableTxBuffer = true;
   Time m_retryInterval = MicroSeconds(2);
   uint32_t m_maxBufferedPackets = 200000;

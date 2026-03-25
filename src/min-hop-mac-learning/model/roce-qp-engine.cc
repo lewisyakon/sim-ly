@@ -69,6 +69,9 @@ RoceQpEngine::ModifyQpState(const RoceQpKey& key, RoceQpState target) {
   if (target == RoceQpState::Reset) {
     it->second.nextPsn = 0;
     it->second.expectedRxPsn = 0;
+    it->second.pendingRxPsns.clear();
+    it->second.rxOutOfOrderPackets = 0;
+    it->second.rxDuplicatePackets = 0;
   }
   return true;
 }
@@ -139,7 +142,15 @@ RoceQpEngine::BuildSendHeader(const RoceQpKey& key,
 bool
 RoceQpEngine::OnRxHeader(const RoceQpKey& key,
                          const RoceSimHeader& header,
-                         RoceCompletion* completion) {
+                         RoceCompletion* completion,
+                         bool* shouldDeliverToUpper,
+                         bool* bufferedForReorder) {
+  if (shouldDeliverToUpper != nullptr) {
+    *shouldDeliverToUpper = false;
+  }
+  if (bufferedForReorder != nullptr) {
+    *bufferedForReorder = false;
+  }
   EnsureQp(key);
   auto it = m_qps.find(key);
   if (it == m_qps.end()) {
@@ -157,11 +168,6 @@ RoceQpEngine::OnRxHeader(const RoceQpKey& key,
   }
 
   const uint32_t psn = header.GetPsn();
-  if (it->second.rxPackets > 0 && psn != it->second.expectedRxPsn) {
-    // 简化有序性检查：要求严格按 expectedRxPsn 递增。
-    it->second.state = RoceQpState::Err;
-    return false;
-  }
   if ((header.GetOpcode() == RoceOpcode::RdmaWrite ||
        header.GetOpcode() == RoceOpcode::RdmaReadResp) &&
       header.GetLength() == 0) {
@@ -169,8 +175,43 @@ RoceQpEngine::OnRxHeader(const RoceQpKey& key,
     return false;
   }
 
-  it->second.expectedRxPsn = psn + 1;
-  it->second.rxPackets++;
+  if (psn < it->second.expectedRxPsn) {
+    // 旧包或重复包：说明该 PSN 已经在过去的有序推进里被覆盖，不再把 QP 置错。
+    it->second.rxDuplicatePackets++;
+    return true;
+  }
+
+  if (psn > it->second.expectedRxPsn) {
+    const auto [_, inserted] = it->second.pendingRxPsns.insert(psn);
+    if (!inserted) {
+      // 同一个 future PSN 重复到达，只计重复，不影响 QP 状态。
+      it->second.rxDuplicatePackets++;
+      return true;
+    }
+    // 当前阶段先允许乱序存在于 QP 内部缓存中；后续由 expectedRxPsn 追平时自然消化。
+    it->second.rxOutOfOrderPackets++;
+    it->second.rxPackets++;
+    if (bufferedForReorder != nullptr) {
+      *bufferedForReorder = true;
+    }
+    return true;
+  } else {
+    it->second.expectedRxPsn = psn + 1;
+    it->second.rxPackets++;
+  }
+
+  while (!it->second.pendingRxPsns.empty()) {
+    auto next = it->second.pendingRxPsns.begin();
+    if (*next != it->second.expectedRxPsn) {
+      break;
+    }
+    it->second.pendingRxPsns.erase(next);
+    it->second.expectedRxPsn++;
+  }
+
+  if (shouldDeliverToUpper != nullptr) {
+    *shouldDeliverToUpper = true;
+  }
 
   if (completion != nullptr) {
     // completion 采用 psn 作为 wrId，便于与上层 flow credit 对齐。
@@ -182,6 +223,15 @@ RoceQpEngine::OnRxHeader(const RoceQpKey& key,
     completion->success = true;
   }
   return true;
+}
+
+uint32_t
+RoceQpEngine::GetExpectedRxPsn(const RoceQpKey& key) const {
+  auto it = m_qps.find(key);
+  if (it == m_qps.end()) {
+    return 0;
+  }
+  return it->second.expectedRxPsn;
 }
 
 void

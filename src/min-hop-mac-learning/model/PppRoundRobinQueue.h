@@ -40,6 +40,7 @@ public:
   uint32_t GetNumQueues() const;
   uint32_t GetMaxPacketsPerQueue() const;
   uint32_t GetSubQueueLength(uint32_t qid) const;
+  uint64_t GetSubQueueDropPackets(uint32_t qid) const;
   uint32_t GetQueueIndexByDst(Mac48Address dst);
   void PauseSubQueue(uint32_t qid);
   void ResumeSubQueue(uint32_t qid);
@@ -62,6 +63,7 @@ private:
   uint32_t m_maxPacketsPerQueue;
   
   std::vector<std::deque<Ptr<Item>>> m_subQueues;
+  std::vector<uint64_t> m_subQueueDropPackets;
   std::vector<bool> m_pausedSubQueues;
   std::deque<Ptr<Item>> m_priority_que;
   uint32_t m_currentTotalPackets;
@@ -120,6 +122,17 @@ PppRoundRobinQueue<Item>::GetSubQueueLength(uint32_t qid) const
         return 0;
     }
     return static_cast<uint32_t>(m_subQueues[qid].size());
+}
+
+template <typename Item>
+uint64_t
+PppRoundRobinQueue<Item>::GetSubQueueDropPackets(uint32_t qid) const
+{
+    if (qid >= m_subQueueDropPackets.size())
+    {
+        return 0;
+    }
+    return m_subQueueDropPackets[qid];
 }
 
 template <typename Item>
@@ -211,6 +224,7 @@ PppRoundRobinQueue<Item>::PppRoundRobinQueue ()
 {
   NS_LOG_FUNCTION(this);
   m_queueSelector = CreateObject<UniformRandomVariable> ();
+  m_subQueueDropPackets.assign(m_numQueues, 0);
   m_pausedSubQueues.assign(m_numQueues, false);
   // Keep QueueBase max size aligned so generic users (e.g., NetDevice) can read capacity.
   this->SetMaxSize(QueueSize(QueueSizeUnit::PACKETS, m_numQueues * m_maxPacketsPerQueue));
@@ -331,6 +345,10 @@ PppRoundRobinQueue<Item>::Enqueue(Ptr<Item> item)
     {
       m_subQueues.resize (m_numQueues);
     }
+  if (m_subQueueDropPackets.size() != m_numQueues)
+    {
+      m_subQueueDropPackets.resize(m_numQueues, 0);
+    }
   if (m_pausedSubQueues.size() != m_numQueues)
     {
       m_pausedSubQueues.assign(m_numQueues, false);
@@ -357,7 +375,9 @@ PppRoundRobinQueue<Item>::Enqueue(Ptr<Item> item)
   ThreePHeader TPheader;
   pp->RemoveHeader(hopHeader);  // 移除头部以读取状态
   pp->RemoveHeader(TPheader);  // 移除头部以读取状态
-  if (TPheader.GetState()==ThreePHeader::REQUEST or TPheader.GetState()==ThreePHeader::ACT){
+  if (TPheader.GetState()==ThreePHeader::REQUEST ||
+      TPheader.GetState()==ThreePHeader::ACT ||
+      TPheader.GetState()==ThreePHeader::IDLE){
     m_currentTotalPackets++;
     m_priority_que.push_back(item);
     this->m_nPackets++;
@@ -373,6 +393,7 @@ PppRoundRobinQueue<Item>::Enqueue(Ptr<Item> item)
   if (m_subQueues[idx].size () >= m_maxPacketsPerQueue)
     {
       ++m_dropPackets;
+      ++m_subQueueDropPackets[idx];
       m_dropBytes += item->GetSize();
       static uint64_t s_dropLogCount = 0;
       if (s_dropLogCount < 20 || (s_dropLogCount % 1000) == 0)

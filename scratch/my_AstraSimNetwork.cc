@@ -407,6 +407,16 @@ int main(int argc, char *argv[]) {
   AstraSim::Workload::SetDefaultPPScheduleByString(
       ResolvePpScheduleFromConfig(network_config));
   main1(network_config);
+  if (mactable_load_enable)
+  {
+    if (!LoadBridgeMacTablesFromDirectory(mactable_load_dir))
+    {
+      std::cerr << "[MACTABLE] load failed from directory: " << mactable_load_dir
+                << ", aborting to avoid running with incomplete preloaded state.\n";
+      return 1;
+    }
+  }
+  const int warmupSeconds = GetEffectiveFloodTime();
   int gpu_num = node_num - nvswitch_num - switch_num;
   int nodes_num = gpu_num + nvswitch_num;
 
@@ -498,7 +508,7 @@ int main(int argc, char *argv[]) {
   }
 
   ns3::Simulator::Schedule(
-      ns3::Seconds(floadtime),
+      ns3::Seconds(warmupSeconds),
       [gpu_num, systems, overlayInjectors]() {
       for (int i = 0; i < gpu_num; i++) {
         if(systems[i] != nullptr)
@@ -511,14 +521,26 @@ int main(int argc, char *argv[]) {
       }
   });
 
+  if (mactable_dump_enable)
+  {
+    ns3::Time dumpTime = ns3::Seconds(warmupSeconds) - ns3::NanoSeconds(1);
+    if (dumpTime < ns3::Seconds(0))
+    {
+      dumpTime = ns3::Seconds(0);
+    }
+    ns3::Simulator::Schedule(dumpTime, []() {
+      DumpBridgeMacTablesToDirectory(mactable_dump_dir);
+    });
+  }
+
   #ifdef NS3_MPI
   if(MpiInterface::GetSystemId() == 0){
-    ns3::Simulator::Schedule(ns3::Seconds(floadtime-1),[](){
+    ns3::Simulator::Schedule(ns3::Seconds(warmupSeconds-1),[](){
       GetGlobalStart();
     });    
   }
   #elif NS3_MTP
-  ns3::Simulator::Schedule(ns3::Seconds(floadtime-1),[](){
+  ns3::Simulator::Schedule(ns3::Seconds(warmupSeconds-1),[](){
     GetGlobalStart();
   });  
   #endif

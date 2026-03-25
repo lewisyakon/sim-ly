@@ -5,6 +5,7 @@
 #include "ns3/uinteger.h"
 #include "roce-qp-engine.h"
 #include "roce-sim-header.h"
+#include "roce-tx-scheduler.h"
 #include "roce-three-phase-fsm.h"
 #include <algorithm>
 #include <cctype>
@@ -18,11 +19,7 @@ NS_LOG_COMPONENT_DEFINE("SendFlowClient");
 
 namespace {
 
-uint32_t
-MakeSyntheticQpnFromTag(uint32_t tag) {
-  // Keep qpn stable per flow tag in the simulation path.
-  return tag;
-}
+constexpr uint16_t kRoceBthBytes = 12;
 
 std::string
 ToLowerCopy(std::string v) {
@@ -30,6 +27,40 @@ ToLowerCopy(std::string v) {
     c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
   }
   return v;
+}
+
+bool
+IsRoceBasicLogEnabled(const RoceConfig& cfg) {
+  return cfg.logLevel != RoceLogLevel::Off;
+}
+
+bool
+IsRoceFullLogEnabled(const RoceConfig& cfg) {
+  return cfg.logLevel == RoceLogLevel::Full;
+}
+
+const char*
+ToString(RoceLogLevel level) {
+  switch (level) {
+    case RoceLogLevel::Off:
+      return "off";
+    case RoceLogLevel::Basic:
+      return "basic";
+    case RoceLogLevel::Full:
+      return "full";
+    default:
+      return "unknown";
+  }
+}
+
+const char*
+ToStringAckTimeoutMode(const RoceConfig& cfg) {
+  return cfg.autoAckTimeout ? "auto" : "manual";
+}
+
+uint16_t
+GetVisibleRoceWireBytes(RoceOpcode opcode) {
+  return static_cast<uint16_t>(RoceSimHeader::GetVisibleWireBytes(opcode));
 }
 
 RoceUserPhase
@@ -80,6 +111,13 @@ ToRoceOpcode(ThreePHeader::State state,
   }
 }
 
+uint16_t
+GetVisibleRoceWireBytes(ThreePHeader::State state,
+                        const RoceConfig& cfg,
+                        const RoceThreePhaseFsm* fsm) {
+  return GetVisibleRoceWireBytes(ToRoceOpcode(state, cfg, fsm));
+}
+
 void
 EnsureQpReadyToSend(RoceQpEngine* engine, const RoceQpKey& key) {
   if (engine == nullptr) {
@@ -116,8 +154,10 @@ sendflowclient::sendflowclient()
   localbridgeindex=0;
   m_roceQpEngine = std::make_unique<RoceQpEngine>();
   m_roceFsm = std::make_unique<RoceThreePhaseFsm>();
+  m_roceTxScheduler = std::make_unique<RoceTxScheduler>();
   m_roceQpEngine->Configure(m_roceCfg);
   m_roceFsm->Configure(m_roceCfg);
+  m_roceTxScheduler->Configure(m_roceCfg);
 }
 sendflowclient::~sendflowclient()
 {
@@ -151,17 +191,19 @@ void sendflowclient::HandleRead(Ptr<Socket> socket)
     uint32_t tag = TPheader.GetTag();
     uint32_t src = TPheader.GetSrc();
     uint32_t dst = TPheader.GetDst();
+    Address local;
+    socket->GetSockName(local);
+    PacketSocketAddress laddr = PacketSocketAddress::ConvertFrom(local);
+    uint32_t formIndex = laddr.GetSingleDevice(); //拿到来源的netdevice编号
 
     RoceSimHeader roceHeader;
     bool hasRoceHeader = false;
     if (IsRoceEnabled()) {
-      // 先用 probe 包试探 RoCE 头；只有 tag/src/dst 匹配才真正消费头部。
+      // RoCE 头最小可见长度是 BTH；当前数据路径上的包在 RoCE 开启时都应携带该头。
       Ptr<Packet> probe = p->Copy();
-      if (probe->GetSize() >= roceHeader.GetSerializedSize()) {
+      if (probe->GetSize() >= kRoceBthBytes) {
         probe->RemoveHeader(roceHeader);
-        if (roceHeader.GetTag() == tag &&
-            roceHeader.GetSrc() == src &&
-            roceHeader.GetDst() == dst) {
+        if (roceHeader.GetVersion() == 1) {
           p->RemoveHeader(roceHeader);
           hasRoceHeader = true;
         } else {
@@ -171,15 +213,26 @@ void sendflowclient::HandleRead(Ptr<Socket> socket)
       }
     }
     if (hasRoceHeader) {
-      HandleRoceRxHeader_(roceHeader, TPheader.GetState(), tag, src, dst);
+      bool bufferedForReorder = false;
+      const bool shouldDeliverUpper =
+          HandleRoceRxHeader_(roceHeader,
+                              TPheader.GetState(),
+                              tag,
+                              src,
+                              dst,
+                              from,
+                              formIndex,
+                              &bufferedForReorder);
+      if (bufferedForReorder) {
+        const RoceQpKey qpKey{src, dst, roceHeader.GetQpn()};
+        m_roceBufferedUpperPackets[qpKey][roceHeader.GetPsn()] =
+            BufferedRoceUpperPacket{p->Copy(), TPheader, from, formIndex};
+      }
+      if (!shouldDeliverUpper) {
+        continue;
+      }
     }
 
-
-
-    Address local;
-    socket->GetSockName(local);
-    PacketSocketAddress laddr = PacketSocketAddress::ConvertFrom(local);
-    uint32_t formIndex = laddr.GetSingleDevice(); //拿到来源的netdevice编号
 
     // NS_LOG_DEBUG("[" << node->timeGetId() << "] Received packet for flow " << flowid
     //                  << " from " << from
@@ -187,133 +240,718 @@ void sendflowclient::HandleRead(Ptr<Socket> socket)
     //                  << ", header datasize=" << datasize
     //                  << ", actual packet size=" << packet->GetSize());
 
-    switch (TPheader.GetState())
-    {
-    case ThreePHeader::REQUEST:
-    {
-      if(check_recvfunc(tag,src,dst) == false){
-        m_recvfuncflag[{tag,{src,dst}}] = 1;
-        return ;
-      }
-      fuc_and_par fp = m_recvfunctable[{tag,{src,dst}}];
-      fp.msg_handler(fp.fun_arg); 
-      m_recvfunctable.erase({tag,{src,dst}});
+    ProcessThreePhasePayload_(p, TPheader, from, formIndex);
+    if (hasRoceHeader) {
+      const RoceQpKey qpKey{src, dst, roceHeader.GetQpn()};
+      MaybeReleaseBufferedRocePackets_(qpKey);
     }
-    break;
+  }
+}
 
-    case ThreePHeader::DATA:
-    {
-      p->RemoveHeader(FTHeader);
-      AstraSim::sim_request now_request;
-      FTHeader.ToFlowTag(now_request.flowTag);
-      uint32_t PacketNum=FTHeader.get_packetnum();
-      if (m_request.find({tag,{src,dst}})==m_request.end()) m_request[{tag,{src,dst}}]=now_request;
-      if (m_dataPacketsExpected.find({tag,{src,dst}})==m_dataPacketsExpected.end()){
-        m_dataPacketsExpected[{tag,{src,dst}}]=PacketNum;
-        m_alldatasize[{tag,{src,dst}}]=TPheader.GetDataSize();
-      } 
+void
+sendflowclient::ProcessThreePhasePayload_(Ptr<Packet> p,
+                                          const ThreePHeader& TPheader,
+                                          const Address& from,
+                                          uint32_t formIndex)
+{
+  const uint32_t tag = TPheader.GetTag();
+  const uint32_t src = TPheader.GetSrc();
+  const uint32_t dst = TPheader.GetDst();
+  const RoceFlowKey flowKey{tag, src, dst};
+  FlowTagHeader FTHeader;
 
-      // 逻辑1 (计数): (接收方) 收到 DATA
-      if (m_dataPacketsExpected.count({tag,{src,dst}})!=0) {
-          m_dataPacketsReceived[{tag,{src,dst}}]++;
-          // realsend(packet,from,4,formIndex);
-          // SendPacket(ThreePHeader::ACT,from,acklen,tag,src,dst,4,formIndex);  
-          // 检查是否是最后一个 DATA 包
-          if (m_dataPacketsReceived[{tag,{src,dst}}] == m_dataPacketsExpected[{tag,{src,dst}}]) {
-              // NS_LOG_INFO("Flow " << flowid << ": (Receiver) LAST DATA packet received (" << m_dataPacketsReceived[flowid] << "/" << m_dataPacketsExpected[flowid] << ").");
-              // --- 填充recvHash ---
-              Address ackDest = from;                          // 目的地址
-              uint64_t acksize = acklen;
-              uint32_t ackTag  = tag;
-              uint32_t ackSrc  = src;
-              uint32_t ackDst  = dst;
-              int      ackIndex     = formIndex;
+  switch (TPheader.GetState())
+  {
+  case ThreePHeader::REQUEST:
+  {
+    if(check_recvfunc(tag,src,dst) == false){
+      m_recvfuncflag[flowKey] = 1;
+      return ;
+    }
+    fuc_and_par fp = m_recvfunctable[flowKey];
+    fp.msg_handler(fp.fun_arg);
+    m_recvfunctable.erase(flowKey);
+  }
+  break;
+
+  case ThreePHeader::DATA:
+  {
+    p->RemoveHeader(FTHeader);
+    AstraSim::sim_request now_request;
+    FTHeader.ToFlowTag(now_request.flowTag);
+    uint32_t PacketNum=FTHeader.get_packetnum();
+    if (m_request.find(flowKey)==m_request.end()) m_request[flowKey]=now_request;
+    if (m_dataPacketsExpected.find(flowKey)==m_dataPacketsExpected.end()){
+      m_dataPacketsExpected[flowKey]=PacketNum;
+      m_alldatasize[flowKey]=TPheader.GetDataSize();
+    }
+
+    if (m_dataPacketsExpected.count(flowKey)!=0) {
+        m_dataPacketsReceived[flowKey]++;
+        if (m_dataPacketsReceived[flowKey] == m_dataPacketsExpected[flowKey]) {
+            Address ackDest = from;
+            uint64_t acksize = acklen;
+            uint32_t ackTag  = tag;
+            uint32_t ackSrc  = src;
+            uint32_t ackDst  = dst;
+            int      ackIndex     = formIndex;
+            if (IsRoceEnabled()) {
+              EnqueueRoceWork_(ThreePHeader::ACT,
+                               ackDest,
+                               acksize,
+                               ackTag,
+                               ackSrc,
+                               ackDst,
+                               FlowSendMode::Loopback,
+                               ackIndex);
+            } else {
               ns3::Simulator::ScheduleWithContext((this->GetNode()->GetId()), Seconds(0), [this,ackDest,acksize,ackTag,ackSrc,ackDst,ackIndex](){
-                  SendPacket(ThreePHeader::ACT,ackDest,acksize,ackTag,ackSrc,ackDst,FlowSendMode::Loopback,ackIndex); });              
+                  SendPacket(ThreePHeader::ACT,ackDest,acksize,ackTag,ackSrc,ackDst,FlowSendMode::Loopback,ackIndex); });
+            }
 
+            m_recvHash[flowKey]=m_alldatasize[flowKey];
+            NS_LOG_INFO("[FLOW][RX_DONE] {tag,src,dst}= "
+                        << tag << " " << src << " " << dst
+                        << " dataPackets=" << m_dataPacketsReceived[flowKey]
+                        << "/" << m_dataPacketsExpected[flowKey]
+                        << " dataBytes=" << m_alldatasize[flowKey]
+                        << " TIME=" << Simulator::Now().GetFemtoSeconds());
+            if (check_recvfunc(tag,src,dst)){
+              fuc_and_par fp = m_recvfunctable[flowKey];
 
-              m_recvHash[{tag,{src,dst}}]=m_alldatasize[{tag,{src,dst}}];
-              if (check_recvfunc(tag,src,dst)){
-                fuc_and_par fp = m_recvfunctable[{tag,{src,dst}}];
+              AstraSim::RecvPacketEventHadndlerData* ehd = (AstraSim::RecvPacketEventHadndlerData*) fp.fun_arg;
+              ehd->flowTag=m_request[flowKey].flowTag;
 
-                AstraSim::RecvPacketEventHadndlerData* ehd = (AstraSim::RecvPacketEventHadndlerData*) fp.fun_arg;
-                ehd->flowTag=m_request[{tag,{src,dst}}].flowTag;
+              fp.msg_handler(fp.fun_arg);
+              m_recvHash.erase(flowKey);
+              m_recvfunctable.erase(flowKey);
+              m_request.erase(flowKey);
+            }
 
-                fp.msg_handler(fp.fun_arg); 
-                m_recvHash.erase({tag,{src,dst}});
-                m_recvfunctable.erase({tag,{src,dst}});
-                m_request.erase({tag,{src,dst}});
-                // NS_LOG_INFO("{tag,src,dst}= " << tag<<"  "<<src<<" "<<dst 
-                //   << " 接收完成; TIME= "<<Simulator::Now().GetFemtoSeconds());
-              }
-              // NS_LOG_INFO("flowid= " << flowid << " 接收完成 ");
-              
-              // 清理map
-              m_dataPacketsExpected.erase({tag,{src,dst}});
-              m_dataPacketsReceived.erase({tag,{src,dst}});
-          }
-      } else {
-          NS_LOG_WARN("{tag,src,dst}= " << tag<<"  "<<src<<" "<<dst << ": Received DATA packet without expected count setup.");
-      }
-
+            m_dataPacketsExpected.erase(flowKey);
+            m_dataPacketsReceived.erase(flowKey);
+        }
+    } else {
+        NS_LOG_WARN("{tag,src,dst}= " << tag<<"  "<<src<<" "<<dst << ": Received DATA packet without expected count setup.");
     }
-    break;
-    case ThreePHeader::ACT:
-    {
-      // 逻辑2 (计数): (发送方) 收到 ACT 控制报文
-      if (m_ackPacketsExpected.find({tag,{src,dst}}) != m_ackPacketsExpected.end()) {
-          m_ackPacketsReceived[{tag,{src,dst}}]++;
-            
-          // 检查是否是最后一个 ACT 包
-          if (m_ackPacketsReceived[{tag,{src,dst}}] == m_ackPacketsExpected[{tag,{src,dst}}]) {
-              // NS_LOG_INFO("Flow " << flowid << ": (Sender) LAST ACT packet received (" << m_ackPacketsReceived[flowid] << "/" << m_ackPacketsExpected[flowid] << ").");
-              // (未来引用notify_send回调函数的地方)
-              if (m_sendfunctable.find({tag,{src,dst}}) != m_sendfunctable.end()) {
-                  fuc_and_par fp = m_sendfunctable[{tag,{src,dst}}];
-                  fp.msg_handler(fp.fun_arg); 
-                  m_sendfunctable.erase({tag,{src,dst}});
-                  // NS_LOG_INFO("{tag,src,dst}= " << tag<<"  "<<src<<" "<<dst 
-                  //   << " 发送完成; TIME= "<<Simulator::Now().GetFemtoSeconds());
-              } else {
-                  NS_LOG_WARN("{tag,src,dst}= " << tag<<"  "<<src<<" "<<dst <<": (Sender) Callback not found for flowid.");
-              }
-                
-              // 清理map
-              m_ackPacketsExpected.erase({tag,{src,dst}});
-              m_ackPacketsReceived.erase({tag,{src,dst}});
-          }
-      } else {
-          NS_LOG_WARN("{tag,src,dst}= " << tag<<"  "<<src<<" "<<dst << ": Received ACT packet without expected count setup.");
-      }
+
+  }
+  break;
+  case ThreePHeader::ACT:
+  {
+    if (m_ackPacketsExpected.find(flowKey) != m_ackPacketsExpected.end()) {
+        m_ackPacketsReceived[flowKey]++;
+
+        if (m_ackPacketsReceived[flowKey] == m_ackPacketsExpected[flowKey]) {
+            if (m_sendfunctable.find(flowKey) != m_sendfunctable.end()) {
+                fuc_and_par fp = m_sendfunctable[flowKey];
+                NS_LOG_INFO("[FLOW][TX_DONE] {tag,src,dst}= "
+                            << tag << " " << src << " " << dst
+                            << " actPackets=" << m_ackPacketsReceived[flowKey]
+                            << "/" << m_ackPacketsExpected[flowKey]
+                            << " TIME=" << Simulator::Now().GetFemtoSeconds());
+                fp.msg_handler(fp.fun_arg);
+                m_sendfunctable.erase(flowKey);
+            } else {
+                NS_LOG_WARN("{tag,src,dst}= " << tag<<"  "<<src<<" "<<dst <<": (Sender) Callback not found for flowid.");
+            }
+
+            m_ackPacketsExpected.erase(flowKey);
+            m_ackPacketsReceived.erase(flowKey);
+        }
+    } else {
+        NS_LOG_WARN("{tag,src,dst}= " << tag<<"  "<<src<<" "<<dst << ": Received ACT packet without expected count setup.");
     }
-    break;
+  }
+  break;
 
   default:
     NS_LOG_WARN("Unknown state received");
     break;
+  }
+}
+
+void
+sendflowclient::MaybeReleaseBufferedRocePackets_(const RoceQpKey& qpKey)
+{
+  if (m_roceQpEngine == nullptr) {
+    return;
+  }
+
+  auto bufferedIt = m_roceBufferedUpperPackets.find(qpKey);
+  if (bufferedIt == m_roceBufferedUpperPackets.end()) {
+    return;
+  }
+
+  const uint32_t deliverUpToPsn = m_roceQpEngine->GetExpectedRxPsn(qpKey);
+  auto& packets = bufferedIt->second;
+  while (!packets.empty()) {
+    auto it = packets.begin();
+    if (it->first >= deliverUpToPsn) {
+      break;
     }
+    ProcessThreePhasePayload_(it->second.payload->Copy(),
+                              it->second.tpHeader,
+                              it->second.from,
+                              it->second.formIndex);
+    packets.erase(it);
+  }
+  if (packets.empty()) {
+    m_roceBufferedUpperPackets.erase(bufferedIt);
   }
 }
 
 void
 sendflowclient::TriggerSendTo_now(PacketSocketAddress dstadd,uint64_t datasize,uint32_t tag,uint32_t src,uint32_t dst,FlowSendMode sendmodel)
 {
-  NS_LOG_INFO("TriggerSendTo_now declared now time = "  << Simulator::Now().GetFemtoSeconds()<<" src="<<src<<" dst="<<dst<<" tag="<<tag<<" size="<<datasize);
-  if(datasize == 1023)
-  {
+  NS_LOG_INFO("TriggerSendTo_now declared now time = "
+              << Simulator::Now().GetFemtoSeconds()
+              << " src=" << src
+              << " dst=" << dst
+              << " tag=" << tag
+              << " size=" << datasize);
+  const ThreePHeader::State state =
+      (datasize == 1023) ? ThreePHeader::REQUEST : ThreePHeader::DATA;
+  if (IsRoceEnabled()) {
+    EnqueueRoceWork_(state, dstadd, datasize, tag, src, dst, sendmodel);
+  } else if (state == ThreePHeader::REQUEST) {
     ns3::Simulator::ScheduleWithContext((this->GetNode()->GetId()), Seconds(0), [this,dstadd,datasize,tag,src,dst,sendmodel](){
       SendPacket(ThreePHeader::REQUEST, dstadd, datasize, tag,src,dst,sendmodel);});
-  }
-  else
-  {
+  } else {
     ns3::Simulator::ScheduleWithContext((this->GetNode()->GetId()), Seconds(0), [this,dstadd,datasize,tag,src,dst,sendmodel](){
-      SendPacket(ThreePHeader::DATA, dstadd, datasize, tag,src,dst,sendmodel);});    
+      SendPacket(ThreePHeader::DATA, dstadd, datasize, tag,src,dst,sendmodel);});
   }
 }
 void
 sendflowclient::realsend(Ptr<Packet> packet,const Address& dest,FlowSendMode sendmodel,int mindex)
 {
     m_io->Send(dest,packet,sendmodel,mindex);
+}
+
+void
+sendflowclient::EnqueueRoceWork_(ThreePHeader::State state,
+                                 const Address& dest,
+                                 uint64_t datasize,
+                                 uint32_t tag,
+                                 uint32_t src,
+                                 uint32_t dst,
+                                 FlowSendMode sendmodel,
+                                 int mindex) {
+  if (!IsRoceEnabled()) {
+    SendPacket(state, dest, datasize, tag, src, dst, sendmodel, mindex);
+    return;
+  }
+  if (m_roceTxScheduler == nullptr) {
+    NS_FATAL_ERROR("[ROCE][SCHED] missing tx scheduler");
+  }
+
+  Ptr<Node> node = GetNode();
+  NS_ASSERT(node != nullptr);
+  Ptr<NetDevice> device = node->GetDevice(0);
+  NS_ASSERT(device != nullptr);
+  const uint32_t mtu = device->GetMtu();
+  const RoceFlowKey flowKey{tag, src, dst};
+  const uint32_t qpn = GetOrAllocRoceQpn_(tag, src, dst);
+
+  uint64_t remainingBytes = 1;
+  uint64_t totalPackets = 1;
+  RoceTxClass txClass = RoceTxClass::Control;
+  if (state == ThreePHeader::DATA) {
+    const uint32_t visibleRoceBytes =
+        GetVisibleRoceWireBytes(state, m_roceCfg, m_roceFsm.get());
+    const uint32_t payloadBudget =
+        mtu > visibleRoceBytes ? (mtu - visibleRoceBytes) : 1;
+    remainingBytes = datasize;
+    totalPackets = std::max<uint64_t>(
+        1, (datasize + static_cast<uint64_t>(payloadBudget) - 1) / payloadBudget);
+    txClass = RoceTxClass::Data;
+    m_ackPacketsExpected[flowKey] = 1;
+    m_ackPacketsReceived[flowKey] = 0;
+  }
+
+  RoceTxWorkItem item;
+  item.workId = m_nextRoceWorkId++;
+  item.state = state;
+  item.flowKey = flowKey;
+  item.qpKey = RoceQpKey{src, dst, qpn};
+  item.dest = dest;
+  item.sendMode = sendmodel;
+  item.mindex = mindex;
+  item.totalBytes = datasize;
+  item.remainingBytes = remainingBytes;
+  item.packetIndex = 0;
+  item.totalPackets = totalPackets;
+  item.txClass = txClass;
+  if (!m_roceTxScheduler->Enqueue(item)) {
+    NS_FATAL_ERROR("[ROCE][SCHED] failed to enqueue work"
+                   << " tag=" << tag
+                   << " src=" << src
+                   << " dst=" << dst
+                   << " state=" << static_cast<uint32_t>(state));
+  }
+  if (IsRoceBasicLogEnabled(m_roceCfg)) {
+    NS_LOG_INFO("[ROCE][SCHED][ENQ] workId=" << item.workId
+                << " state=" << static_cast<uint32_t>(state)
+                << " tag=" << tag
+                << " src=" << src
+                << " dst=" << dst
+                << " qpn=" << qpn
+                << " totalBytes=" << item.totalBytes
+                << " totalPackets=" << item.totalPackets
+                << " class=" << static_cast<uint32_t>(item.txClass));
+  }
+  ScheduleRoceDispatch_();
+}
+
+void
+sendflowclient::ScheduleRoceDispatch_() {
+  if (!IsRoceEnabled() || m_roceTxScheduler == nullptr) {
+    return;
+  }
+  if (m_rocePendingRetransmissions.empty() &&
+      !m_roceTxScheduler->HasPendingWork()) {
+    return;
+  }
+  if (m_roceDispatchEvent.IsPending()) {
+    return;
+  }
+  m_roceDispatchEvent = Simulator::Schedule(
+      Seconds(0),
+      &sendflowclient::DispatchOneRoceSlice_,
+      this);
+}
+
+void
+sendflowclient::DispatchOneRoceSlice_() {
+  if (!IsRoceEnabled() || m_roceTxScheduler == nullptr) {
+    return;
+  }
+
+  if (!m_rocePendingRetransmissions.empty()) {
+    DispatchPendingRoceRetransmissions_();
+    if (!m_rocePendingRetransmissions.empty() || m_roceTxScheduler->HasPendingWork()) {
+      ScheduleRoceDispatch_();
+    }
+    return;
+  }
+
+  Ptr<Node> node = GetNode();
+  NS_ASSERT(node != nullptr);
+  Ptr<NetDevice> device = node->GetDevice(0);
+  NS_ASSERT(device != nullptr);
+
+  const std::set<RoceQpKey> blockedQps = CollectBlockedRoceQps_();
+  RoceTxSlice slice;
+  if (!m_roceTxScheduler->PickNextSlice(device->GetMtu(), &blockedQps, &slice)) {
+    return;
+  }
+  if (IsRoceFullLogEnabled(m_roceCfg)) {
+    NS_LOG_INFO("[ROCE][SCHED][TX] workId=" << slice.workId
+                << " state=" << static_cast<uint32_t>(slice.state)
+                << " tag=" << slice.flowKey.tag
+                << " src=" << slice.flowKey.src
+                << " dst=" << slice.flowKey.dst
+                << " qpn=" << slice.qpKey.qpn
+                << " packetIndex=" << slice.packetIndex
+                << " sliceBytes=" << slice.sliceBytes
+                << " totalPackets=" << slice.totalPackets
+                << " last=" << slice.isLastSlice
+                << " class=" << static_cast<uint32_t>(slice.txClass));
+  }
+
+  Ptr<Packet> packet;
+  RoceSimHeader roceHeader;
+  if (!BuildPacketForRoceSlice_(slice, &packet, &roceHeader)) {
+    NS_FATAL_ERROR("[ROCE][SCHED] failed to build packet for dispatched slice"
+                   << " tag=" << slice.flowKey.tag
+                   << " src=" << slice.flowKey.src
+                   << " dst=" << slice.flowKey.dst
+                   << " workId=" << slice.workId);
+  }
+  realsend(packet, slice.dest, slice.sendMode, slice.mindex);
+  TrackRoceOutstandingPacket_(slice, packet, roceHeader);
+  FinalizeRoceSliceDispatch_(slice);
+
+  if (m_roceTxScheduler->HasPendingWork()) {
+    ScheduleRoceDispatch_();
+  }
+}
+
+void
+sendflowclient::DispatchPendingRoceRetransmissions_() {
+  if (m_rocePendingRetransmissions.empty()) {
+    return;
+  }
+
+  auto it = m_rocePendingRetransmissions.begin();
+  const RoceQpKey qpKey = it->first;
+  const RoceOutstandingPacket outstanding = it->second;
+  m_rocePendingRetransmissions.erase(it);
+
+  if (IsRoceBasicLogEnabled(m_roceCfg)) {
+    NS_LOG_INFO("[ROCE][RTX][SEND] tag=" << outstanding.flowKey.tag
+                << " src=" << outstanding.flowKey.src
+                << " dst=" << outstanding.flowKey.dst
+                << " qpn=" << qpKey.qpn
+                << " psn=" << outstanding.psn
+                << " retry=" << outstanding.retries
+                << " TIME=" << Simulator::Now().GetFemtoSeconds());
+  }
+  realsend(outstanding.packet->Copy(),
+           outstanding.dest,
+           outstanding.sendMode,
+           outstanding.mindex);
+  ArmRoceRetransTimer_(qpKey);
+}
+
+bool
+sendflowclient::BuildPacketForRoceSlice_(const RoceTxSlice& slice,
+                                         Ptr<Packet>* packetOut,
+                                         RoceSimHeader* headerOut) {
+  if (packetOut == nullptr) {
+    return false;
+  }
+
+  HopCountHeader hopHeader;
+  hopHeader.SetHopCount(0);
+  hopHeader.SetIsFlood(false);
+
+  ThreePHeader TPheader;
+  TPheader.SetState(slice.state);
+  TPheader.SetTag(slice.flowKey.tag);
+  TPheader.SetSrc(slice.flowKey.src);
+  TPheader.SetDst(slice.flowKey.dst);
+  TPheader.SetDataSize(slice.totalBytes);
+
+  FlowTagHeader FTHeader;
+  const uint16_t roceWireBytes =
+      GetVisibleRoceWireBytes(slice.state, m_roceCfg, m_roceFsm.get());
+  auto SafePayloadBytes = [](int64_t rawBytes) -> uint16_t {
+    return rawBytes > 0 ? static_cast<uint16_t>(rawBytes) : 0;
+  };
+
+  Ptr<Packet> packet;
+  uint16_t realPacketPayload = 0;
+  if (slice.state == ThreePHeader::REQUEST) {
+    realPacketPayload = SafePayloadBytes(
+        static_cast<int64_t>(reqlen) - TPheader.GetSerializedSize() -
+        hopHeader.GetSerializedSize() - roceWireBytes);
+    packet = Create<Packet>(realPacketPayload);
+  } else if (slice.state == ThreePHeader::DATA) {
+    FTHeader.FromFlowTag(get_flowtag(slice.flowKey.tag, slice.flowKey.src, slice.flowKey.dst).flowTag);
+    FTHeader.set_packetnum(slice.totalPackets);
+    const int64_t baseBytes = static_cast<int64_t>(slice.sliceBytes);
+    realPacketPayload = SafePayloadBytes(
+        baseBytes - TPheader.GetSerializedSize() -
+        hopHeader.GetSerializedSize() - FTHeader.GetSerializedSize());
+    packet = Create<Packet>(realPacketPayload);
+    packet->AddHeader(FTHeader);
+  } else if (slice.state == ThreePHeader::ACT) {
+    realPacketPayload = SafePayloadBytes(
+        static_cast<int64_t>(acklen) - TPheader.GetSerializedSize() -
+        hopHeader.GetSerializedSize() - roceWireBytes);
+    packet = Create<Packet>(realPacketPayload);
+  } else {
+    return false;
+  }
+
+  RoceSimHeader roceHeader;
+  const bool hasRoceHeader =
+      BuildRoceTxHeader_(slice.state,
+                         slice.totalBytes,
+                         static_cast<uint32_t>(realPacketPayload),
+                         slice.flowKey.tag,
+                         slice.flowKey.src,
+                         slice.flowKey.dst,
+                         &roceHeader);
+  if (!hasRoceHeader) {
+    return false;
+  }
+
+  packet->AddHeader(roceHeader);
+  packet->AddHeader(TPheader);
+  packet->AddHeader(hopHeader);
+  if (headerOut != nullptr) {
+    *headerOut = roceHeader;
+  }
+  *packetOut = packet;
+  return true;
+}
+
+void
+sendflowclient::FinalizeRoceSliceDispatch_(const RoceTxSlice& slice) {
+  if (!slice.isLastSlice) {
+    return;
+  }
+
+  if (slice.state == ThreePHeader::REQUEST) {
+    auto it = m_sendfunctable.find(slice.flowKey);
+    if (it == m_sendfunctable.end()) {
+      NS_LOG_WARN("[ROCE][SCHED] request callback missing"
+                  << " tag=" << slice.flowKey.tag
+                  << " src=" << slice.flowKey.src
+                  << " dst=" << slice.flowKey.dst);
+      return;
+    }
+    fuc_and_par fp = it->second;
+    NS_LOG_INFO("[FLOW][REQ_DONE] {tag,src,dst}= "
+                << slice.flowKey.tag << " "
+                << slice.flowKey.src << " "
+                << slice.flowKey.dst
+                << " workId=" << slice.workId
+                << " TIME=" << Simulator::Now().GetFemtoSeconds());
+    fp.msg_handler(fp.fun_arg);
+    m_sendfunctable.erase(it);
+  }
+}
+
+bool
+sendflowclient::BuildRoceAckPacket_(uint32_t tag,
+                                    uint32_t src,
+                                    uint32_t dst,
+                                    uint32_t qpn,
+                                    Ptr<Packet>* packetOut) {
+  if (!IsRoceEnabled() || packetOut == nullptr || m_roceQpEngine == nullptr) {
+    return false;
+  }
+
+  HopCountHeader hopHeader;
+  hopHeader.SetHopCount(0);
+  hopHeader.SetIsFlood(false);
+
+  ThreePHeader TPheader;
+  TPheader.SetState(ThreePHeader::IDLE);
+  TPheader.SetTag(tag);
+  TPheader.SetSrc(src);
+  TPheader.SetDst(dst);
+  TPheader.SetDataSize(0);
+
+  const RoceQpKey qpKey{src, dst, qpn};
+  EnsureQpReadyToSend(m_roceQpEngine.get(), qpKey);
+
+  RoceSimHeader ackHeader;
+  if (!m_roceQpEngine->BuildSendHeader(
+          qpKey, RoceOpcode::Ack, RoceUserPhase::None, 0, tag, &ackHeader)) {
+    return false;
+  }
+  ackHeader.SetFlags(ackHeader.GetFlags() | 0x4);
+
+  Ptr<Packet> packet = Create<Packet>(0);
+  packet->AddHeader(ackHeader);
+  packet->AddHeader(TPheader);
+  packet->AddHeader(hopHeader);
+  *packetOut = packet;
+  return true;
+}
+
+void
+sendflowclient::MaybeSendRoceAck_(const Address& dest,
+                                  uint32_t tag,
+                                  uint32_t src,
+                                  uint32_t dst,
+                                  uint32_t qpn,
+                                  uint32_t rxInDevIndexForLoopback,
+                                  RoceOpcode rxOpcode) {
+  if (!IsRoceEnabled() || !m_roceCfg.enableTransportAck ||
+      rxOpcode == RoceOpcode::Ack) {
+    return;
+  }
+
+  Ptr<Packet> ackPacket;
+  if (!BuildRoceAckPacket_(tag, src, dst, qpn, &ackPacket)) {
+    NS_LOG_WARN("[ROCE][ACK][TX] failed to build ack"
+                << " tag=" << tag
+                << " src=" << src
+                << " dst=" << dst
+                << " qpn=" << qpn);
+    return;
+  }
+  if (IsRoceFullLogEnabled(m_roceCfg)) {
+    NS_LOG_INFO("[ROCE][ACK][TX] tag=" << tag
+                << " src=" << src
+                << " dst=" << dst
+                << " qpn=" << qpn
+                << " TIME=" << Simulator::Now().GetFemtoSeconds());
+  }
+  realsend(ackPacket, dest, FlowSendMode::Loopback, rxInDevIndexForLoopback);
+}
+
+void
+sendflowclient::TrackRoceOutstandingPacket_(const RoceTxSlice& slice,
+                                            const Ptr<Packet>& packet,
+                                            const RoceSimHeader& header) {
+  if (!IsRoceEnabled() || !m_roceCfg.enableTransportAck ||
+      header.GetOpcode() == RoceOpcode::Ack || packet == nullptr) {
+    return;
+  }
+
+  RoceOutstandingPacket outstanding;
+  outstanding.packet = packet->Copy();
+  outstanding.dest = slice.dest;
+  outstanding.sendMode = slice.sendMode;
+  outstanding.mindex = slice.mindex;
+  outstanding.flowKey = slice.flowKey;
+  outstanding.qpKey = slice.qpKey;
+  outstanding.psn = header.GetPsn();
+  outstanding.retries = 0;
+  m_roceOutstandingPackets[slice.qpKey][header.GetPsn()] = outstanding;
+  ArmRoceRetransTimer_(slice.qpKey);
+}
+
+void
+sendflowclient::HandleRoceAck_(const RoceFlowKey& flowKey,
+                               const RoceQpKey& qpKey,
+                               const RoceSimHeader& roceHeader) {
+  auto mapIt = m_roceOutstandingPackets.find(qpKey);
+  if (mapIt == m_roceOutstandingPackets.end()) {
+    return;
+  }
+
+  const uint32_t ackPsn = roceHeader.GetAckPsn();
+  auto& packets = mapIt->second;
+  for (auto it = packets.begin(); it != packets.end();) {
+    if (it->first > ackPsn) {
+      ++it;
+      continue;
+    }
+    it = packets.erase(it);
+  }
+  if (packets.empty()) {
+    CancelRoceRetransTimer_(qpKey);
+    m_roceOutstandingPackets.erase(mapIt);
+  } else {
+    ArmRoceRetransTimer_(qpKey);
+  }
+
+  auto recoveryIt = m_roceRecoveryTargetPsns.find(qpKey);
+  if (recoveryIt != m_roceRecoveryTargetPsns.end() &&
+      ackPsn >= recoveryIt->second) {
+    m_roceRecoveryTargetPsns.erase(recoveryIt);
+    m_rocePendingRetransmissions.erase(qpKey);
+  }
+
+  if (IsRoceFullLogEnabled(m_roceCfg)) {
+    NS_LOG_INFO("[ROCE][ACK][RX] tag=" << flowKey.tag
+                << " src=" << flowKey.src
+                << " dst=" << flowKey.dst
+                << " qpn=" << qpKey.qpn
+                << " ackPsn=" << ackPsn
+                << " TIME=" << Simulator::Now().GetFemtoSeconds());
+  }
+  ScheduleRoceDispatch_();
+}
+
+void
+sendflowclient::HandleRoceRetransTimeout_(RoceQpKey qpKey) {
+  auto mapIt = m_roceOutstandingPackets.find(qpKey);
+  if (mapIt == m_roceOutstandingPackets.end()) {
+    CancelRoceRetransTimer_(qpKey);
+    return;
+  }
+  auto packetIt = mapIt->second.begin();
+  if (packetIt == mapIt->second.end()) {
+    CancelRoceRetransTimer_(qpKey);
+    return;
+  }
+
+  RoceOutstandingPacket& outstanding = packetIt->second;
+  const uint32_t psn = outstanding.psn;
+  if (outstanding.retries >= m_roceCfg.maxRetransmissions) {
+    NS_LOG_WARN("[ROCE][RTX][DROP] tag=" << outstanding.flowKey.tag
+                << " src=" << outstanding.flowKey.src
+                << " dst=" << outstanding.flowKey.dst
+                << " qpn=" << qpKey.qpn
+                << " psn=" << psn
+                << " retries=" << outstanding.retries);
+    mapIt->second.erase(packetIt);
+    if (mapIt->second.empty()) {
+      CancelRoceRetransTimer_(qpKey);
+      m_roceOutstandingPackets.erase(mapIt);
+    } else {
+      ArmRoceRetransTimer_(qpKey);
+    }
+    m_rocePendingRetransmissions.erase(qpKey);
+    m_roceRecoveryTargetPsns.erase(qpKey);
+    ScheduleRoceDispatch_();
+    return;
+  }
+
+  outstanding.retries++;
+  if (IsRoceBasicLogEnabled(m_roceCfg)) {
+    NS_LOG_INFO("[ROCE][RTX][TIMEOUT] tag=" << outstanding.flowKey.tag
+                << " src=" << outstanding.flowKey.src
+                << " dst=" << outstanding.flowKey.dst
+                << " qpn=" << qpKey.qpn
+                << " psn=" << psn
+                << " retry=" << outstanding.retries
+                << " TIME=" << Simulator::Now().GetFemtoSeconds());
+  }
+  m_rocePendingRetransmissions[qpKey] = outstanding;
+  m_roceRecoveryTargetPsns[qpKey] = psn;
+  ScheduleRoceDispatch_();
+}
+
+void
+sendflowclient::ArmRoceRetransTimer_(const RoceQpKey& qpKey) {
+  auto outstandingIt = m_roceOutstandingPackets.find(qpKey);
+  if (outstandingIt == m_roceOutstandingPackets.end() ||
+      outstandingIt->second.empty()) {
+    CancelRoceRetransTimer_(qpKey);
+    return;
+  }
+
+  const uint32_t oldestPsn = outstandingIt->second.begin()->first;
+  auto& timerState = m_roceRetransTimers[qpKey];
+  if (timerState.event.IsPending()) {
+    timerState.event.Cancel();
+  }
+  timerState.trackedPsn = oldestPsn;
+  timerState.event = Simulator::Schedule(
+      NanoSeconds(m_roceCfg.ackTimeoutNs),
+      &sendflowclient::HandleRoceRetransTimeout_,
+      this,
+      qpKey);
+}
+
+void
+sendflowclient::CancelRoceRetransTimer_(const RoceQpKey& qpKey) {
+  auto it = m_roceRetransTimers.find(qpKey);
+  if (it == m_roceRetransTimers.end()) {
+    return;
+  }
+  if (it->second.event.IsPending()) {
+    it->second.event.Cancel();
+  }
+  m_roceRetransTimers.erase(it);
+}
+
+uint32_t
+sendflowclient::GetRoceOutstandingCount_(const RoceQpKey& qpKey) const {
+  auto it = m_roceOutstandingPackets.find(qpKey);
+  if (it == m_roceOutstandingPackets.end()) {
+    return 0;
+  }
+  return static_cast<uint32_t>(it->second.size());
+}
+
+uint32_t
+sendflowclient::GetRoceTransportWindowPackets_() const {
+  return std::max<uint32_t>(1, m_roceCfg.transportWindowPackets);
+}
+
+std::set<RoceQpKey>
+sendflowclient::CollectBlockedRoceQps_() const {
+  std::set<RoceQpKey> blocked;
+  const uint32_t windowPackets = GetRoceTransportWindowPackets_();
+  for (const auto& [qpKey, packets] : m_roceOutstandingPackets) {
+    if (packets.size() >= windowPackets) {
+      blocked.insert(qpKey);
+    }
+  }
+  for (const auto& [qpKey, _] : m_roceRecoveryTargetPsns) {
+    blocked.insert(qpKey);
+  }
+  return blocked;
 }
 
 
@@ -365,16 +1003,19 @@ sendflowclient::SendPacket(ThreePHeader::State state, const Address& dest, uint6
   
   Ptr<Node> node = GetNode();
   Ptr<NetDevice> device = node->GetDevice(0);
-  // uint16_t m_mtu=device->GetMtu()-TPheader.GetSerializedSize()-hopHeader.GetSerializedSize();
   uint16_t m_mtu=device->GetMtu();
-  RoceSimHeader roceWireHeader;
-  // 开启 RoCE 时，payload 预算需要扣除 RoCE 头，避免 MTU 计算偏大导致流程卡住。
+  // 开启 RoCE 时，DATA 分片预算需要扣掉可见 RoCE 头；隐藏的仿真控制头仍算在业务区里。
   const uint16_t roceWireBytes =
-      IsRoceEnabled() ? static_cast<uint16_t>(roceWireHeader.GetSerializedSize())
+      IsRoceEnabled() ? GetVisibleRoceWireBytes(state, m_roceCfg, m_roceFsm.get())
                       : 0;
+  const uint16_t payloadBudget =
+      IsRoceEnabled() && m_mtu > roceWireBytes
+          ? static_cast<uint16_t>(m_mtu - roceWireBytes)
+          : m_mtu;
   auto SafePayloadBytes = [](int64_t rawBytes) -> uint16_t {
     return rawBytes > 0 ? static_cast<uint16_t>(rawBytes) : 0;
   };
+  const RoceFlowKey flowKey{tag, src, dst};
  
   if (state == ThreePHeader::REQUEST) {
       uint16_t real_packet_size = SafePayloadBytes(
@@ -398,24 +1039,27 @@ sendflowclient::SendPacket(ThreePHeader::State state, const Address& dest, uint6
       packet->AddHeader(hopHeader);
       realsend(packet,dest,sendmodel);
 
-      fuc_and_par fp = m_sendfunctable[{tag,{src,dst}}];
+      fuc_and_par fp = m_sendfunctable[flowKey];
+      NS_LOG_INFO("[FLOW][REQ_DONE] {tag,src,dst}= "
+                  << tag << " " << src << " " << dst
+                  << " TIME=" << Simulator::Now().GetFemtoSeconds());
       fp.msg_handler(fp.fun_arg);
-      m_sendfunctable.erase({tag,{src,dst}});
+      m_sendfunctable.erase(flowKey);
 
       // m_alldatasize[{tag,{src,dst}}]=datasize;
   }
   
   if (state==ThreePHeader::DATA){
     uint64_t numPackets;
-    if (datasize<m_mtu) numPackets=1;
+    if (datasize<payloadBudget) numPackets=1;
     else {
-      if (datasize % m_mtu==0) numPackets=datasize / m_mtu;
-      else numPackets = (datasize / m_mtu) + 1;
+      if (datasize % payloadBudget==0) numPackets=datasize / payloadBudget;
+      else numPackets = (datasize / payloadBudget) + 1;
     }
     // m_ackPacketsExpected[{tag,{src,dst}}] = numPackets;
     // 发送前记录act
-    m_ackPacketsExpected[{tag,{src,dst}}] = 1;
-    m_ackPacketsReceived[{tag,{src,dst}}] = 0; // 初始化 ACT 计数器
+    m_ackPacketsExpected[flowKey] = 1;
+    m_ackPacketsReceived[flowKey] = 0; // 初始化 ACT 计数器
     FTHeader.FromFlowTag(get_flowtag(tag,src,dst).flowTag);
     FTHeader.set_packetnum(numPackets);
     TPheader.SetDataSize(datasize);
@@ -423,19 +1067,17 @@ sendflowclient::SendPacket(ThreePHeader::State state, const Address& dest, uint6
     uint64_t len = datasize;
     for (uint64_t i = 0; i < numPackets; ++i) {
         uint16_t real_packet_size = 0;
-        if (len >= m_mtu) {
+        if (len >= payloadBudget) {
           real_packet_size = SafePayloadBytes(
-              static_cast<int64_t>(m_mtu) - TPheader.GetSerializedSize() -
-              hopHeader.GetSerializedSize() - FTHeader.GetSerializedSize() -
-              roceWireBytes);
+              static_cast<int64_t>(payloadBudget) - TPheader.GetSerializedSize() -
+              hopHeader.GetSerializedSize() - FTHeader.GetSerializedSize());
           packet = Create<Packet>(real_packet_size);
           
         } 
         else {
           real_packet_size = SafePayloadBytes(
               static_cast<int64_t>(len) - TPheader.GetSerializedSize() -
-              hopHeader.GetSerializedSize() - FTHeader.GetSerializedSize() -
-              roceWireBytes);
+              hopHeader.GetSerializedSize() - FTHeader.GetSerializedSize());
           packet = Create<Packet>(real_packet_size);
         }
         RoceSimHeader roceHeader;
@@ -456,7 +1098,7 @@ sendflowclient::SendPacket(ThreePHeader::State state, const Address& dest, uint6
         
         realsend(packet,dest,sendmodel,mindex);
       
-        len = (len > m_mtu) ? (len - m_mtu) : 0;
+        len = (len > payloadBudget) ? (len - payloadBudget) : 0;
     }
   }
   if (state==ThreePHeader::ACT){
@@ -491,51 +1133,52 @@ sendflowclient::SendPacket(ThreePHeader::State state, const Address& dest, uint6
 }
 void
 sendflowclient::set_sendfunc(int tag,int src,int dst,fuc_and_par fp){
-    m_sendfunctable[{tag,{src,dst}}]=fp; 
+    m_sendfunctable[RoceFlowKey{static_cast<uint32_t>(tag), static_cast<uint32_t>(src), static_cast<uint32_t>(dst)}]=fp; 
 }
 
 void
 sendflowclient::set_recvfunc(int tag,int src,int dst,fuc_and_par fp){
-    if(m_recvfuncflag[{tag,{src,dst}}] == 1){
-      m_recvfuncflag[{tag,{src,dst}}] = 0;
+    const RoceFlowKey flowKey{static_cast<uint32_t>(tag), static_cast<uint32_t>(src), static_cast<uint32_t>(dst)};
+    if(m_recvfuncflag[flowKey] == 1){
+      m_recvfuncflag[flowKey] = 0;
 
       // NS_LOG_INFO("[RZV] CALLBACK fired tag="<<tag<<" src="<<src<<" dst="<<dst);
       
       fp.msg_handler(fp.fun_arg);
       return ;
     }
-    m_recvfunctable[{tag,{src,dst}}]=fp; 
+    m_recvfunctable[flowKey]=fp; 
 }
 
 bool
 sendflowclient::check_recvfunc(int tag,int src,int dst){
-    if (m_recvfunctable.find({tag,{src,dst}})!=m_recvfunctable.end()) return true;
+    if (m_recvfunctable.find(RoceFlowKey{static_cast<uint32_t>(tag), static_cast<uint32_t>(src), static_cast<uint32_t>(dst)})!=m_recvfunctable.end()) return true;
     else return false;
 }
 void
 sendflowclient::set_recvhash(int tag,int src,int dst,uint64_t countnum){
-    m_recvHash[{tag,{src,dst}}]=countnum;
+    m_recvHash[RoceFlowKey{static_cast<uint32_t>(tag), static_cast<uint32_t>(src), static_cast<uint32_t>(dst)}]=countnum;
 }
 void
 sendflowclient::erase_recvhash(int tag,int src,int dst){
-    m_recvHash.erase({tag,{src,dst}});
+    m_recvHash.erase(RoceFlowKey{static_cast<uint32_t>(tag), static_cast<uint32_t>(src), static_cast<uint32_t>(dst)});
 }
 bool
 sendflowclient::check_recvhash(int tag,int src,int dst){
-    if (m_recvHash.find({tag,{src,dst}})!=m_recvHash.end()) return true;
+    if (m_recvHash.find(RoceFlowKey{static_cast<uint32_t>(tag), static_cast<uint32_t>(src), static_cast<uint32_t>(dst)})!=m_recvHash.end()) return true;
     else return false;
 }
 uint64_t
 sendflowclient::get_recvhash(int tag,int src,int dst){
-    return m_recvHash[{tag,{src,dst}}];
+    return m_recvHash[RoceFlowKey{static_cast<uint32_t>(tag), static_cast<uint32_t>(src), static_cast<uint32_t>(dst)}];
 }
 void
 sendflowclient::write_flowtag(int tag,int src,int dst,AstraSim::sim_request request){
-    m_request[{tag,{src,dst}}]=request;
+    m_request[RoceFlowKey{static_cast<uint32_t>(tag), static_cast<uint32_t>(src), static_cast<uint32_t>(dst)}]=request;
 }
 AstraSim::sim_request
 sendflowclient::get_flowtag(int tag,int src,int dst){
-  return m_request[{tag,{src,dst}}];
+  return m_request[RoceFlowKey{static_cast<uint32_t>(tag), static_cast<uint32_t>(src), static_cast<uint32_t>(dst)}];
 }
 
 bool
@@ -555,16 +1198,25 @@ sendflowclient::BuildRoceTxHeader_(ThreePHeader::State state,
 
   if (!m_roceActiveLogged) {
     // 每个 app 实例只打印一次 ACTIVE，避免日志过量。
-    NS_LOG_INFO("[ROCE][ACTIVE] node=" << GetNode()->GetId()
-                << " mode=" << m_roceCfg.modeName
-                << " dataUseWrite=" << m_roceCfg.dataUseWrite
-                << " sqDepth=" << m_roceCfg.defaultSqDepth
-                << " rqDepth=" << m_roceCfg.defaultRqDepth
-                << " etherType=0x" << std::hex << m_roceCfg.etherType << std::dec);
+    if (IsRoceBasicLogEnabled(m_roceCfg)) {
+      NS_LOG_INFO("[ROCE][ACTIVE] node=" << GetNode()->GetId()
+                  << " mode=" << m_roceCfg.modeName
+                  << " dataUseWrite=" << m_roceCfg.dataUseWrite
+                  << " sqDepth=" << m_roceCfg.defaultSqDepth
+                  << " rqDepth=" << m_roceCfg.defaultRqDepth
+                  << " transportWindowPackets=" << m_roceCfg.transportWindowPackets
+                  << " etherType=0x" << std::hex << m_roceCfg.etherType << std::dec
+                  << " logLevel=" << ToString(m_roceCfg.logLevel)
+                  << " ackTimeoutMode=" << ToStringAckTimeoutMode(m_roceCfg)
+                  << " ackTimeoutBaseNs=" << m_roceCfg.ackTimeoutBaseNs
+                  << " ackTimeoutFactor=" << m_roceCfg.ackTimeoutFactor
+                  << " ackTimeoutNs=" << m_roceCfg.ackTimeoutNs);
+    }
     m_roceActiveLogged = true;
   }
 
-  const RoceQpKey qpKey{src, dst, MakeSyntheticQpnFromTag(tag)};
+  const uint32_t qpn = GetOrAllocRoceQpn_(tag, src, dst);
+  const RoceQpKey qpKey{src, dst, qpn};
   EnsureQpReadyToSend(m_roceQpEngine.get(), qpKey);
   if (m_roceQpEngine == nullptr || !m_roceQpEngine->CanPostSend(qpKey)) {
     // 当前实现的 QP 就绪是同步推进到 RTS；走到这里说明状态机内部存在错误。
@@ -634,31 +1286,65 @@ sendflowclient::BuildRoceTxHeader_(ThreePHeader::State state,
   return true;
 }
 
-void
+bool
 sendflowclient::HandleRoceRxHeader_(const RoceSimHeader& roceHeader,
                                     ThreePHeader::State state,
                                     uint32_t tag,
                                     uint32_t src,
-                                    uint32_t dst) {
+                                    uint32_t dst,
+                                    const Address& from,
+                                    uint32_t rxInDevIndexForLoopback,
+                                    bool* bufferedForReorder) {
   if (!IsRoceEnabled()) {
-    return;
+    return true;
   }
 
+  const RoceFlowKey flowKey{tag, src, dst};
+  RememberRoceQpn_(tag, src, dst, roceHeader.GetQpn());
   const RoceQpKey qpKey{src, dst, roceHeader.GetQpn()};
   EnsureQpReadyToSend(m_roceQpEngine.get(), qpKey);
 
   bool qpAccepted = true;
+  bool shouldDeliverUpper = true;
+  bool qpBufferedForReorder = false;
   RoceCompletion cqe;
   if (m_roceQpEngine != nullptr) {
     // 由 QP 引擎校验 PSN/状态等接收侧条件。
-    qpAccepted = m_roceQpEngine->OnRxHeader(qpKey, roceHeader, &cqe);
+    qpAccepted = m_roceQpEngine->OnRxHeader(qpKey,
+                                            roceHeader,
+                                            &cqe,
+                                            &shouldDeliverUpper,
+                                            &qpBufferedForReorder);
     if (!qpAccepted) {
       NS_LOG_WARN("[ROCE][RX] QP rejected packet tag=" << tag
                   << " src=" << src
                   << " dst=" << dst
                   << " qpn=" << roceHeader.GetQpn()
                   << " psn=" << roceHeader.GetPsn());
+      return false;
     }
+  }
+  if (bufferedForReorder != nullptr) {
+    *bufferedForReorder = qpBufferedForReorder;
+  }
+
+  if (roceHeader.GetOpcode() == RoceOpcode::Ack && qpAccepted) {
+    HandleRoceAck_(flowKey, qpKey, roceHeader);
+    return false;
+  }
+
+  if (qpAccepted) {
+    MaybeSendRoceAck_(from,
+                      tag,
+                      src,
+                      dst,
+                      roceHeader.GetQpn(),
+                      rxInDevIndexForLoopback,
+                      roceHeader.GetOpcode());
+  }
+
+  if (!shouldDeliverUpper) {
+    return false;
   }
 
   if (roceHeader.GetUserPhase() != ToRoceUserPhase(state)) {
@@ -676,9 +1362,10 @@ sendflowclient::HandleRoceRxHeader_(const RoceSimHeader& roceHeader,
   if (state == ThreePHeader::ACT && qpAccepted) {
     // ACT 仅作为 3P 业务控制报文存在，不再承担可靠传输 completion 语义。
     if (m_roceFsm != nullptr) {
-      m_roceFsm->OnActReceived(RoceFlowKey{tag, src, dst});
+      m_roceFsm->OnActReceived(flowKey);
     }
   }
+  return true;
 }
 
 void
@@ -699,14 +1386,41 @@ sendflowclient::SetRoceConfig(const RoceConfig& cfg) {
     m_roceFsm->Configure(m_roceCfg);
     m_roceFsm->Reset();
   }
+  if (m_roceTxScheduler) {
+    m_roceTxScheduler->Configure(m_roceCfg);
+  }
+  for (auto& [_, timerState] : m_roceRetransTimers) {
+    if (timerState.event.IsPending()) {
+      timerState.event.Cancel();
+    }
+  }
+  m_roceOutstandingPackets.clear();
+  m_roceRetransTimers.clear();
+  m_roceBufferedUpperPackets.clear();
+  m_rocePendingRetransmissions.clear();
+  m_roceRecoveryTargetPsns.clear();
+  m_roceFlowToQpn.clear();
+  m_nextSyntheticQpn = 1;
+  m_nextRoceWorkId = 1;
+  m_roceDispatchEvent.Cancel();
   m_roceActiveLogged = false;
-  NS_LOG_INFO("[ROCE][CFG] enable=" << m_roceCfg.enable
-              << " mode=" << m_roceCfg.modeName
-              << " dataUseWrite=" << m_roceCfg.dataUseWrite
-              << " etherType=0x" << std::hex << m_roceCfg.etherType << std::dec
-              << " reqOp=" << static_cast<uint32_t>(ToRoceOpcode(ThreePHeader::REQUEST, m_roceCfg, m_roceFsm.get()))
-              << " dataOp=" << static_cast<uint32_t>(ToRoceOpcode(ThreePHeader::DATA, m_roceCfg, m_roceFsm.get()))
-              << " actOp=" << static_cast<uint32_t>(ToRoceOpcode(ThreePHeader::ACT, m_roceCfg, m_roceFsm.get())));
+  if (IsRoceBasicLogEnabled(m_roceCfg)) {
+    NS_LOG_INFO("[ROCE][CFG] enable=" << m_roceCfg.enable
+                << " mode=" << m_roceCfg.modeName
+                << " dataUseWrite=" << m_roceCfg.dataUseWrite
+                << " etherType=0x" << std::hex << m_roceCfg.etherType << std::dec
+                << " logLevel=" << ToString(m_roceCfg.logLevel)
+                << " transportAck=" << m_roceCfg.enableTransportAck
+                << " transportWindowPackets=" << m_roceCfg.transportWindowPackets
+                << " ackTimeoutMode=" << ToStringAckTimeoutMode(m_roceCfg)
+                << " ackTimeoutBaseNs=" << m_roceCfg.ackTimeoutBaseNs
+                << " ackTimeoutFactor=" << m_roceCfg.ackTimeoutFactor
+                << " ackTimeoutNs=" << m_roceCfg.ackTimeoutNs
+                << " maxRetrans=" << m_roceCfg.maxRetransmissions
+                << " reqOp=" << static_cast<uint32_t>(ToRoceOpcode(ThreePHeader::REQUEST, m_roceCfg, m_roceFsm.get()))
+                << " dataOp=" << static_cast<uint32_t>(ToRoceOpcode(ThreePHeader::DATA, m_roceCfg, m_roceFsm.get()))
+                << " actOp=" << static_cast<uint32_t>(ToRoceOpcode(ThreePHeader::ACT, m_roceCfg, m_roceFsm.get())));
+  }
 }
 
 void
@@ -722,6 +1436,47 @@ sendflowclient::GetRoceMode() const {
 bool
 sendflowclient::IsRoceEnabled() const {
   return m_roceCfg.enable && m_roceMode != RoceMode::Legacy;
+}
+
+uint32_t
+sendflowclient::GetOrAllocRoceQpn_(uint32_t tag, uint32_t src, uint32_t dst) {
+  const RoceFlowKey flowKey{tag, src, dst};
+  auto it = m_roceFlowToQpn.find(flowKey);
+  if (it != m_roceFlowToQpn.end()) {
+    return it->second;
+  }
+
+  // 运行时按 flow 三元组稳定分配 synthetic QPN，避免直接用 tag 造成复用冲突。
+  uint32_t qpn = m_nextSyntheticQpn++;
+  if (qpn == 0) {
+    qpn = m_nextSyntheticQpn++;
+  }
+  m_roceFlowToQpn[flowKey] = qpn;
+  return qpn;
+}
+
+void
+sendflowclient::RememberRoceQpn_(uint32_t tag,
+                                 uint32_t src,
+                                 uint32_t dst,
+                                 uint32_t qpn) {
+  if (qpn == 0) {
+    return;
+  }
+
+  const RoceFlowKey flowKey{tag, src, dst};
+  auto it = m_roceFlowToQpn.find(flowKey);
+  if (it != m_roceFlowToQpn.end() && it->second != qpn) {
+    NS_LOG_WARN("[ROCE][QPN] flow remap detected tag=" << tag
+                << " src=" << src
+                << " dst=" << dst
+                << " oldQpn=" << it->second
+                << " newQpn=" << qpn);
+  }
+  m_roceFlowToQpn[flowKey] = qpn;
+  if (m_nextSyntheticQpn <= qpn) {
+    m_nextSyntheticQpn = qpn + 1;
+  }
 }
 
 

@@ -17,6 +17,27 @@ RoceSimHeader::GetTypeId() {
   return tid;
 }
 
+uint32_t
+RoceSimHeader::GetVisibleWireBytes(RoceOpcode opcode) {
+  constexpr uint32_t kBthBytes = 12;
+  constexpr uint32_t kRethBytes = 16;
+  constexpr uint32_t kAethBytes = 4;
+
+  switch (opcode) {
+    case RoceOpcode::RdmaWrite:
+    case RoceOpcode::RdmaWriteWithImm:
+    case RoceOpcode::RdmaReadReq:
+      return kBthBytes + kRethBytes;
+    case RoceOpcode::Ack:
+    case RoceOpcode::RdmaReadResp:
+      return kBthBytes + kAethBytes;
+    case RoceOpcode::Send:
+    case RoceOpcode::SendWithImm:
+    default:
+      return kBthBytes;
+  }
+}
+
 TypeId
 RoceSimHeader::GetInstanceTypeId() const {
   return GetTypeId();
@@ -24,16 +45,15 @@ RoceSimHeader::GetInstanceTypeId() const {
 
 uint32_t
 RoceSimHeader::GetSerializedSize() const {
-  // 固定长度编码：
-  // 4B(version/opcode/phase/flags)
-  // + 9 * 4B(qpn/psn/ack/imm/rkey/len/tag/src/dst)
-  // + 8B(remoteAddr)
-  return 4 + (4 * 9) + 8;
+  return GetVisibleWireBytes(GetOpcode());
 }
 
 void
 RoceSimHeader::Serialize(Buffer::Iterator start) const {
-  // 按固定顺序写入，Deserialize 必须保持同顺序读取。
+  // 线长按标准等效头做变长编码：
+  // - SEND: BTH(12B)
+  // - WRITE/READ_REQ: BTH + RETH(28B)
+  // - ACK/READ_RESP: BTH + AETH(16B)
   start.WriteU8(m_version);
   start.WriteU8(m_opcode);
   start.WriteU8(m_userPhase);
@@ -41,21 +61,28 @@ RoceSimHeader::Serialize(Buffer::Iterator start) const {
 
   start.WriteHtonU32(m_qpn);
   start.WriteHtonU32(m_psn);
-  start.WriteHtonU32(m_ackPsn);
-  start.WriteHtonU32(m_immData);
-
-  start.WriteHtonU64(m_remoteAddr);
-  start.WriteHtonU32(m_rkey);
-  start.WriteHtonU32(m_length);
-
-  start.WriteHtonU32(m_tag);
-  start.WriteHtonU32(m_src);
-  start.WriteHtonU32(m_dst);
+  switch (GetOpcode()) {
+    case RoceOpcode::RdmaWrite:
+    case RoceOpcode::RdmaWriteWithImm:
+    case RoceOpcode::RdmaReadReq:
+      start.WriteHtonU64(m_remoteAddr);
+      start.WriteHtonU32(m_rkey);
+      start.WriteHtonU32(m_length);
+      break;
+    case RoceOpcode::Ack:
+    case RoceOpcode::RdmaReadResp:
+      start.WriteHtonU32(m_ackPsn);
+      break;
+    case RoceOpcode::Send:
+    case RoceOpcode::SendWithImm:
+    default:
+      break;
+  }
 }
 
 uint32_t
 RoceSimHeader::Deserialize(Buffer::Iterator start) {
-  // 解析顺序与 Serialize 一一对应。
+  // 解析顺序与 Serialize 一一对应；tag/src/dst 这类本地关联字段不在 wire 上。
   m_version = start.ReadU8();
   m_opcode = start.ReadU8();
   m_userPhase = start.ReadU8();
@@ -63,16 +90,28 @@ RoceSimHeader::Deserialize(Buffer::Iterator start) {
 
   m_qpn = start.ReadNtohU32();
   m_psn = start.ReadNtohU32();
-  m_ackPsn = start.ReadNtohU32();
-  m_immData = start.ReadNtohU32();
-
-  m_remoteAddr = start.ReadNtohU64();
-  m_rkey = start.ReadNtohU32();
-  m_length = start.ReadNtohU32();
-
-  m_tag = start.ReadNtohU32();
-  m_src = start.ReadNtohU32();
-  m_dst = start.ReadNtohU32();
+  m_ackPsn = 0;
+  m_immData = 0;
+  m_remoteAddr = 0;
+  m_rkey = 0;
+  m_length = 0;
+  switch (GetOpcode()) {
+    case RoceOpcode::RdmaWrite:
+    case RoceOpcode::RdmaWriteWithImm:
+    case RoceOpcode::RdmaReadReq:
+      m_remoteAddr = start.ReadNtohU64();
+      m_rkey = start.ReadNtohU32();
+      m_length = start.ReadNtohU32();
+      break;
+    case RoceOpcode::Ack:
+    case RoceOpcode::RdmaReadResp:
+      m_ackPsn = start.ReadNtohU32();
+      break;
+    case RoceOpcode::Send:
+    case RoceOpcode::SendWithImm:
+    default:
+      break;
+  }
 
   return GetSerializedSize();
 }
@@ -85,10 +124,12 @@ RoceSimHeader::Print(std::ostream& os) const {
      << " qpn=" << m_qpn
      << " psn=" << m_psn
      << " ack_psn=" << m_ackPsn
-     << " len=" << m_length
-     << " tag=" << m_tag
-     << " src=" << m_src
-     << " dst=" << m_dst;
+     << " len=" << m_length;
+  if (m_tag != 0 || m_src != 0 || m_dst != 0) {
+    os << " tag=" << m_tag
+       << " src=" << m_src
+       << " dst=" << m_dst;
+  }
 }
 
 void
