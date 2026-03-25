@@ -5,7 +5,9 @@
 #include <set>
 #include <vector>
 #include <fstream>
+#include <string>
 #include "ns3/channel.h"
+#include "ns3/event-id.h"
 #include "ns3/mac48-address.h"
 #include "ns3/net-device.h"
 #include "ns3/traced-callback.h"
@@ -18,6 +20,9 @@ namespace ns3
 {
 
 class BridgeChannel;
+class Packet;
+template <typename Item>
+class PppRoundRobinQueue;
 
 /**
  * @ingroup bridge
@@ -71,6 +76,7 @@ class MinHopBridgeNetDevice : public NetDevice
     Ptr<NetDevice> GetBridgePort(uint32_t n) const;
     void PrintLearnedState() const;
     void Print_LocalMacAddress() const;
+    static void PrintFloodWindowSummary(bool printToStdout = false);
     
     void AddEntry(Mac48Address mac, const std::vector<uint32_t>& ports);
     void set_ecmp_model(int model);
@@ -84,6 +90,16 @@ class MinHopBridgeNetDevice : public NetDevice
 
     void hostsend(Ptr<NetDevice> incomingPort,Ptr<const Packet> packet,uint16_t protocol,
                     const Address& src,const Address& dst);
+
+    struct IngressQueueSnapshot
+    {
+        uint32_t portIndex;
+        Mac48Address portMac;
+        uint32_t maxPacketsPerQueue;
+        std::vector<uint32_t> subQueueLengths;
+        std::vector<uint64_t> subQueueDropPackets;
+    };
+    std::vector<IngressQueueSnapshot> GetIngressQueueSnapshots() const;
     
   protected:
     void DoDispose() override;
@@ -118,6 +134,24 @@ class MinHopBridgeNetDevice : public NetDevice
                            const Address& src,
                            const Address& dst,
                            PacketType packetType);
+    bool EnqueueIngressPacket(Ptr<NetDevice> incomingPort,
+                              Ptr<const Packet> packet,
+                              uint16_t protocol,
+                              const Address& src,
+                              const Address& dst,
+                              PacketType packetType,
+                              bool addSwitchDelay = true);
+    void ScheduleIngressDrainRetry(Ptr<NetDevice> incomingPort);
+    void DrainIngressQueue(Ptr<NetDevice> incomingPort);
+    bool HasAvailableUnicastPath(Ptr<NetDevice> incomingPort, Mac48Address dst);
+    bool HasAvailableFloodPath(Ptr<NetDevice> incomingPort, Mac48Address dst);
+    bool IsEgressQueueCongested(Ptr<NetDevice> egressPort, Mac48Address dst, bool anticipateEnqueue);
+    bool RefreshEgressQueueCongestionStateByQid(Ptr<NetDevice> egressPort,
+                                                uint32_t queueId,
+                                                bool anticipateEnqueue);
+    void UpdateIngressPauseStateOnEnqueue(Ptr<NetDevice> ingressPort, Mac48Address dst);
+    void UpdateIngressPauseStateOnDequeue(Ptr<NetDevice> ingressPort, uint32_t queueId);
+    PacketType InferPacketTypeFromDst(const Address& dst, PacketType fallback) const;
 
     void ForwardUnicast(Ptr<NetDevice> incomingPort,
                         Ptr<const Packet> packet,
@@ -151,14 +185,15 @@ class MinHopBridgeNetDevice : public NetDevice
 
     double m_highWatermark;
     double m_lowWatermark;
-    std::map<Ptr<NetDevice>, std::map<Ptr<NetDevice>, std::set<uint32_t>>> m_pausedIngressQueueIds;
-    std::map<Ptr<NetDevice>, std::set<uint32_t>> m_pausedLocalQueueIds;
-    void maybePauseUpstreamPort(Ptr<NetDevice> congestedEgress,
-                                Ptr<NetDevice> ingressPort,
-                                Mac48Address dst);
-    void maybePauseLocalFlowIo(Ptr<NetDevice> congestedEgress, Mac48Address dst);
+    std::map<Ptr<NetDevice>, std::set<uint32_t>> m_pausedIngressQueueIds;
+    // Map ingress sub-queue -> upstream egress sub-queue id used in PAUSE/RESUME frames.
+    std::map<Ptr<NetDevice>, std::map<uint32_t, uint32_t>> m_ingressPauseUpstreamQueueIds;
+    std::map<Ptr<NetDevice>, std::map<uint32_t, bool>> m_egressQueueCongested;
+    std::map<Ptr<NetDevice>, Ptr<PppRoundRobinQueue<Packet>>> m_ingressQueues;
+    std::map<Ptr<NetDevice>, EventId> m_ingressRetryEvents;
+    uint64_t m_ingressQueueDrops;
+    uint64_t m_ingressQueueDropBytes;
     void sendPauseFrameToUpstream(Ptr<NetDevice> ingressPort, uint32_t queueId, bool pause);
-    void handleLowWatermark(Ptr<NetDevice> port, uint32_t queueId);
     bool sendFromWithDropStats(Ptr<NetDevice> outPort,
                                Ptr<const Packet> packet,
                                const Address& src,

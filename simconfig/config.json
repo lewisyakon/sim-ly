@@ -13,34 +13,50 @@
     "normallink_rate": "224Gbps",
     "nvlink_rate": "2400Gbps",
     "normallink_delay": "5ns",
-    "nvlink_delay": "15ns",
-    "drop_tail_queue_size": "100",
-    "drop_tail_queue_num": "16"
+    "nvlink_delay": "15ns"
   },
 
   "workload": {
-    "floadtime_s": 500,
-    "auto_stop_on_finish": true
+    "floadtime_s": 500
   },
 
+  "mactable": {
+    "load_enable": false,
+    "dump_enable": false,
+    "dir": "mactable"
+  },
+
+  "pfc": {
+    "drop_tail_queue_size": "200",
+    "drop_tail_queue_num": "16",
+    "high_watermark": 0.55,
+    "low_watermark": 0.25,
+    "log_level": "basic"
+  },
 
   "topology": {
     "model": "fattree",
     "k": 4,
-    "subnet_model": 0,              
+    "subnet_model": 2,              
     "subnet_k": 4,                             
     "hostperleaf": 2,                            
     "switch_delay_ns_override": 100 
   },
 
   "roce": {
-  "enable": true,
-  "mode": "rc_3phase",
-  "data_use_write": true,
-  "strict_completion": true,
-  "sq_depth": 1024,
-  "rq_depth": 1024,
-  "ether_type": "0x9999"
-}
+    "enable": true,
+    "mode": "rc_3phase",
+    "data_use_write": true,
+    "sq_depth": 1024,
+    "rq_depth": 1024,
+    "transport_ack_enable": true,
+    "transport_window_packets": 32,
+    "ack_timeout_mode": "auto",
+    "ack_timeout_factor": 2.0,
+    "ack_timeout_ns": 50000,
+    "max_retransmissions": 8,
+    "ether_type": "0x9999",
+    "log_level": "full"
+  }
 
 }

@@ -33,6 +33,7 @@
 #include "ns3/hop-count-header.h"
 #include "ns3/hop-count-client.h"
 #include "ns3/min-hop-bridge-net-device.h"
+#include "ns3/pause-header.h"
 #include "ns3/three-phase-protocol.h"
 #include "ns3/mtp-module.h"
 #include "ns3/my_sendflowclient.h"
@@ -42,6 +43,13 @@
 
 #include <mutex>
 #include <map>
+#include <algorithm>
+#include <sstream>
+#include <fstream>
+#include <cmath>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <cerrno>
 #include <nlohmann/json.hpp>
 
 using namespace ns3;
@@ -51,6 +59,13 @@ NS_LOG_COMPONENT_DEFINE("GENERIC_SIMULATION");
 
 GPUType gpu_type;
 int ecmpmodel,max_jump,floadtime,m_mtu;
+int effective_floadtime;
+bool mactable_load_enable;
+bool mactable_dump_enable;
+std::string mactable_load_dir;
+std::string mactable_dump_dir;
+double pfc_high_watermark;
+double pfc_low_watermark;
 uint32_t node_num, switch_num, link_num, trace_num, nvswitch_num, gpus_per_server,
             nvswitch_per_server,numGPUs;
 uint32_t Topology_model,subnet_model,subnet_k,numHosts,switch_delay;
@@ -86,6 +101,13 @@ std::vector<Ptr<MinHopBridgeNetDevice>> TestSwitchDevices;
 
 std::vector<Ptr<MinHopBridgeNetDevice>> SubNetDevices;
 
+static inline void
+ApplyBridgePfcWatermarks(const Ptr<MinHopBridgeNetDevice>& dev)
+{
+    dev->SetAttribute("PfcHighWatermark", DoubleValue(pfc_high_watermark));
+    dev->SetAttribute("PfcLowWatermark", DoubleValue(pfc_low_watermark));
+}
+
 static inline Ptr<MinHopBridgeNetDevice>
 CreateGpuSubnetBridge(Ptr<Node> gpu, uint32_t intraMaxJump)
 {
@@ -94,6 +116,7 @@ CreateGpuSubnetBridge(Ptr<Node> gpu, uint32_t intraMaxJump)
     dev->set_ecmp_model(ecmpmodel);
     dev->Set_switchDelay(NanoSeconds(0));
     dev->SetMtu(m_mtu);
+    ApplyBridgePfcWatermarks(dev);
     gpu->AddDevice(dev);
     return dev;
 }
@@ -194,6 +217,520 @@ BuildServerSubnet_Torus(uint32_t serverId, NodeContainer& hosts,
     }
 }
 
+static inline int
+GetEffectiveFloodTime()
+{
+    return std::max(1, effective_floadtime);
+}
+
+struct RoceAckTimeoutPathBudget
+{
+    uint32_t oneWayLinks = 0;
+    uint32_t oneWaySwitches = 0;
+};
+
+static inline uint64_t
+ParseTimeStringToNs(const std::string& raw)
+{
+    std::string s;
+    s.reserve(raw.size());
+    for (char c : raw)
+    {
+        if (!std::isspace(static_cast<unsigned char>(c)))
+        {
+            s.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        }
+    }
+    if (s.empty())
+    {
+        return 0;
+    }
+
+    std::size_t unitPos = 0;
+    while (unitPos < s.size() &&
+           (std::isdigit(static_cast<unsigned char>(s[unitPos])) || s[unitPos] == '.'))
+    {
+        ++unitPos;
+    }
+
+    const std::string valueStr = s.substr(0, unitPos);
+    const std::string unit = s.substr(unitPos);
+    if (valueStr.empty())
+    {
+        return 0;
+    }
+
+    long double value = 0.0L;
+    try
+    {
+        value = std::stold(valueStr);
+    }
+    catch (...)
+    {
+        return 0;
+    }
+
+    long double scale = 1.0L;
+    if (unit == "ns")
+    {
+        scale = 1.0L;
+    }
+    else if (unit == "us")
+    {
+        scale = 1000.0L;
+    }
+    else if (unit == "ms")
+    {
+        scale = 1000.0L * 1000.0L;
+    }
+    else if (unit == "s" || unit.empty())
+    {
+        scale = 1000.0L * 1000.0L * 1000.0L;
+    }
+    else
+    {
+        return 0;
+    }
+
+    return static_cast<uint64_t>(std::ceil(value * scale));
+}
+
+static inline uint64_t
+ComputeSerializationNs(uint64_t bytes, const std::string& rateStr)
+{
+    if (bytes == 0)
+    {
+        return 0;
+    }
+    DataRate rate(rateStr);
+    const uint64_t bitRate = rate.GetBitRate();
+    if (bitRate == 0)
+    {
+        return 0;
+    }
+    const long double ns =
+        (static_cast<long double>(bytes) * 8.0L * 1000.0L * 1000.0L * 1000.0L) /
+        static_cast<long double>(bitRate);
+    return static_cast<uint64_t>(std::ceil(ns));
+}
+
+static inline RoceAckTimeoutPathBudget
+GetWorstCaseRocePathBudget()
+{
+    switch (Topology_model)
+    {
+    case 0: // FatTree: host-edge-agg-core-agg-edge-host
+        return {6, 5};
+    case 1: // Clos: host-leaf-spine-leaf-host
+        return {4, 3};
+    case 2: // FullMesh: direct host-to-host, conservative count one forwarding stage
+        return {1, 1};
+    case 3: // Torus: diameter of a k x k torus shortest path
+    {
+        const uint32_t diameter = std::max<uint32_t>(1, (torus_x / 2) + (torus_y / 2));
+        return {diameter, diameter};
+    }
+    case 4: // Test: small star-like fallback
+        return {2, 1};
+    default:
+        return {6, 5};
+    }
+}
+
+static inline uint64_t
+ComputeAutoRoceAckTimeoutBaseNs()
+{
+    const RoceAckTimeoutPathBudget budget = GetWorstCaseRocePathBudget();
+    const uint64_t oneWayPropagationNs =
+        static_cast<uint64_t>(budget.oneWayLinks) * ParseTimeStringToNs(normallink_delay);
+    const uint64_t oneWaySwitchNs =
+        static_cast<uint64_t>(budget.oneWaySwitches) * static_cast<uint64_t>(switch_delay);
+    const uint64_t oneWaySerializationNs =
+        static_cast<uint64_t>(budget.oneWayLinks) * ComputeSerializationNs(m_mtu, normallink_rate);
+    return 2ULL * (oneWayPropagationNs + oneWaySwitchNs + oneWaySerializationNs);
+}
+
+static inline void
+RefreshRoceAckTimeoutFromNetworkConfig()
+{
+    if (!g_roce_cfg.enableTransportAck)
+    {
+        g_roce_cfg.ackTimeoutBaseNs = 0;
+        return;
+    }
+    if (!g_roce_cfg.autoAckTimeout)
+    {
+        g_roce_cfg.ackTimeoutBaseNs = 0;
+        return;
+    }
+
+    g_roce_cfg.ackTimeoutBaseNs = ComputeAutoRoceAckTimeoutBaseNs();
+    const long double factor =
+        std::max<long double>(1.0L, static_cast<long double>(g_roce_cfg.ackTimeoutFactor));
+    const long double derived =
+        static_cast<long double>(g_roce_cfg.ackTimeoutBaseNs) * factor;
+    g_roce_cfg.ackTimeoutNs =
+        std::max<uint64_t>(1ULL, static_cast<uint64_t>(std::ceil(derived)));
+}
+
+static inline std::string
+JoinPath(const std::string& dir, const std::string& file)
+{
+    if (dir.empty())
+    {
+        return file;
+    }
+    if (dir.back() == '/')
+    {
+        return dir + file;
+    }
+    return dir + "/" + file;
+}
+
+static inline std::string
+BasenameOnly(const std::string& path)
+{
+    if (path.empty())
+    {
+        return path;
+    }
+    const std::string::size_type pos = path.find_last_of("/\\");
+    return (pos == std::string::npos) ? path : path.substr(pos + 1);
+}
+
+static inline std::string
+SanitizeDirToken(std::string s)
+{
+    for (char& c : s)
+    {
+        const bool ok = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+                        (c >= 'a' && c <= 'z') || c == '-' || c == '_';
+        if (!ok)
+        {
+            c = '-';
+        }
+    }
+    while (s.find("--") != std::string::npos)
+    {
+        s.replace(s.find("--"), 2, "-");
+    }
+    if (!s.empty() && s.front() == '-')
+    {
+        s.erase(s.begin());
+    }
+    if (!s.empty() && s.back() == '-')
+    {
+        s.pop_back();
+    }
+    if (s.empty())
+    {
+        s = "na";
+    }
+    return s;
+}
+
+static inline std::string
+TopologyModelName(uint32_t model)
+{
+    switch (model)
+    {
+    case 0:
+        return "fattree";
+    case 1:
+        return "clos";
+    case 2:
+        return "fullmesh";
+    case 3:
+        return "torus";
+    case 4:
+        return "test";
+    default:
+        return "unknown";
+    }
+}
+
+static inline std::string
+BuildMacTableScenarioTag()
+{
+    std::ostringstream oss;
+    oss << "topo-" << TopologyModelName(Topology_model);
+    switch (Topology_model)
+    {
+    case 0:
+        oss << "_k-" << k_fattree;
+        break;
+    case 1:
+        oss << "_k-" << k_clos << "_hostperleaf-" << hostperleaf;
+        break;
+    case 2:
+        oss << "_k-" << k_mesh;
+        break;
+    case 3:
+        oss << "_k-" << k_torus;
+        break;
+    case 4:
+        oss << "_k-" << k_test;
+        break;
+    default:
+        break;
+    }
+
+    oss << "_subnet-" << subnet_model
+        << "_subnetk-" << subnet_k
+        << "_gpusper-" << gpus_per_server
+        << "_nvsper-" << nvswitch_per_server;
+    return oss.str();
+}
+
+static inline std::string
+AppendScenarioTagIfMissing(const std::string& baseDir, const std::string& tag)
+{
+    if (baseDir.empty())
+    {
+        return JoinPath("mactable", tag);
+    }
+
+    std::string normalized = baseDir;
+    while (normalized.size() > 1 && normalized.back() == '/')
+    {
+        normalized.pop_back();
+    }
+    if (normalized.size() >= tag.size() &&
+        normalized.compare(normalized.size() - tag.size(), tag.size(), tag) == 0)
+    {
+        return normalized;
+    }
+    return JoinPath(normalized, tag);
+}
+
+static inline bool
+PathExists(const std::string& path)
+{
+    std::ifstream in(path);
+    return in.good();
+}
+
+static inline bool
+EnsureDirectoryRecursive(const std::string& dir)
+{
+    if (dir.empty())
+    {
+        return false;
+    }
+
+    std::string normalized = dir;
+    while (normalized.size() > 1 && normalized.back() == '/')
+    {
+        normalized.pop_back();
+    }
+
+    std::string current;
+    if (!normalized.empty() && normalized[0] == '/')
+    {
+        current = "/";
+    }
+
+    std::stringstream ss(normalized);
+    std::string part;
+    while (std::getline(ss, part, '/'))
+    {
+        if (part.empty())
+        {
+            continue;
+        }
+        if (!current.empty() && current.back() != '/')
+        {
+            current.push_back('/');
+        }
+        current += part;
+
+        struct stat st;
+        if (stat(current.c_str(), &st) == 0)
+        {
+            if (!S_ISDIR(st.st_mode))
+            {
+                return false;
+            }
+            continue;
+        }
+        if (mkdir(current.c_str(), 0755) != 0 && errno != EEXIST)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static inline std::string
+SanitizeMacForFilename(const Mac48Address& mac)
+{
+    std::ostringstream oss;
+    oss << mac;
+    std::string out = oss.str();
+    std::replace(out.begin(), out.end(), ':', '-');
+    return out;
+}
+
+static inline bool
+IsBridgeEligibleForMacTableIo(const Ptr<MinHopBridgeNetDevice>& dev)
+{
+    if (!dev)
+    {
+        return false;
+    }
+    if (dev->GetNBridgePorts() == 0)
+    {
+        return false;
+    }
+    return Mac48Address::IsMatchingType(dev->GetAddress());
+}
+
+static inline std::string
+GetBridgeTableFilename(const Ptr<MinHopBridgeNetDevice>& dev)
+{
+    const uint32_t nodeId = dev && dev->GetNode() ? dev->GetNode()->GetId() : 0;
+    const uint32_t ifIndex = dev ? dev->GetIfIndex() : 0;
+    Mac48Address mac("00:00:00:00:00:00");
+    if (dev && Mac48Address::IsMatchingType(dev->GetAddress()))
+    {
+        mac = Mac48Address::ConvertFrom(dev->GetAddress());
+    }
+    std::ostringstream oss;
+    oss << "bridge-node-" << nodeId
+        << "-if-" << ifIndex
+        << "-mac-" << SanitizeMacForFilename(mac)
+        << ".tbl";
+    return oss.str();
+}
+
+static inline void
+AppendBridgeVectorUnique(const std::vector<Ptr<MinHopBridgeNetDevice>>& src,
+                         std::vector<Ptr<MinHopBridgeNetDevice>>& dst)
+{
+    for (const auto& dev : src)
+    {
+        if (!dev)
+        {
+            continue;
+        }
+        bool exists = false;
+        for (const auto& cur : dst)
+        {
+            if (cur == dev)
+            {
+                exists = true;
+                break;
+            }
+        }
+        if (!exists)
+        {
+            dst.push_back(dev);
+        }
+    }
+}
+
+static inline std::vector<Ptr<MinHopBridgeNetDevice>>
+CollectAllBridgeDevices()
+{
+    std::vector<Ptr<MinHopBridgeNetDevice>> devices;
+    AppendBridgeVectorUnique(coreDevices, devices);
+    AppendBridgeVectorUnique(aggregationDevices, devices);
+    AppendBridgeVectorUnique(edgeDevices, devices);
+    AppendBridgeVectorUnique(nvswitchDevices, devices);
+    AppendBridgeVectorUnique(SpineDevices, devices);
+    AppendBridgeVectorUnique(LeafDevices, devices);
+    AppendBridgeVectorUnique(TorusDevices, devices);
+    AppendBridgeVectorUnique(FullmeshDevices, devices);
+    AppendBridgeVectorUnique(TestSwitchDevices, devices);
+    AppendBridgeVectorUnique(SubNetDevices, devices);
+    return devices;
+}
+
+static inline bool
+DumpBridgeMacTablesToDirectory(const std::string& dir)
+{
+    std::vector<Ptr<MinHopBridgeNetDevice>> bridges = CollectAllBridgeDevices();
+    if (bridges.empty())
+    {
+        NS_LOG_UNCOND("[MACTABLE][DUMP] no bridge devices found.");
+        return false;
+    }
+    if (!EnsureDirectoryRecursive(dir))
+    {
+        NS_LOG_UNCOND("[MACTABLE][DUMP] failed to create/access directory: " << dir);
+        return false;
+    }
+
+    uint32_t ok = 0;
+    uint32_t fail = 0;
+    uint32_t skip = 0;
+    for (const auto& dev : bridges)
+    {
+        if (!IsBridgeEligibleForMacTableIo(dev))
+        {
+            ++skip;
+            continue;
+        }
+        const std::string file = JoinPath(dir, GetBridgeTableFilename(dev));
+        if (dev->writemactable(file))
+        {
+            ++ok;
+        }
+        else
+        {
+            ++fail;
+        }
+    }
+
+    NS_LOG_UNCOND("[MACTABLE][DUMP] dir=" << dir << " ok=" << ok
+                                          << " fail=" << fail
+                                          << " skip=" << skip);
+    return fail == 0;
+}
+
+static inline bool
+LoadBridgeMacTablesFromDirectory(const std::string& dir)
+{
+    std::vector<Ptr<MinHopBridgeNetDevice>> bridges = CollectAllBridgeDevices();
+    if (bridges.empty())
+    {
+        NS_LOG_UNCOND("[MACTABLE][LOAD] no bridge devices found.");
+        return false;
+    }
+
+    uint32_t ok = 0;
+    uint32_t fail = 0;
+    uint32_t skip = 0;
+    for (const auto& dev : bridges)
+    {
+        if (!IsBridgeEligibleForMacTableIo(dev))
+        {
+            ++skip;
+            continue;
+        }
+        const std::string file = JoinPath(dir, GetBridgeTableFilename(dev));
+        if (!PathExists(file))
+        {
+            ++fail;
+            NS_LOG_UNCOND("[MACTABLE][LOAD] missing file: " << file);
+            continue;
+        }
+        if (dev->readmactable(file))
+        {
+            ++ok;
+        }
+        else
+        {
+            ++fail;
+        }
+    }
+
+    NS_LOG_UNCOND("[MACTABLE][LOAD] dir=" << dir << " ok=" << ok
+                                          << " fail=" << fail
+                                          << " skip=" << skip);
+    return ok > 0 && fail == 0;
+}
+
 bool ReadConf(std::string network_conf)
 {
   using std::string;
@@ -222,6 +759,12 @@ bool ReadConf(std::string network_conf)
   auto JGetStr = [&](const json& x, const char* k, std::string& out){
     if (JHas(x,k)) out = x.at(k).get<std::string>();
   };
+  auto JGetBool = [&](const json& x, const char* k, bool& out){
+    if (JHas(x,k)) out = x.at(k).get<bool>();
+  };
+  auto JGetDouble = [&](const json& x, const char* k, double& out){
+    if (JHas(x,k)) out = x.at(k).get<double>();
+  };
   auto to_upper = [](std::string s){ for(char& c:s) c = (char)std::toupper((unsigned char)c); return s; };
 
   auto ParseGpuType = [&](const std::string& sIn)->GPUType {
@@ -248,6 +791,89 @@ bool ReadConf(std::string network_conf)
     }
     return 0; // 默认 FatTree
   };
+  auto ParseRoceLogLevel = [&](const json& v)->RoceLogLevel {
+    if (v.is_number_integer() || v.is_number_unsigned()) {
+      const int level = v.get<int>();
+      if (level <= 0) {
+        return RoceLogLevel::Off;
+      }
+      if (level == 1) {
+        return RoceLogLevel::Basic;
+      }
+      return RoceLogLevel::Full;
+    }
+    if (v.is_string()) {
+      std::string s = v.get<std::string>();
+      for (auto& c : s) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      }
+      if (s == "off" || s == "none" || s == "quiet") {
+        return RoceLogLevel::Off;
+      }
+      if (s == "basic" || s == "partial" || s == "summary") {
+        return RoceLogLevel::Basic;
+      }
+      if (s == "full" || s == "all" || s == "verbose") {
+        return RoceLogLevel::Full;
+      }
+    }
+    return g_roce_cfg.logLevel;
+  };
+  auto ParsePfcLogLevel = [&](const json& v)->PfcLogLevel {
+    if (v.is_number_integer() || v.is_number_unsigned()) {
+      const int level = v.get<int>();
+      if (level <= 0) {
+        return PfcLogLevel::Off;
+      }
+      if (level == 1) {
+        return PfcLogLevel::Basic;
+      }
+      return PfcLogLevel::Full;
+    }
+    if (v.is_string()) {
+      std::string s = v.get<std::string>();
+      for (auto& c : s) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      }
+      if (s == "off" || s == "none" || s == "quiet") {
+        return PfcLogLevel::Off;
+      }
+      if (s == "basic" || s == "partial" || s == "summary") {
+        return PfcLogLevel::Basic;
+      }
+      if (s == "full" || s == "all" || s == "verbose") {
+        return PfcLogLevel::Full;
+      }
+    }
+    return g_pfcLogLevel;
+  };
+  auto ParseRoceAckTimeoutMode = [&](const json& v)->bool {
+    if (v.is_boolean())
+    {
+      return v.get<bool>();
+    }
+    if (v.is_number_integer() || v.is_number_unsigned())
+    {
+      return v.get<int>() != 0;
+    }
+    if (v.is_string())
+    {
+      std::string s = v.get<std::string>();
+      for (auto& c : s)
+      {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      }
+      if (s == "auto" || s == "automatic" || s == "derived")
+      {
+        return true;
+      }
+      if (s == "manual" || s == "fixed" || s == "off")
+      {
+        return false;
+      }
+    }
+    return g_roce_cfg.autoAckTimeout;
+  };
 
   // ---------- 备份旧值（失败时不改动） ----------
   auto gpu_type_bak             = gpu_type;
@@ -262,10 +888,24 @@ bool ReadConf(std::string network_conf)
   auto normallink_delay_bak     = normallink_delay;
   auto nvlink_delay_bak         = nvlink_delay;
   auto DropTailQueue_size_bak   = DropTailQueue_size;
+  auto DropTailQueue_num_bak    = DropTailQueue_num;
   auto Topology_model_bak       = Topology_model;
   auto k_bak                    = k_all;
   auto hostperleaf_bak          = hostperleaf;
   auto roce_cfg_bak             = g_roce_cfg;
+  auto pfc_log_level_bak        = g_pfcLogLevel;
+  auto pfc_high_global_bak      = g_pfcHighWatermark;
+  auto pfc_low_global_bak       = g_pfcLowWatermark;
+  auto mactable_load_enable_bak = mactable_load_enable;
+  auto mactable_dump_enable_bak = mactable_dump_enable;
+  auto mactable_load_dir_bak    = mactable_load_dir;
+  auto mactable_dump_dir_bak    = mactable_dump_dir;
+  auto effective_floadtime_bak  = effective_floadtime;
+  auto pfc_high_watermark_bak   = pfc_high_watermark;
+  auto pfc_low_watermark_bak    = pfc_low_watermark;
+  bool mactable_load_switch_seen = false;
+  bool mactable_dump_switch_seen = false;
+  bool legacy_dump_enable_value = mactable_dump_enable;
 
 
   // ---------- 1) 顶层通用 ----------
@@ -287,6 +927,78 @@ bool ReadConf(std::string network_conf)
     JGetStr(nw, "nvlink_delay",          nvlink_delay);
     JGetStr(nw, "drop_tail_queue_size",  DropTailQueue_size);
     JGetStr(nw, "drop_tail_queue_num",  DropTailQueue_num);
+    if (JHas(nw, "pfc_high_watermark"))
+    {
+      JGetDouble(nw, "pfc_high_watermark", pfc_high_watermark);
+      g_pfcHighWatermark = pfc_high_watermark;
+    }
+    if (JHas(nw, "pfc_low_watermark"))
+    {
+      JGetDouble(nw, "pfc_low_watermark", pfc_low_watermark);
+      g_pfcLowWatermark = pfc_low_watermark;
+    }
+    if (JHas(nw, "pfc_log_level"))
+    {
+      g_pfcLogLevel = ParsePfcLogLevel(nw["pfc_log_level"]);
+    }
+    if (JHas(nw, "mactable_load_enable"))
+    {
+      JGetBool(nw, "mactable_load_enable", mactable_load_enable);
+      mactable_load_switch_seen = true;
+    }
+    if (JHas(nw, "mactable_dump_enable"))
+    {
+      JGetBool(nw, "mactable_dump_enable", legacy_dump_enable_value);
+      mactable_dump_switch_seen = true;
+    }
+    JGetStr(nw, "mactable_load_dir", mactable_load_dir);
+    if (mactable_load_dir.empty())
+    {
+      JGetStr(nw, "mactable_dump_dir", mactable_load_dir);
+    }
+  }
+
+  // ---------- 2.5) mactable ----------
+  if (j.contains("mactable"))
+  {
+    const auto& mt = j["mactable"];
+    if (JHas(mt, "load_enable"))
+    {
+      JGetBool(mt, "load_enable", mactable_load_enable);
+      mactable_load_switch_seen = true;
+    }
+    if (JHas(mt, "dump_enable"))
+    {
+      JGetBool(mt, "dump_enable", legacy_dump_enable_value);
+      mactable_dump_switch_seen = true;
+    }
+    JGetStr(mt, "dir", mactable_load_dir);
+    JGetStr(mt, "load_dir", mactable_load_dir);
+    if (mactable_load_dir.empty())
+    {
+      JGetStr(mt, "dump_dir", mactable_load_dir);
+    }
+  }
+
+  if (j.contains("pfc") && j["pfc"].is_object())
+  {
+    const auto& pf = j["pfc"];
+    JGetStr(pf, "drop_tail_queue_size", DropTailQueue_size);
+    JGetStr(pf, "drop_tail_queue_num", DropTailQueue_num);
+    if (JHas(pf, "high_watermark"))
+    {
+      JGetDouble(pf, "high_watermark", pfc_high_watermark);
+      g_pfcHighWatermark = pfc_high_watermark;
+    }
+    if (JHas(pf, "low_watermark"))
+    {
+      JGetDouble(pf, "low_watermark", pfc_low_watermark);
+      g_pfcLowWatermark = pfc_low_watermark;
+    }
+    if (JHas(pf, "log_level"))
+    {
+      g_pfcLogLevel = ParsePfcLogLevel(pf["log_level"]);
+    }
   }
 
   // ---------- 3) workload ----------
@@ -312,6 +1024,27 @@ bool ReadConf(std::string network_conf)
     }
     if (JHas(rc, "rq_depth")) {
       g_roce_cfg.defaultRqDepth = rc["rq_depth"].get<uint32_t>();
+    }
+    if (JHas(rc, "transport_ack_enable")) {
+      g_roce_cfg.enableTransportAck = rc["transport_ack_enable"].get<bool>();
+    }
+    if (JHas(rc, "transport_window_packets")) {
+      g_roce_cfg.transportWindowPackets = rc["transport_window_packets"].get<uint32_t>();
+    }
+    if (JHas(rc, "ack_timeout_mode")) {
+      g_roce_cfg.autoAckTimeout = ParseRoceAckTimeoutMode(rc["ack_timeout_mode"]);
+    }
+    if (JHas(rc, "ack_timeout_factor")) {
+      g_roce_cfg.ackTimeoutFactor = rc["ack_timeout_factor"].get<double>();
+    }
+    if (JHas(rc, "ack_timeout_ns")) {
+      g_roce_cfg.ackTimeoutNs = rc["ack_timeout_ns"].get<uint64_t>();
+    }
+    if (JHas(rc, "max_retransmissions")) {
+      g_roce_cfg.maxRetransmissions = rc["max_retransmissions"].get<uint32_t>();
+    }
+    if (JHas(rc, "log_level")) {
+      g_roce_cfg.logLevel = ParseRoceLogLevel(rc["log_level"]);
     }
     if (JHas(rc, "mode") && rc["mode"].is_string()) {
       g_roce_cfg.modeName = rc["mode"].get<std::string>();
@@ -436,15 +1169,52 @@ bool ReadConf(std::string network_conf)
       ecmpmodel = ecmpmodel_bak; max_jump = max_jump_bak; floadtime = floadtime_bak; m_mtu = m_mtu_bak;
       normallink_rate = normallink_rate_bak; nvlink_rate = nvlink_rate_bak;
       normallink_delay = normallink_delay_bak; nvlink_delay = nvlink_delay_bak;
-      DropTailQueue_size = DropTailQueue_size_bak;
+      DropTailQueue_size = DropTailQueue_size_bak; DropTailQueue_num = DropTailQueue_num_bak;
       Topology_model = Topology_model_bak;
       k_fattree = k_bak; k_clos = k_bak; hostperleaf = hostperleaf_bak;
       k_mesh = k_bak; k_torus = k_bak; k_test = k_bak;
       g_roce_cfg = roce_cfg_bak;
+      g_pfcLogLevel = pfc_log_level_bak;
+      g_pfcHighWatermark = pfc_high_global_bak;
+      g_pfcLowWatermark = pfc_low_global_bak;
+      mactable_load_enable = mactable_load_enable_bak;
+      mactable_dump_enable = mactable_dump_enable_bak;
+      mactable_load_dir = mactable_load_dir_bak;
+      mactable_dump_dir = mactable_dump_dir_bak;
+      effective_floadtime = effective_floadtime_bak;
+      pfc_high_watermark = pfc_high_watermark_bak;
+      pfc_low_watermark = pfc_low_watermark_bak;
       return false;
     }
   }
 
+  if (!mactable_load_switch_seen && mactable_dump_switch_seen)
+  {
+    mactable_load_enable = !legacy_dump_enable_value;
+  }
+  if (mactable_load_switch_seen || mactable_dump_switch_seen)
+  {
+    mactable_dump_enable = !mactable_load_enable;
+  }
+
+  if ((mactable_load_enable || mactable_dump_enable) && mactable_load_dir.empty())
+  {
+    mactable_load_dir = "mactable";
+  }
+  mactable_dump_dir = mactable_load_dir;
+
+  if (mactable_load_enable || mactable_dump_enable)
+  {
+    const std::string mactableScenarioTag = BuildMacTableScenarioTag();
+    mactable_load_dir = AppendScenarioTagIfMissing(mactable_load_dir, mactableScenarioTag);
+    mactable_dump_dir = mactable_load_dir;
+  }
+
+  effective_floadtime = mactable_load_enable ? 1 : floadtime;
+  effective_floadtime = std::max(1, effective_floadtime);
+  g_pfcHighWatermark = pfc_high_watermark;
+  g_pfcLowWatermark = pfc_low_watermark;
+  RefreshRoceAckTimeoutFromNetworkConfig();
   return true;
 }
 
@@ -455,7 +1225,18 @@ void SetConfig(){
     g_roce_cfg.etherType = 0x9999;
     g_roce_cfg.defaultSqDepth = 1024;
     g_roce_cfg.defaultRqDepth = 1024;
+    g_roce_cfg.enableTransportAck = true;
+    g_roce_cfg.transportWindowPackets = 32;
+    g_roce_cfg.autoAckTimeout = false;
+    g_roce_cfg.ackTimeoutFactor = 2.0;
+    g_roce_cfg.ackTimeoutBaseNs = 0;
+    g_roce_cfg.ackTimeoutNs = 5000;
+    g_roce_cfg.maxRetransmissions = 8;
+    g_roce_cfg.logLevel = RoceLogLevel::Full;
     g_roce_cfg.modeName = "legacy";
+    g_pfcLogLevel = PfcLogLevel::Full;
+    g_pfcHighWatermark = 0.8;
+    g_pfcLowWatermark = 0.2;
 
     gpu_type = GPUType::A100;
     gpus_per_server=1;
@@ -463,6 +1244,7 @@ void SetConfig(){
     ecmpmodel=1;//ECMP模式；0随机转发，1按包hash
     max_jump=5;//最大5跳
     floadtime=200;//泛红时间200秒
+    effective_floadtime=floadtime;
     m_mtu=4096;
     normallink_rate="1600Gbps";
     nvlink_rate="2400Gbps";
@@ -470,6 +1252,14 @@ void SetConfig(){
     nvlink_delay="15ns";
     DropTailQueue_size="1000000";
     DropTailQueue_num="16";
+    mactable_load_enable=false;
+    mactable_dump_enable=false;
+    mactable_load_dir="mactable";
+    mactable_dump_dir="mactable";
+    pfc_high_watermark=0.8;
+    pfc_low_watermark=0.2;
+    g_pfcHighWatermark = pfc_high_watermark;
+    g_pfcLowWatermark = pfc_low_watermark;
 
     Topology_model=0;//0--FatTree;1--Clos;2--FullMesh;3--Torus;4--Test
     subnet_model=0;//0--nosubnet;1--nvswitch;2--FullMesh;3--Torus;
@@ -570,8 +1360,7 @@ void SetConfig(){
 
         switch_delay=100;//单位纳秒
     }
-
-
+    RefreshRoceAckTimeoutFromNetworkConfig();
 }
 
 void SetupNetwork(){
@@ -646,6 +1435,7 @@ void SetupNetwork(){
             dev->set_ecmp_model(ecmpmodel);
             dev->Set_switchDelay(NanoSeconds(switch_delay));
             dev->SetMtu(m_mtu);
+            ApplyBridgePfcWatermarks(dev);
             coreSwitches.Get(i)->AddDevice(dev);
             coreDevices.push_back(dev);
         }
@@ -655,6 +1445,7 @@ void SetupNetwork(){
             dev->set_ecmp_model(ecmpmodel);
             dev->Set_switchDelay(NanoSeconds(switch_delay));
             dev->SetMtu(m_mtu);
+            ApplyBridgePfcWatermarks(dev);
             aggregationSwitches.Get(i)->AddDevice(dev);
             aggregationDevices.push_back(dev);
         }
@@ -664,6 +1455,7 @@ void SetupNetwork(){
             dev->set_ecmp_model(ecmpmodel);
             dev->Set_switchDelay(NanoSeconds(switch_delay));
             dev->SetMtu(m_mtu);
+            ApplyBridgePfcWatermarks(dev);
             edgeSwitches.Get(i)->AddDevice(dev);
             edgeDevices.push_back(dev);
         }
@@ -673,6 +1465,7 @@ void SetupNetwork(){
             nvs->set_ecmp_model(ecmpmodel);
             nvs->Set_switchDelay(Seconds(0));
             nvs->SetMtu(m_mtu);
+            ApplyBridgePfcWatermarks(nvs);
             nvswitch.Get(i)->AddDevice(nvs);
             nvswitchDevices.push_back(nvs);
         }
@@ -815,41 +1608,44 @@ void SetupNetwork(){
         PacketSocketHelper packetSocketHelper;
         packetSocketHelper.Install(hosts); // 为所有主机安装 PacketSocket
 
-        // 为每个主机安装发往其他主机的 HopCountClient
-        uint16_t customEtherType = 0x88B5;
-        for (uint32_t i = 0; i < numGPUs; ++i){
-            Ptr<Node> clientNode = hosts.Get(i);
-            #ifdef NS3_MPI
-            if(clientNode->GetSystemId() != MpiInterface::GetSystemId())
-            {
-                continue;
+        if (!mactable_load_enable)
+        {
+            // 为每个主机安装发往其他主机的 HopCountClient
+            uint16_t customEtherType = 0x88B5;
+            for (uint32_t i = 0; i < numGPUs; ++i){
+                Ptr<Node> clientNode = hosts.Get(i);
+                #ifdef NS3_MPI
+                if(clientNode->GetSystemId() != MpiInterface::GetSystemId())
+                {
+                    continue;
+                }
+                #endif
+                for (uint32_t k=0;k<=1;k++){
+                    PacketSocketAddress clientSocketAddr;
+                    clientSocketAddr.SetSingleDevice(k);
+                    clientSocketAddr.SetPhysicalAddress(hostMacs[i]);
+                    clientSocketAddr.SetProtocol(customEtherType);
+
+                    Ptr<HopCountClient> client = CreateObject<HopCountClient>();
+                    client->SetRemote(clientSocketAddr);
+                    client->SetAttribute("PacketSize", UintegerValue(100));
+                    client->SetAttribute("Interval", TimeValue(Seconds(1.5)));
+                    client->SetAttribute("MaxPackets", UintegerValue(1));
+                    hosts.Get(i)->AddApplication(client);
+
+                    double startTime = 1.0 + (i * 0.2);
+                    ApplicationContainer clientApps(client);
+                    clientApps.Start(Seconds(startTime));
+                    clientApps.Stop(Seconds(GetEffectiveFloodTime()-1));
+                }
             }
-            #endif
-            for (uint32_t k=0;k<=1;k++){
-                PacketSocketAddress clientSocketAddr;
-                clientSocketAddr.SetSingleDevice(k);
-                clientSocketAddr.SetPhysicalAddress(hostMacs[i]);
-                clientSocketAddr.SetProtocol(customEtherType);
-
-                Ptr<HopCountClient> client = CreateObject<HopCountClient>();
-                client->SetRemote(clientSocketAddr);
-                client->SetAttribute("PacketSize", UintegerValue(100));
-                client->SetAttribute("Interval", TimeValue(Seconds(1.5)));
-                client->SetAttribute("MaxPackets", UintegerValue(1));
-                hosts.Get(i)->AddApplication(client);
-
-                double startTime = 1.0 + (i * 0.2);
-                ApplicationContainer clientApps(client);
-                clientApps.Start(Seconds(startTime));
-                clientApps.Stop(Seconds(floadtime-1));
-            }           
         }
         for (uint32_t i = 0; i < numGPUs; ++i) {
             Ptr<Node> clientNode = hosts.Get(i);
             uint16_t proto = g_roce_cfg.enable ? g_roce_cfg.etherType : 0x9999;
             Ptr<sendflowclient> App = CreateObject<sendflowclient>();
             App->SetRoceConfig(g_roce_cfg);
-            App->SetStartTime(Seconds(floadtime-1));
+            App->SetStartTime(Seconds(GetEffectiveFloodTime()-1));
             App->SetStopTime(Seconds(2000000000));
             hosts.Get(i)->AddApplication(App);
 
@@ -883,6 +1679,7 @@ void SetupNetwork(){
             dev->set_ecmp_model(ecmpmodel);
             dev->Set_switchDelay(NanoSeconds(switch_delay));
             dev->SetMtu(m_mtu);
+            ApplyBridgePfcWatermarks(dev);
             SpineSwitchs.Get(i)->AddDevice(dev);
             SpineDevices.push_back(dev);
         }
@@ -892,6 +1689,7 @@ void SetupNetwork(){
             dev->set_ecmp_model(ecmpmodel);
             dev->Set_switchDelay(NanoSeconds(switch_delay));
             dev->SetMtu(m_mtu);
+            ApplyBridgePfcWatermarks(dev);
             LeafSwitchs.Get(i)->AddDevice(dev);
             LeafDevices.push_back(dev);
         }
@@ -900,6 +1698,7 @@ void SetupNetwork(){
             nvs->set_ecmp_model(ecmpmodel);
             nvs->Set_switchDelay(Seconds(0));
             nvs->SetMtu(m_mtu);
+            ApplyBridgePfcWatermarks(nvs);
             nvswitch.Get(i)->AddDevice(nvs);
             nvswitchDevices.push_back(nvs);
         }
@@ -1014,34 +1813,37 @@ void SetupNetwork(){
         packetSocketHelper.Install(hosts); // 为所有主机安装 PacketSocket
 
 
-        // 为每个主机安装发往其他主机的 HopCountClient
-        uint16_t customEtherType = 0x88B5;
-        for (uint32_t i = 0; i < numGPUs; ++i){
-            Ptr<Node> clientNode = hosts.Get(i);
-            #ifdef NS3_MPI
-            if(clientNode->GetSystemId() != MpiInterface::GetSystemId())
-            {
-                continue;
+        if (!mactable_load_enable)
+        {
+            // 为每个主机安装发往其他主机的 HopCountClient
+            uint16_t customEtherType = 0x88B5;
+            for (uint32_t i = 0; i < numGPUs; ++i){
+                Ptr<Node> clientNode = hosts.Get(i);
+                #ifdef NS3_MPI
+                if(clientNode->GetSystemId() != MpiInterface::GetSystemId())
+                {
+                    continue;
+                }
+                #endif
+                for (uint32_t k=0;k<=1;k++){
+                    PacketSocketAddress clientSocketAddr;
+                    clientSocketAddr.SetSingleDevice(k);
+                    clientSocketAddr.SetPhysicalAddress(hostMacs[i]);
+                    clientSocketAddr.SetProtocol(customEtherType);
+
+                    Ptr<HopCountClient> client = CreateObject<HopCountClient>();
+                    client->SetRemote(clientSocketAddr);
+                    client->SetAttribute("PacketSize", UintegerValue(100));
+                    client->SetAttribute("Interval", TimeValue(Seconds(1.5)));
+                    client->SetAttribute("MaxPackets", UintegerValue(1));
+                    hosts.Get(i)->AddApplication(client);
+
+                    double startTime = 1.0 + (i * 0.2);
+                    ApplicationContainer clientApps(client);
+                    clientApps.Start(Seconds(startTime));
+                    clientApps.Stop(Seconds(GetEffectiveFloodTime()-1));
+                }
             }
-            #endif
-            for (uint32_t k=0;k<=1;k++){
-                PacketSocketAddress clientSocketAddr;
-                clientSocketAddr.SetSingleDevice(k);
-                clientSocketAddr.SetPhysicalAddress(hostMacs[i]);
-                clientSocketAddr.SetProtocol(customEtherType);
-
-                Ptr<HopCountClient> client = CreateObject<HopCountClient>();
-                client->SetRemote(clientSocketAddr);
-                client->SetAttribute("PacketSize", UintegerValue(100));
-                client->SetAttribute("Interval", TimeValue(Seconds(1.5)));
-                client->SetAttribute("MaxPackets", UintegerValue(1));
-                hosts.Get(i)->AddApplication(client);
-
-                double startTime = 1.0 + (i * 0.2);
-                ApplicationContainer clientApps(client);
-                clientApps.Start(Seconds(startTime));
-                clientApps.Stop(Seconds(floadtime-1));
-            }           
         }
 
         for (uint32_t i = 0; i < numGPUs; ++i) {
@@ -1049,7 +1851,7 @@ void SetupNetwork(){
             uint16_t proto = g_roce_cfg.enable ? g_roce_cfg.etherType : 0x9999;
             Ptr<sendflowclient> App = CreateObject<sendflowclient>();
             App->SetRoceConfig(g_roce_cfg);
-            App->SetStartTime(Seconds(floadtime-1));
+            App->SetStartTime(Seconds(GetEffectiveFloodTime()-1));
             App->SetStopTime(Seconds(2000000000));
             hosts.Get(i)->AddApplication(App);
 
@@ -1097,6 +1899,7 @@ void SetupNetwork(){
             dev->set_ecmp_model(ecmpmodel);
             dev->Set_switchDelay(NanoSeconds(switch_delay));
             dev->SetMtu(m_mtu);
+            ApplyBridgePfcWatermarks(dev);
             hosts.Get(i)->AddDevice(dev);
             FullmeshDevices.push_back(dev);
         }
@@ -1127,37 +1930,40 @@ void SetupNetwork(){
         packetSocketHelper.Install(hosts); // 为所有主机安装 PacketSocket
 
 
-        // 为每个主机安装发往其他主机的 HopCountClient
-        uint16_t customEtherType = 0x88B5;
-        for (uint32_t i = 0; i < numGPUs; ++i){
-            #ifdef NS3_MPI
-            if(hosts.Get(i)->GetSystemId() != MpiInterface::GetSystemId())
-            {
-                continue;
-            }
-            #endif
-            PacketSocketAddress clientSocketAddr;
-            clientSocketAddr.SetSingleDevice(0);
-            clientSocketAddr.SetPhysicalAddress(hostMacs[i]);
-            clientSocketAddr.SetProtocol(customEtherType);
-            Ptr<HopCountClient> client = CreateObject<HopCountClient>();
-            client->SetRemote(clientSocketAddr);
-            client->SetAttribute("PacketSize", UintegerValue(100));
-            client->SetAttribute("Interval", TimeValue(Seconds(1.5)));
-            client->SetAttribute("MaxPackets", UintegerValue(1));
-            hosts.Get(i)->AddApplication(client);
+        if (!mactable_load_enable)
+        {
+            // 为每个主机安装发往其他主机的 HopCountClient
+            uint16_t customEtherType = 0x88B5;
+            for (uint32_t i = 0; i < numGPUs; ++i){
+                #ifdef NS3_MPI
+                if(hosts.Get(i)->GetSystemId() != MpiInterface::GetSystemId())
+                {
+                    continue;
+                }
+                #endif
+                PacketSocketAddress clientSocketAddr;
+                clientSocketAddr.SetSingleDevice(0);
+                clientSocketAddr.SetPhysicalAddress(hostMacs[i]);
+                clientSocketAddr.SetProtocol(customEtherType);
+                Ptr<HopCountClient> client = CreateObject<HopCountClient>();
+                client->SetRemote(clientSocketAddr);
+                client->SetAttribute("PacketSize", UintegerValue(100));
+                client->SetAttribute("Interval", TimeValue(Seconds(1.5)));
+                client->SetAttribute("MaxPackets", UintegerValue(1));
+                hosts.Get(i)->AddApplication(client);
 
-            double startTime = 1.0 + (i * 0.2);
-            ApplicationContainer clientApps(client);
-            clientApps.Start(Seconds(startTime));
-            clientApps.Stop(Seconds(floadtime-1));
+                double startTime = 1.0 + (i * 0.2);
+                ApplicationContainer clientApps(client);
+                clientApps.Start(Seconds(startTime));
+                clientApps.Stop(Seconds(GetEffectiveFloodTime()-1));
+            }
         }
         for (uint32_t i = 0; i < numGPUs; ++i) {
             Ptr<Node> clientNode = hosts.Get(i);
             uint16_t proto = g_roce_cfg.enable ? g_roce_cfg.etherType : 0x9999;
             Ptr<sendflowclient> App = CreateObject<sendflowclient>();
             App->SetRoceConfig(g_roce_cfg);
-            App->SetStartTime(Seconds(floadtime-1));
+            App->SetStartTime(Seconds(GetEffectiveFloodTime()-1));
             App->SetStopTime(Seconds(2000000000));
             hosts.Get(i)->AddApplication(App);
 
@@ -1194,6 +2000,7 @@ void SetupNetwork(){
             dev->set_ecmp_model(ecmpmodel);
             dev->Set_switchDelay(NanoSeconds(switch_delay));
             dev->SetMtu(m_mtu);
+            ApplyBridgePfcWatermarks(dev);
             TorusSwitch.Get(i)->AddDevice(dev);
             TorusDevices.push_back(dev);
         }
@@ -1232,31 +2039,34 @@ void SetupNetwork(){
         packetSocketHelper.Install(TorusSwitch); // 为所有主机安装 PacketSocket
 
 
-        // 为每个主机安装发往其他主机的 HopCountClient
-        uint16_t customEtherType = 0x88B5;
-        for (uint32_t i = 0; i < numGPUs; ++i){
-            PacketSocketAddress clientSocketAddr;
-            clientSocketAddr.SetSingleDevice(0);
-            clientSocketAddr.SetPhysicalAddress(hostMacs[i]);
-            clientSocketAddr.SetProtocol(customEtherType);
-            Ptr<HopCountClient> client = CreateObject<HopCountClient>();
-            client->SetRemote(clientSocketAddr);
-            client->SetAttribute("PacketSize", UintegerValue(100));
-            client->SetAttribute("Interval", TimeValue(Seconds(1.5)));
-            client->SetAttribute("MaxPackets", UintegerValue(1));
-            TorusSwitch.Get(i)->AddApplication(client);
+        if (!mactable_load_enable)
+        {
+            // 为每个主机安装发往其他主机的 HopCountClient
+            uint16_t customEtherType = 0x88B5;
+            for (uint32_t i = 0; i < numGPUs; ++i){
+                PacketSocketAddress clientSocketAddr;
+                clientSocketAddr.SetSingleDevice(0);
+                clientSocketAddr.SetPhysicalAddress(hostMacs[i]);
+                clientSocketAddr.SetProtocol(customEtherType);
+                Ptr<HopCountClient> client = CreateObject<HopCountClient>();
+                client->SetRemote(clientSocketAddr);
+                client->SetAttribute("PacketSize", UintegerValue(100));
+                client->SetAttribute("Interval", TimeValue(Seconds(1.5)));
+                client->SetAttribute("MaxPackets", UintegerValue(1));
+                TorusSwitch.Get(i)->AddApplication(client);
 
-            double startTime = 1.0 + (i * 0.2);
-            ApplicationContainer clientApps(client);
-            clientApps.Start(Seconds(startTime));
-            clientApps.Stop(Seconds(floadtime-1));
+                double startTime = 1.0 + (i * 0.2);
+                ApplicationContainer clientApps(client);
+                clientApps.Start(Seconds(startTime));
+                clientApps.Stop(Seconds(GetEffectiveFloodTime()-1));
+            }
         }
         for (uint32_t i = 0; i < numGPUs; ++i) {
             Ptr<Node> clientNode = TorusSwitch.Get(i);
             uint16_t proto = g_roce_cfg.enable ? g_roce_cfg.etherType : 0x9999;
             Ptr<sendflowclient> App = CreateObject<sendflowclient>();
             App->SetRoceConfig(g_roce_cfg);
-            App->SetStartTime(Seconds(floadtime-1));
+            App->SetStartTime(Seconds(GetEffectiveFloodTime()-1));
             App->SetStopTime(Seconds(2000000000));
             TorusSwitch.Get(i)->AddApplication(App);
 

@@ -12,6 +12,7 @@ namespace ns3 {
 class RoceSimHeader : public Header {
 public:
   static TypeId GetTypeId();
+  static uint32_t GetVisibleWireBytes(RoceOpcode opcode);
   TypeId GetInstanceTypeId() const override;
 
   RoceSimHeader() = default;
@@ -81,7 +82,8 @@ private:
   uint32_t m_rkey = 0;
   uint32_t m_length = 0;
 
-  // 与 3P 业务流对齐的标识
+  // 与 3P 业务流对齐的标识。
+  // 这些字段保留在本地对象里做调试/关联，不计入序列化线长。
   uint32_t m_tag = 0;
   uint32_t m_src = 0;
   uint32_t m_dst = 0;

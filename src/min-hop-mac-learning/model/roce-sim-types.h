@@ -2,6 +2,7 @@
 #define ROCE_SIM_TYPES_H
 
 #include <cstdint>
+#include <set>
 #include <string>
 
 namespace ns3 {
@@ -42,6 +43,16 @@ enum class RoceUserPhase : uint8_t {
   Act = 3,
 };
 
+// RoCE 信息日志等级：
+// - Off: 关闭信息级 RoCE 日志。
+// - Basic: 仅保留配置、激活、入队等方向性日志。
+// - Full: 打开逐 slice 的完整调试日志。
+enum class RoceLogLevel : uint8_t {
+  Off = 0,
+  Basic = 1,
+  Full = 2,
+};
+
 struct RoceConfig {
   bool enable = false;                 // 总开关
   bool dataUseWrite = true;            // DATA 阶段默认使用 WRITE 语义
@@ -49,7 +60,34 @@ struct RoceConfig {
   uint16_t etherType = 0x9999;         // 二层协议号
   uint32_t defaultSqDepth = 1024;      // 默认 SQ 深度
   uint32_t defaultRqDepth = 1024;      // 默认 RQ 深度
+  bool enableTransportAck = true;      // 是否启用传输层 ACK/超时重传
+  uint32_t transportWindowPackets = 32; // 每 QP 允许并行在途的 transport packet 数
+  bool autoAckTimeout = false;         // 是否根据拓扑/链路配置自动推导 ACK 超时
+  double ackTimeoutFactor = 2.0;       // 自动模式下乘在最坏 RTT 基线上的系数
+  uint64_t ackTimeoutBaseNs = 0;       // 自动模式下推导得到的未乘系数 RTT 基线（ns）
+  uint64_t ackTimeoutNs = 5000;        // 每包 ACK 超时时间（ns）
+  uint32_t maxRetransmissions = 8;     // 单包最大重传次数
+  RoceLogLevel logLevel = RoceLogLevel::Full; // RoCE 信息日志等级
   std::string modeName = "legacy";     // 模式名（例如 rc_3phase/read/send）
+};
+
+// flow 级键：沿用 tag/src/dst 三元组。
+struct RoceFlowKey {
+  uint32_t tag = 0;
+  uint32_t src = 0;
+  uint32_t dst = 0;
+
+  bool operator==(const RoceFlowKey& other) const = default;
+
+  bool operator<(const RoceFlowKey& other) const {
+    if (tag != other.tag) {
+      return tag < other.tag;
+    }
+    if (src != other.src) {
+      return src < other.src;
+    }
+    return dst < other.dst;
+  }
 };
 
 // QP 唯一键：src/dst + qpn。
@@ -57,6 +95,8 @@ struct RoceQpKey {
   uint32_t src = 0;
   uint32_t dst = 0;
   uint32_t qpn = 0;
+
+  bool operator==(const RoceQpKey& other) const = default;
 
   bool operator<(const RoceQpKey& other) const {
     if (src != other.src) {
@@ -73,11 +113,14 @@ struct RoceQpKey {
 struct RoceQpContext {
   RoceQpState state = RoceQpState::Reset;
   uint32_t nextPsn = 0;        // 下一个发送 PSN
-  uint32_t expectedRxPsn = 0;  // 期望接收的下一个 PSN
+  uint32_t expectedRxPsn = 0;  // 当前最小缺失 PSN；乱序缓存会围绕它向前收敛
   uint32_t sqDepth = 0;
   uint32_t rqDepth = 0;
   uint64_t txPackets = 0;      // 已发送包计数
-  uint64_t rxPackets = 0;      // 已接收包计数
+  uint64_t rxPackets = 0;      // 已接收唯一包计数
+  uint64_t rxOutOfOrderPackets = 0; // 先于 expectedRxPsn 到达的唯一包计数
+  uint64_t rxDuplicatePackets = 0;  // 重复包/旧包计数
+  std::set<uint32_t> pendingRxPsns; // 已到达但尚未与 expectedRxPsn 接上的 future PSN
 };
 
 // 简化 completion 队列项。

@@ -13,7 +13,7 @@ namespace ns3 {
 // RoCE QP 引擎（轻量仿真版）：
 // - 维护 QP 状态机与 PSN
 // - 生成发送头
-// - 接收侧校验并产出 completion
+// - 接收侧校验、乱序跟踪并产出 completion
 class RoceQpEngine {
 public:
   RoceQpEngine() = default;
@@ -39,10 +39,15 @@ public:
                        uint32_t tag,
                        RoceSimHeader* out);
 
-  // 处理接收头并做基础合法性检查（状态、opcode、PSN、长度）。
+  // 处理接收头并做基础合法性检查（状态、opcode、长度），
+  // 同时允许 future PSN 先进入 QP 内部乱序缓存。
   bool OnRxHeader(const RoceQpKey& key,
                   const RoceSimHeader& header,
-                  RoceCompletion* completion);
+                  RoceCompletion* completion,
+                  bool* shouldDeliverToUpper = nullptr,
+                  bool* bufferedForReorder = nullptr);
+
+  uint32_t GetExpectedRxPsn(const RoceQpKey& key) const;
 
   // Completion 队列接口。
   void NotifyTxCompletion(const RoceQpKey& key, uint32_t wrId, bool success);

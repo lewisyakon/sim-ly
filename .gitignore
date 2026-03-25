@@ -43,6 +43,7 @@ version.cache
 
 .gitlab-ci-local/
 .idea/
+.vscode/
 cmake-*/
 vcpkg/
 
@@ -50,3 +51,8 @@ vcpkg/
 
 # Ignore local cache used by e.g. clangd
 .cache/
+
+# Generated simulation outputs
+/ncclFlowModel*.csv
+/mactable/
+/mactable_test*/

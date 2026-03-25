@@ -8,23 +8,6 @@
 
 namespace ns3 {
 
-// flow 级键：沿用 tag/src/dst 三元组。
-struct RoceFlowKey {
-  uint32_t tag = 0;
-  uint32_t src = 0;
-  uint32_t dst = 0;
-
-  bool operator<(const RoceFlowKey& other) const {
-    if (tag != other.tag) {
-      return tag < other.tag;
-    }
-    if (src != other.src) {
-      return src < other.src;
-    }
-    return dst < other.dst;
-  }
-};
-
 // 3P 语义状态（用于 REQUEST/DATA/ACT 生命周期跟踪）。
 enum class ThreePhaseState : uint8_t {
   Idle = 0,

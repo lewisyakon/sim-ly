@@ -500,9 +500,12 @@ PointToPointNetDevice::Receive(Ptr<Packet> packet)
             uint16_t pauseQid = header.GetQueueId();
             if(header.GetFrameType() == PauseHeader::PAUSE && pauseDst == m_address)
             {
-                NS_LOG_INFO("[PFC][RX][PAUSE] dev=" << Mac48Address::ConvertFrom(m_address)
-                            << " qid=" << pauseQid
-                            << " t=" << Simulator::Now().GetSeconds() << "s");
+                if (IsPfcFullLogEnabled())
+                {
+                    NS_LOG_UNCOND("[PFC][RX][NONLOCAL][PAUSE] dev=" << Mac48Address::ConvertFrom(m_address)
+                                  << " qid=" << pauseQid
+                                  << " t=" << Simulator::Now().GetSeconds() << "s");
+                }
                 Ptr<PppRoundRobinQueue<Packet>> rrQueue =
                     DynamicCast<PppRoundRobinQueue<Packet>>(m_queue);
                 if (rrQueue)
@@ -517,9 +520,12 @@ PointToPointNetDevice::Receive(Ptr<Packet> packet)
             }
             else if(header.GetFrameType() == PauseHeader::RESUME && pauseDst == m_address)
             {
-                NS_LOG_INFO("[PFC][RX][RESUME] dev=" << Mac48Address::ConvertFrom(m_address)
-                            << " qid=" << pauseQid
-                            << " t=" << Simulator::Now().GetSeconds() << "s");
+                if (IsPfcFullLogEnabled())
+                {
+                    NS_LOG_UNCOND("[PFC][RX][NONLOCAL][RESUME] dev=" << Mac48Address::ConvertFrom(m_address)
+                                  << " qid=" << pauseQid
+                                  << " t=" << Simulator::Now().GetSeconds() << "s");
+                }
                 Ptr<PppRoundRobinQueue<Packet>> rrQueue =
                     DynamicCast<PppRoundRobinQueue<Packet>>(m_queue);
                 if (rrQueue)

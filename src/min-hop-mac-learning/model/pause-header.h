@@ -4,8 +4,49 @@
 #include "ns3/header.h"
 #include "ns3/mac48-address.h"
 
+#include <cstdint>
+
 namespace ns3
 {
+
+enum class PfcLogLevel : uint8_t
+{
+    Off = 0,
+    Basic = 1,
+    Full = 2
+};
+
+inline PfcLogLevel g_pfcLogLevel = PfcLogLevel::Full;
+inline double g_pfcHighWatermark = 0.8;
+inline double g_pfcLowWatermark = 0.2;
+
+inline bool
+IsPfcBasicLogEnabled()
+{
+    return g_pfcLogLevel != PfcLogLevel::Off;
+}
+
+inline bool
+IsPfcFullLogEnabled()
+{
+    return g_pfcLogLevel == PfcLogLevel::Full;
+}
+
+inline const char*
+ToString(PfcLogLevel level)
+{
+    switch (level)
+    {
+    case PfcLogLevel::Off:
+        return "off";
+    case PfcLogLevel::Basic:
+        return "basic";
+    case PfcLogLevel::Full:
+        return "full";
+    default:
+        return "unknown";
+    }
+}
 
 class PauseHeader : public Header
 {
