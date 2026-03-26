@@ -62,6 +62,7 @@ struct RoceConfig {
   uint32_t defaultRqDepth = 1024;      // 默认 RQ 深度
   bool enableTransportAck = true;      // 是否启用传输层 ACK/超时重传
   uint32_t transportWindowPackets = 32; // 每 QP 允许并行在途的 transport packet 数
+  uint32_t reorderWindowPackets = 32;  // 每 QP 接收侧允许缓存的 future packet 窗口（包数）
   bool autoAckTimeout = false;         // 是否根据拓扑/链路配置自动推导 ACK 超时
   double ackTimeoutFactor = 2.0;       // 自动模式下乘在最坏 RTT 基线上的系数
   uint64_t ackTimeoutBaseNs = 0;       // 自动模式下推导得到的未乘系数 RTT 基线（ns）
@@ -120,6 +121,7 @@ struct RoceQpContext {
   uint64_t rxPackets = 0;      // 已接收唯一包计数
   uint64_t rxOutOfOrderPackets = 0; // 先于 expectedRxPsn 到达的唯一包计数
   uint64_t rxDuplicatePackets = 0;  // 重复包/旧包计数
+  uint64_t rxReorderOverflowPackets = 0; // 超出 bounded reorder window 的 future packet 计数
   std::set<uint32_t> pendingRxPsns; // 已到达但尚未与 expectedRxPsn 接上的 future PSN
 };
 

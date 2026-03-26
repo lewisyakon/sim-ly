@@ -44,6 +44,14 @@
   - 含义：每个 QP 同时允许存在的 transport outstanding packet 数上限。
   - 影响：这是当前最重要的发送 admission control 之一。达到上限后，该 QP 会暂时停止发送新的普通 packet，直到 ACK 回来释放窗口。
 
+- `reorder_window_packets`（uint32）
+  - 含义：每个 QP 接收侧允许缓存的 future packet 乱序窗口大小，单位是 packet。
+  - 影响：
+    - 只接受区间 `[expectedRxPsn, expectedRxPsn + reorder_window_packets)` 内的 future packet 进入 reorder buffer。
+    - 超出窗口的 future packet 不再缓存，不上送业务层，而是继续只回累计 ACK，等待发送端 timeout/recovery 补洞。
+  - 当前约束：
+    - `1 <= reorder_window_packets <= transport_window_packets`
+
 - `ack_timeout_mode`（string）
   - 含义：ACK timeout 的来源。
   - 推荐写法：`"auto"`、`"manual"`。
@@ -90,8 +98,8 @@
 示例：
 
 ```text
-[ROCE][CFG] enable=true mode=rc_3phase dataUseWrite=true etherType=0x9999 logLevel=full transportAck=true transportWindowPackets=32 ackTimeoutMode=auto ackTimeoutBaseNs=2824 ackTimeoutFactor=2 ackTimeoutNs=5648 maxRetrans=8 reqOp=0 dataOp=2 actOp=0
-[ROCE][ACTIVE] node=20 mode=rc_3phase dataUseWrite=true sqDepth=1024 rqDepth=1024 etherType=0x9999 logLevel=full transportAck=true transportWindowPackets=32 ackTimeoutMode=auto ackTimeoutBaseNs=2824 ackTimeoutFactor=2 ackTimeoutNs=5648 maxRetrans=8
+[ROCE][CFG] enable=true mode=rc_3phase dataUseWrite=true etherType=0x9999 logLevel=full transportAck=true transportWindowPackets=32 reorderWindowPackets=32 ackTimeoutMode=auto ackTimeoutBaseNs=2824 ackTimeoutFactor=2 ackTimeoutNs=5648 maxRetrans=8 reqOp=0 dataOp=2 actOp=0
+[ROCE][ACTIVE] node=20 mode=rc_3phase dataUseWrite=true sqDepth=1024 rqDepth=1024 etherType=0x9999 logLevel=full transportAck=true transportWindowPackets=32 reorderWindowPackets=32 ackTimeoutMode=auto ackTimeoutBaseNs=2824 ackTimeoutFactor=2 ackTimeoutNs=5648 maxRetrans=8
 ```
 
 字段含义：
@@ -121,6 +129,10 @@
 - `transportWindowPackets`
   - 当前每个 QP 的 in-flight packet 上限。
   - 这个值现在会明显影响发送节奏，甚至可能比设备队列长度更主导 offered load。
+
+- `reorderWindowPackets`
+  - 当前每个 QP 接收侧允许缓存的 future packet 窗口。
+  - 它和 `transportWindowPackets` 一起决定 sender/receiver 两端对“最大离散程度”的共同上界。
 
 - `ackTimeoutMode`
   - `manual` 或 `auto`。
@@ -218,6 +230,16 @@
 含义：
 
 - 某个 QP 的 oldest outstanding packet 超时。
+
+#### `[ROCE][RX][REORDER_OVERFLOW]`
+
+含义：
+
+- 接收侧发现某个 future packet 超出了当前 `reorder_window_packets`。
+- 这个 packet 不会进入 reorder buffer，也不会上送业务层。
+- 当前处理策略是：
+  - 保持累计 ACK 在 `expectedRxPsn - 1`
+  - 依赖发送侧 timeout/recovery 来补回缺失洞
 - 当前实现会让该 QP 进入 recovery，并阻塞新的普通 packet。
 
 #### `[ROCE][RTX][SEND]`

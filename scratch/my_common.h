@@ -1031,6 +1031,9 @@ bool ReadConf(std::string network_conf)
     if (JHas(rc, "transport_window_packets")) {
       g_roce_cfg.transportWindowPackets = rc["transport_window_packets"].get<uint32_t>();
     }
+    if (JHas(rc, "reorder_window_packets")) {
+      g_roce_cfg.reorderWindowPackets = rc["reorder_window_packets"].get<uint32_t>();
+    }
     if (JHas(rc, "ack_timeout_mode")) {
       g_roce_cfg.autoAckTimeout = ParseRoceAckTimeoutMode(rc["ack_timeout_mode"]);
     }
@@ -1212,6 +1215,10 @@ bool ReadConf(std::string network_conf)
 
   effective_floadtime = mactable_load_enable ? 1 : floadtime;
   effective_floadtime = std::max(1, effective_floadtime);
+  g_roce_cfg.transportWindowPackets = std::max<uint32_t>(1, g_roce_cfg.transportWindowPackets);
+  g_roce_cfg.reorderWindowPackets = std::max<uint32_t>(1, g_roce_cfg.reorderWindowPackets);
+  g_roce_cfg.reorderWindowPackets =
+      std::min(g_roce_cfg.reorderWindowPackets, g_roce_cfg.transportWindowPackets);
   g_pfcHighWatermark = pfc_high_watermark;
   g_pfcLowWatermark = pfc_low_watermark;
   RefreshRoceAckTimeoutFromNetworkConfig();
@@ -1227,6 +1234,7 @@ void SetConfig(){
     g_roce_cfg.defaultRqDepth = 1024;
     g_roce_cfg.enableTransportAck = true;
     g_roce_cfg.transportWindowPackets = 32;
+    g_roce_cfg.reorderWindowPackets = 32;
     g_roce_cfg.autoAckTimeout = false;
     g_roce_cfg.ackTimeoutFactor = 2.0;
     g_roce_cfg.ackTimeoutBaseNs = 0;
