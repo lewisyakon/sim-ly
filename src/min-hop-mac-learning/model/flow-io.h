@@ -94,6 +94,9 @@ private:
   void ScheduleDrain();
   void EnsureQueueState();
   uint32_t GetExternalIngressMaxPacketsPerQueue() const;
+  bool GetExternalEgressQueueState(uint32_t queueId,
+                                   uint32_t& queueLen,
+                                   uint32_t& maxPerQueue) const;
   uint32_t GetExternalHoldPacketCount() const;
   bool HasPendingExternalIngressWork() const;
   void EnqueueExternalIngress(uint32_t queueId, const Address& dest, Ptr<Packet> pkt);
@@ -101,8 +104,7 @@ private:
   void DrainExternalIngress();
   void ScheduleExternalIngressDrain(bool delayed);
   void TryRefillExternalIngress(uint32_t queueId);
-  void UpdateExternalIngressPauseStateOnEnqueue(uint32_t queueId);
-  void UpdateExternalIngressPauseStateOnDequeue(uint32_t queueId);
+  bool RefreshExternalIngressPauseState(uint32_t queueId, bool anticipateEnqueue);
 
   void DoDispose() override;
 

@@ -72,6 +72,7 @@ RoceQpEngine::ModifyQpState(const RoceQpKey& key, RoceQpState target) {
     it->second.pendingRxPsns.clear();
     it->second.rxOutOfOrderPackets = 0;
     it->second.rxDuplicatePackets = 0;
+    it->second.rxReorderOverflowPackets = 0;
   }
   return true;
 }
@@ -117,7 +118,20 @@ RoceQpEngine::BuildSendHeader(const RoceQpKey& key,
     return false;
   }
 
-  const uint32_t psn = it->second.nextPsn++;
+  uint32_t psn = it->second.nextPsn;
+  uint32_t ackPsn = 0;
+  if (opcode == RoceOpcode::Ack || opcode == RoceOpcode::RdmaReadResp) {
+    // ACK/READ_RESP 的序号锚定到当前累计确认点，而不是维护一条独立增长的
+    // 反向 PSN 流。这样重复 ACK 不会把接收端 expectedRxPsn 冲到很高的位置，
+    // ACT 等后续反向控制包也能继续沿同一累计序号闭环。
+    ackPsn = it->second.expectedRxPsn == 0 ? 0 : (it->second.expectedRxPsn - 1);
+    psn = ackPsn;
+    if (it->second.nextPsn < ackPsn + 1) {
+      it->second.nextPsn = ackPsn + 1;
+    }
+  } else {
+    psn = it->second.nextPsn++;
+  }
   it->second.txPackets++;
 
   // 发送头由 QP 上下文驱动，保证同一 QP 上 PSN 单调递增。
@@ -132,8 +146,6 @@ RoceQpEngine::BuildSendHeader(const RoceQpKey& key,
   out->SetDst(key.dst);
   if (opcode == RoceOpcode::Ack || opcode == RoceOpcode::RdmaReadResp) {
     // ACK/READ_RESP 回显最近一个按序接收的 PSN。
-    const uint32_t ackPsn =
-        it->second.expectedRxPsn == 0 ? 0 : (it->second.expectedRxPsn - 1);
     out->SetAckPsn(ackPsn);
   }
   return true;
@@ -144,12 +156,16 @@ RoceQpEngine::OnRxHeader(const RoceQpKey& key,
                          const RoceSimHeader& header,
                          RoceCompletion* completion,
                          bool* shouldDeliverToUpper,
-                         bool* bufferedForReorder) {
+                         bool* bufferedForReorder,
+                         bool* overflowedReorderWindow) {
   if (shouldDeliverToUpper != nullptr) {
     *shouldDeliverToUpper = false;
   }
   if (bufferedForReorder != nullptr) {
     *bufferedForReorder = false;
+  }
+  if (overflowedReorderWindow != nullptr) {
+    *overflowedReorderWindow = false;
   }
   EnsureQp(key);
   auto it = m_qps.find(key);
@@ -182,6 +198,21 @@ RoceQpEngine::OnRxHeader(const RoceQpKey& key,
   }
 
   if (psn > it->second.expectedRxPsn) {
+    const uint32_t reorderWindowPackets =
+        std::max<uint32_t>(1, m_cfg.reorderWindowPackets);
+    const uint64_t reorderWindowEndExclusive =
+        static_cast<uint64_t>(it->second.expectedRxPsn) +
+        static_cast<uint64_t>(reorderWindowPackets);
+    if (static_cast<uint64_t>(psn) >= reorderWindowEndExclusive) {
+      // 超出 bounded reorder window：不缓存 future packet，不上送业务层，
+      // 继续依赖累计 ACK + timeout/recovery 把缺失洞补回来。
+      it->second.rxReorderOverflowPackets++;
+      if (overflowedReorderWindow != nullptr) {
+        *overflowedReorderWindow = true;
+      }
+      return true;
+    }
+
     const auto [_, inserted] = it->second.pendingRxPsns.insert(psn);
     if (!inserted) {
       // 同一个 future PSN 重复到达，只计重复，不影响 QP 状态。
@@ -232,6 +263,15 @@ RoceQpEngine::GetExpectedRxPsn(const RoceQpKey& key) const {
     return 0;
   }
   return it->second.expectedRxPsn;
+}
+
+uint32_t
+RoceQpEngine::GetPendingRxCount(const RoceQpKey& key) const {
+  auto it = m_qps.find(key);
+  if (it == m_qps.end()) {
+    return 0;
+  }
+  return static_cast<uint32_t>(it->second.pendingRxPsns.size());
 }
 
 void

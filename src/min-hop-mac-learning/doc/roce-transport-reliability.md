@@ -277,7 +277,8 @@
    - 当前项目里对应的是 `transportWindowPackets`
 2. 接收端的 `N`
    - 更接近 reorder / OOO 容忍窗口
-   - 当前项目里还没有把这个值完整配置化，也还没有做 overflow 策略
+   - 当前项目里对应的是 `reorder_window_packets`
+   - overflow 行为已收敛成 `drop future packet + cumulative ACK + timeout recovery`
 
 所以“RoCE 的 go-back-N 里的 N 是多少”并没有一个简单的标准答案。更合理的说法是：
 
@@ -397,7 +398,121 @@
 
 - 在你当前这组 workload 和参数下，**发送端的类滑动窗口更主导**。
 
-## 5. 当前还没完成的地方
+## 5. bounded reorder window 设计收敛
+
+这部分是下一阶段准备优先落的内容，因此先把设计和参数口径定死。
+
+### 5.1 窗口语义
+
+每个 QP 的接收侧维护一个以 `expectedRxPsn` 为左边界的有界乱序窗口。
+
+窗口定义为：
+
+```text
+[ expectedRxPsn, expectedRxPsn + reorderWindowPackets )
+```
+
+处理规则固定为：
+
+1. `psn < expectedRxPsn`
+   - 视为旧包/重复包
+   - 不再进入 reorder buffer
+   - 不上送业务层
+2. `psn == expectedRxPsn`
+   - 正常按序接收
+   - 推进 `expectedRxPsn`
+   - 并尝试释放后面已经连续的 buffered packet
+3. `expectedRxPsn < psn < expectedRxPsn + reorderWindowPackets`
+   - 允许进入 reorder buffer
+   - 不立刻上送业务层
+4. `psn >= expectedRxPsn + reorderWindowPackets`
+   - 视为 reorder overflow
+   - 不进入 reorder buffer
+   - 不上送业务层
+   - 交由发送端的 timeout / retransmission 去恢复
+
+### 5.2 参数先定成什么
+
+第一版先只引入一个窗口参数：
+
+- `reorder_window_packets`
+
+默认值先定死为：
+
+```text
+reorder_window_packets = transport_window_packets
+```
+
+按当前默认配置，就是：
+
+```text
+reorder_window_packets = 32
+```
+
+这样定的原因很简单：
+
+1. sender side 最多只允许 `transportWindowPackets` 个 packet outstanding
+2. receiver side 没必要允许一个比 sender outstanding 还更大的 future-packet gap
+3. 这样 sender/receiver 对“同一时刻最多能离散到多大”有一致上界
+
+当前 JSON 已支持 `reorder_window_packets`，推荐约束也直接定死：
+
+```text
+1 <= reorder_window_packets <= transport_window_packets
+```
+
+第一版不再单独引入 `bytes` 维度，也不搞多套窗口，避免模型复杂度先失控。
+
+### 5.3 overflow 行为先定成什么
+
+overflow 的行为这次也先定死，不再留成开放项。
+
+当接收侧发现：
+
+```text
+psn >= expectedRxPsn + reorderWindowPackets
+```
+
+第一版行为固定为：
+
+1. 丢弃这个 packet 的业务上送资格
+2. 不把它塞进 reorder buffer
+3. 记录 `rxReorderOverflowPackets`
+4. ACK 仍然只回当前累计点：
+   - `ackPsn = expectedRxPsn - 1`
+5. 不额外引入 NAK/SACK
+6. 依赖现有 timeout/recovery 机制补回缺失 packet
+
+也就是说，overflow 不是“QP 直接进 Err”，也不是“无限缓存”，而是：
+
+- **drop future packet, keep cumulative ACK, let sender recover**
+
+### 5.4 这和 go-back-N 的关系
+
+按这个设计，receiver side 不是“纯粹的无缓冲 go-back-N”：
+
+1. 在窗口内，允许 bounded reorder buffering
+2. 超出窗口，才退回到更保守的“丢 future packet，等待 sender recovery”
+
+所以它更接近：
+
+- **bounded OOO receiver + go-back-N-like sender recovery**
+
+而不是：
+
+- **纯 receiver 端无缓冲的经典 go-back-N**
+
+### 5.5 这一步落完以后，ACK/重传还剩什么
+
+这一步做完以后，乱序处理这条线就会比较清楚：
+
+1. receiver 能缓多少：由 `reorder_window_packets` 定死
+2. 超窗怎么办：固定成 `drop + cumulative ACK + timeout recovery`
+3. sender 怎么补洞：继续用现有 recovery / retransmission
+
+这样后面 ACK 这条线就可以单独讨论，不会再和“receiver 到底能缓多少 future packet”搅在一起。
+
+## 6. 当前还没完成的地方
 
 虽然最近改动很多，但当前 RoCE 可靠传输还没有完全做完。
 
@@ -410,7 +525,7 @@
 5. 动态 RTO（例如 SRTT/RTTVAR）
 6. 更完整的累计 ACK / recovery 策略细化
 
-## 6. 建议怎么读代码
+## 7. 建议怎么读代码
 
 如果你现在要顺着代码看这一轮改动，建议顺序是：
 

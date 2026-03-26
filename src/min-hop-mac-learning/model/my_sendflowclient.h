@@ -98,7 +98,8 @@ private:
                            uint32_t dst,
                            const Address& from,
                            uint32_t rxInDevIndexForLoopback,
-                           bool* bufferedForReorder = nullptr);
+                           bool* bufferedForReorder = nullptr,
+                           bool* overflowedReorderWindow = nullptr);
   void EnqueueRoceWork_(ThreePHeader::State state,
                         const Address& dest,
                         uint64_t datasize,
@@ -118,7 +119,8 @@ private:
                            uint32_t src,
                            uint32_t dst,
                            uint32_t qpn,
-                           Ptr<Packet>* packetOut);
+                           Ptr<Packet>* packetOut,
+                           RoceSimHeader* headerOut = nullptr);
   void MaybeSendRoceAck_(const Address& dest,
                          uint32_t tag,
                          uint32_t src,
@@ -141,6 +143,8 @@ private:
   void ArmRoceRetransTimer_(const RoceQpKey& qpKey);
   void CancelRoceRetransTimer_(const RoceQpKey& qpKey);
   uint32_t GetRoceOutstandingCount_(const RoceQpKey& qpKey) const;
+  uint32_t GetRoceOldestOutstandingPsn_(const RoceQpKey& qpKey) const;
+  uint32_t GetRoceRecoveryTargetPsn_(const RoceQpKey& qpKey) const;
   uint32_t GetRoceTransportWindowPackets_() const;
   std::set<RoceQpKey> CollectBlockedRoceQps_() const;
   uint32_t GetOrAllocRoceQpn_(uint32_t tag, uint32_t src, uint32_t dst);

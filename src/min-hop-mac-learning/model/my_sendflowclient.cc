@@ -214,6 +214,7 @@ void sendflowclient::HandleRead(Ptr<Socket> socket)
     }
     if (hasRoceHeader) {
       bool bufferedForReorder = false;
+      bool overflowedReorderWindow = false;
       const bool shouldDeliverUpper =
           HandleRoceRxHeader_(roceHeader,
                               TPheader.GetState(),
@@ -222,11 +223,22 @@ void sendflowclient::HandleRead(Ptr<Socket> socket)
                               dst,
                               from,
                               formIndex,
-                              &bufferedForReorder);
+                              &bufferedForReorder,
+                              &overflowedReorderWindow);
       if (bufferedForReorder) {
         const RoceQpKey qpKey{src, dst, roceHeader.GetQpn()};
         m_roceBufferedUpperPackets[qpKey][roceHeader.GetPsn()] =
             BufferedRoceUpperPacket{p->Copy(), TPheader, from, formIndex};
+        if (IsRoceFullLogEnabled(m_roceCfg)) {
+          NS_LOG_INFO("[ROCE][RX][REORDER_BUFFER] node=" << GetNode()->GetId()
+                      << " src=" << src
+                      << " dst=" << dst
+                      << " qpn=" << roceHeader.GetQpn()
+                      << " psn=" << roceHeader.GetPsn()
+                      << " expectedRxPsn=" << m_roceQpEngine->GetExpectedRxPsn(qpKey)
+                      << " pendingRxCount=" << m_roceQpEngine->GetPendingRxCount(qpKey)
+                      << " bufferedUpperCount=" << m_roceBufferedUpperPackets[qpKey].size());
+        }
       }
       if (!shouldDeliverUpper) {
         continue;
@@ -389,6 +401,15 @@ sendflowclient::MaybeReleaseBufferedRocePackets_(const RoceQpKey& qpKey)
     auto it = packets.begin();
     if (it->first >= deliverUpToPsn) {
       break;
+    }
+    if (IsRoceFullLogEnabled(m_roceCfg)) {
+      NS_LOG_INFO("[ROCE][RX][REORDER_RELEASE] node=" << GetNode()->GetId()
+                  << " src=" << qpKey.src
+                  << " dst=" << qpKey.dst
+                  << " qpn=" << qpKey.qpn
+                  << " psn=" << it->first
+                  << " deliverUpToPsn=" << deliverUpToPsn
+                  << " remainingBuffered=" << packets.size());
     }
     ProcessThreePhasePayload_(it->second.payload->Copy(),
                               it->second.tpHeader,
@@ -590,11 +611,15 @@ sendflowclient::DispatchPendingRoceRetransmissions_() {
 
   if (IsRoceBasicLogEnabled(m_roceCfg)) {
     NS_LOG_INFO("[ROCE][RTX][SEND] tag=" << outstanding.flowKey.tag
+                << " node=" << GetNode()->GetId()
                 << " src=" << outstanding.flowKey.src
                 << " dst=" << outstanding.flowKey.dst
                 << " qpn=" << qpKey.qpn
                 << " psn=" << outstanding.psn
                 << " retry=" << outstanding.retries
+                << " outstandingCount=" << GetRoceOutstandingCount_(qpKey)
+                << " oldestOutstanding=" << GetRoceOldestOutstandingPsn_(qpKey)
+                << " recoveryTarget=" << GetRoceRecoveryTargetPsn_(qpKey)
                 << " TIME=" << Simulator::Now().GetFemtoSeconds());
   }
   realsend(outstanding.packet->Copy(),
@@ -710,7 +735,8 @@ sendflowclient::BuildRoceAckPacket_(uint32_t tag,
                                     uint32_t src,
                                     uint32_t dst,
                                     uint32_t qpn,
-                                    Ptr<Packet>* packetOut) {
+                                    Ptr<Packet>* packetOut,
+                                    RoceSimHeader* headerOut) {
   if (!IsRoceEnabled() || packetOut == nullptr || m_roceQpEngine == nullptr) {
     return false;
   }
@@ -730,11 +756,23 @@ sendflowclient::BuildRoceAckPacket_(uint32_t tag,
   EnsureQpReadyToSend(m_roceQpEngine.get(), qpKey);
 
   RoceSimHeader ackHeader;
-  if (!m_roceQpEngine->BuildSendHeader(
-          qpKey, RoceOpcode::Ack, RoceUserPhase::None, 0, tag, &ackHeader)) {
-    return false;
+  ackHeader.SetVersion(1);
+  ackHeader.SetOpcode(RoceOpcode::Ack);
+  ackHeader.SetUserPhase(RoceUserPhase::None);
+  ackHeader.SetFlags(0x4);
+  ackHeader.SetQpn(qpn);
+  const uint32_t ackPsn =
+      m_roceQpEngine->GetExpectedRxPsn(qpKey) == 0
+          ? 0
+          : (m_roceQpEngine->GetExpectedRxPsn(qpKey) - 1);
+  ackHeader.SetPsn(ackPsn);
+  ackHeader.SetAckPsn(ackPsn);
+  ackHeader.SetTag(tag);
+  ackHeader.SetSrc(src);
+  ackHeader.SetDst(dst);
+  if (headerOut != nullptr) {
+    *headerOut = ackHeader;
   }
-  ackHeader.SetFlags(ackHeader.GetFlags() | 0x4);
 
   Ptr<Packet> packet = Create<Packet>(0);
   packet->AddHeader(ackHeader);
@@ -758,8 +796,10 @@ sendflowclient::MaybeSendRoceAck_(const Address& dest,
   }
 
   Ptr<Packet> ackPacket;
-  if (!BuildRoceAckPacket_(tag, src, dst, qpn, &ackPacket)) {
+  RoceSimHeader ackHeader;
+  if (!BuildRoceAckPacket_(tag, src, dst, qpn, &ackPacket, &ackHeader)) {
     NS_LOG_WARN("[ROCE][ACK][TX] failed to build ack"
+                << " node=" << GetNode()->GetId()
                 << " tag=" << tag
                 << " src=" << src
                 << " dst=" << dst
@@ -768,9 +808,14 @@ sendflowclient::MaybeSendRoceAck_(const Address& dest,
   }
   if (IsRoceFullLogEnabled(m_roceCfg)) {
     NS_LOG_INFO("[ROCE][ACK][TX] tag=" << tag
+                << " node=" << GetNode()->GetId()
                 << " src=" << src
                 << " dst=" << dst
                 << " qpn=" << qpn
+                << " psn=" << ackHeader.GetPsn()
+                << " ackPsn=" << ackHeader.GetAckPsn()
+                << " expectedRxPsn=" << m_roceQpEngine->GetExpectedRxPsn(RoceQpKey{src, dst, qpn})
+                << " pendingRxCount=" << m_roceQpEngine->GetPendingRxCount(RoceQpKey{src, dst, qpn})
                 << " TIME=" << Simulator::Now().GetFemtoSeconds());
   }
   realsend(ackPacket, dest, FlowSendMode::Loopback, rxInDevIndexForLoopback);
@@ -808,6 +853,9 @@ sendflowclient::HandleRoceAck_(const RoceFlowKey& flowKey,
   }
 
   const uint32_t ackPsn = roceHeader.GetAckPsn();
+  const uint32_t outstandingBefore = static_cast<uint32_t>(mapIt->second.size());
+  const uint32_t oldestOutstandingBefore = mapIt->second.begin()->first;
+  const uint32_t recoveryTargetBefore = GetRoceRecoveryTargetPsn_(qpKey);
   auto& packets = mapIt->second;
   for (auto it = packets.begin(); it != packets.end();) {
     if (it->first > ackPsn) {
@@ -832,10 +880,18 @@ sendflowclient::HandleRoceAck_(const RoceFlowKey& flowKey,
 
   if (IsRoceFullLogEnabled(m_roceCfg)) {
     NS_LOG_INFO("[ROCE][ACK][RX] tag=" << flowKey.tag
+                << " node=" << GetNode()->GetId()
                 << " src=" << flowKey.src
                 << " dst=" << flowKey.dst
                 << " qpn=" << qpKey.qpn
+                << " psn=" << roceHeader.GetPsn()
                 << " ackPsn=" << ackPsn
+                << " outstandingBefore=" << outstandingBefore
+                << " outstandingAfter=" << GetRoceOutstandingCount_(qpKey)
+                << " oldestOutstandingBefore=" << oldestOutstandingBefore
+                << " oldestOutstandingAfter=" << GetRoceOldestOutstandingPsn_(qpKey)
+                << " recoveryTargetBefore=" << recoveryTargetBefore
+                << " recoveryTargetAfter=" << GetRoceRecoveryTargetPsn_(qpKey)
                 << " TIME=" << Simulator::Now().GetFemtoSeconds());
   }
   ScheduleRoceDispatch_();
@@ -858,11 +914,15 @@ sendflowclient::HandleRoceRetransTimeout_(RoceQpKey qpKey) {
   const uint32_t psn = outstanding.psn;
   if (outstanding.retries >= m_roceCfg.maxRetransmissions) {
     NS_LOG_WARN("[ROCE][RTX][DROP] tag=" << outstanding.flowKey.tag
+                << " node=" << GetNode()->GetId()
                 << " src=" << outstanding.flowKey.src
                 << " dst=" << outstanding.flowKey.dst
                 << " qpn=" << qpKey.qpn
                 << " psn=" << psn
-                << " retries=" << outstanding.retries);
+                << " retries=" << outstanding.retries
+                << " outstandingCount=" << GetRoceOutstandingCount_(qpKey)
+                << " oldestOutstanding=" << GetRoceOldestOutstandingPsn_(qpKey)
+                << " recoveryTarget=" << GetRoceRecoveryTargetPsn_(qpKey));
     mapIt->second.erase(packetIt);
     if (mapIt->second.empty()) {
       CancelRoceRetransTimer_(qpKey);
@@ -879,11 +939,15 @@ sendflowclient::HandleRoceRetransTimeout_(RoceQpKey qpKey) {
   outstanding.retries++;
   if (IsRoceBasicLogEnabled(m_roceCfg)) {
     NS_LOG_INFO("[ROCE][RTX][TIMEOUT] tag=" << outstanding.flowKey.tag
+                << " node=" << GetNode()->GetId()
                 << " src=" << outstanding.flowKey.src
                 << " dst=" << outstanding.flowKey.dst
                 << " qpn=" << qpKey.qpn
                 << " psn=" << psn
                 << " retry=" << outstanding.retries
+                << " outstandingCount=" << GetRoceOutstandingCount_(qpKey)
+                << " oldestOutstanding=" << GetRoceOldestOutstandingPsn_(qpKey)
+                << " recoveryTarget=" << GetRoceRecoveryTargetPsn_(qpKey)
                 << " TIME=" << Simulator::Now().GetFemtoSeconds());
   }
   m_rocePendingRetransmissions[qpKey] = outstanding;
@@ -932,6 +996,24 @@ sendflowclient::GetRoceOutstandingCount_(const RoceQpKey& qpKey) const {
     return 0;
   }
   return static_cast<uint32_t>(it->second.size());
+}
+
+uint32_t
+sendflowclient::GetRoceOldestOutstandingPsn_(const RoceQpKey& qpKey) const {
+  auto it = m_roceOutstandingPackets.find(qpKey);
+  if (it == m_roceOutstandingPackets.end() || it->second.empty()) {
+    return 0;
+  }
+  return it->second.begin()->first;
+}
+
+uint32_t
+sendflowclient::GetRoceRecoveryTargetPsn_(const RoceQpKey& qpKey) const {
+  auto it = m_roceRecoveryTargetPsns.find(qpKey);
+  if (it == m_roceRecoveryTargetPsns.end()) {
+    return 0;
+  }
+  return it->second;
 }
 
 uint32_t
@@ -1205,6 +1287,7 @@ sendflowclient::BuildRoceTxHeader_(ThreePHeader::State state,
                   << " sqDepth=" << m_roceCfg.defaultSqDepth
                   << " rqDepth=" << m_roceCfg.defaultRqDepth
                   << " transportWindowPackets=" << m_roceCfg.transportWindowPackets
+                  << " reorderWindowPackets=" << m_roceCfg.reorderWindowPackets
                   << " etherType=0x" << std::hex << m_roceCfg.etherType << std::dec
                   << " logLevel=" << ToString(m_roceCfg.logLevel)
                   << " ackTimeoutMode=" << ToStringAckTimeoutMode(m_roceCfg)
@@ -1294,7 +1377,8 @@ sendflowclient::HandleRoceRxHeader_(const RoceSimHeader& roceHeader,
                                     uint32_t dst,
                                     const Address& from,
                                     uint32_t rxInDevIndexForLoopback,
-                                    bool* bufferedForReorder) {
+                                    bool* bufferedForReorder,
+                                    bool* overflowedReorderWindow) {
   if (!IsRoceEnabled()) {
     return true;
   }
@@ -1302,11 +1386,22 @@ sendflowclient::HandleRoceRxHeader_(const RoceSimHeader& roceHeader,
   const RoceFlowKey flowKey{tag, src, dst};
   RememberRoceQpn_(tag, src, dst, roceHeader.GetQpn());
   const RoceQpKey qpKey{src, dst, roceHeader.GetQpn()};
+  if (roceHeader.GetOpcode() == RoceOpcode::Ack) {
+    if (bufferedForReorder != nullptr) {
+      *bufferedForReorder = false;
+    }
+    if (overflowedReorderWindow != nullptr) {
+      *overflowedReorderWindow = false;
+    }
+    HandleRoceAck_(flowKey, qpKey, roceHeader);
+    return false;
+  }
   EnsureQpReadyToSend(m_roceQpEngine.get(), qpKey);
 
   bool qpAccepted = true;
   bool shouldDeliverUpper = true;
   bool qpBufferedForReorder = false;
+  bool qpOverflowedReorderWindow = false;
   RoceCompletion cqe;
   if (m_roceQpEngine != nullptr) {
     // 由 QP 引擎校验 PSN/状态等接收侧条件。
@@ -1314,7 +1409,8 @@ sendflowclient::HandleRoceRxHeader_(const RoceSimHeader& roceHeader,
                                             roceHeader,
                                             &cqe,
                                             &shouldDeliverUpper,
-                                            &qpBufferedForReorder);
+                                            &qpBufferedForReorder,
+                                            &qpOverflowedReorderWindow);
     if (!qpAccepted) {
       NS_LOG_WARN("[ROCE][RX] QP rejected packet tag=" << tag
                   << " src=" << src
@@ -1327,10 +1423,20 @@ sendflowclient::HandleRoceRxHeader_(const RoceSimHeader& roceHeader,
   if (bufferedForReorder != nullptr) {
     *bufferedForReorder = qpBufferedForReorder;
   }
+  if (overflowedReorderWindow != nullptr) {
+    *overflowedReorderWindow = qpOverflowedReorderWindow;
+  }
 
-  if (roceHeader.GetOpcode() == RoceOpcode::Ack && qpAccepted) {
-    HandleRoceAck_(flowKey, qpKey, roceHeader);
-    return false;
+  if (qpOverflowedReorderWindow) {
+    NS_LOG_WARN("[ROCE][RX][REORDER_OVERFLOW] tag=" << tag
+                << " node=" << GetNode()->GetId()
+                << " src=" << src
+                << " dst=" << dst
+                << " qpn=" << roceHeader.GetQpn()
+                << " psn=" << roceHeader.GetPsn()
+                << " expectedRxPsn=" << m_roceQpEngine->GetExpectedRxPsn(qpKey)
+                << " pendingRxCount=" << m_roceQpEngine->GetPendingRxCount(qpKey)
+                << " reorderWindowPackets=" << m_roceCfg.reorderWindowPackets);
   }
 
   if (qpAccepted) {
@@ -1412,6 +1518,7 @@ sendflowclient::SetRoceConfig(const RoceConfig& cfg) {
                 << " logLevel=" << ToString(m_roceCfg.logLevel)
                 << " transportAck=" << m_roceCfg.enableTransportAck
                 << " transportWindowPackets=" << m_roceCfg.transportWindowPackets
+                << " reorderWindowPackets=" << m_roceCfg.reorderWindowPackets
                 << " ackTimeoutMode=" << ToStringAckTimeoutMode(m_roceCfg)
                 << " ackTimeoutBaseNs=" << m_roceCfg.ackTimeoutBaseNs
                 << " ackTimeoutFactor=" << m_roceCfg.ackTimeoutFactor

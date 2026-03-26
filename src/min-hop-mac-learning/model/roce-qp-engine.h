@@ -45,9 +45,11 @@ public:
                   const RoceSimHeader& header,
                   RoceCompletion* completion,
                   bool* shouldDeliverToUpper = nullptr,
-                  bool* bufferedForReorder = nullptr);
+                  bool* bufferedForReorder = nullptr,
+                  bool* overflowedReorderWindow = nullptr);
 
   uint32_t GetExpectedRxPsn(const RoceQpKey& key) const;
+  uint32_t GetPendingRxCount(const RoceQpKey& key) const;
 
   // Completion 队列接口。
   void NotifyTxCompletion(const RoceQpKey& key, uint32_t wrId, bool success);
