@@ -1,5 +1,5 @@
 {
-  "workloadpath": "simworkload/microAllReduce.txt",
+  "workloadpath": "simworkload/65536_workload.txt",
   "thread": 1,
   "gpu_type": "A100",                
   "gpus_per_server": 4,
@@ -22,12 +22,11 @@
 
   "mactable": {
     "load_enable": false,
-    "dump_enable": false,
     "dir": "mactable"
   },
 
   "pfc": {
-    "drop_tail_queue_size": "200",
+    "drop_tail_queue_size": "2000",
     "drop_tail_queue_num": "16",
     "high_watermark": 0.8,
     "low_watermark": 0.2,
@@ -36,15 +35,15 @@
 
   "topology": {
     "model": "fattree",
-    "k": 4,
+    "k": 32,
     "subnet_model": 2,              
-    "subnet_k": 4,                             
+    "subnet_k": 8,                             
     "hostperleaf": 2,                            
     "switch_delay_ns_override": 100 
   },
 
   "roce": {
-    "enable": true,
+    "enable": false,
     "mode": "rc_3phase",
     "data_use_write": true,
     "sq_depth": 1024,

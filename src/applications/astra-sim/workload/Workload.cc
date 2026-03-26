@@ -1688,9 +1688,9 @@ bool Workload::initialize_workload(std::string name) {
   //             << " local_layers=" << SIZE
   //             << std::endl;
   // }
-  std::cout<<"id: "<<generator->id<<" tp_size="<<tp_size<<" pp_size="<<pp_size<<" dp_size="<<dp_size<< 
-      " (dp,pp,tp)=("<<dp_rank<<","<<pp_rank<<","<<tp_rank<<")"<<" layer_range=["<<stage_start_layer<<","
-        <<stage_end_layer<<"]" << " local_layers="<<SIZE <<std::endl;
+  // std::cout<<"id: "<<generator->id<<" tp_size="<<tp_size<<" pp_size="<<pp_size<<" dp_size="<<dp_size<< 
+  //     " (dp,pp,tp)=("<<dp_rank<<","<<pp_rank<<","<<tp_rank<<")"<<" layer_range=["<<stage_start_layer<<","
+  //       <<stage_end_layer<<"]" << " local_layers="<<SIZE <<std::endl;
 
   // SIZE = lines;
   for (int i = 0; i < lines; i++) {

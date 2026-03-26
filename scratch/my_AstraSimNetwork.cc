@@ -521,7 +521,7 @@ int main(int argc, char *argv[]) {
       }
   });
 
-  if (mactable_dump_enable)
+  if (!mactable_load_enable)
   {
     ns3::Time dumpTime = ns3::Seconds(warmupSeconds) - ns3::NanoSeconds(1);
     if (dumpTime < ns3::Seconds(0))
@@ -529,7 +529,7 @@ int main(int argc, char *argv[]) {
       dumpTime = ns3::Seconds(0);
     }
     ns3::Simulator::Schedule(dumpTime, []() {
-      DumpBridgeMacTablesToDirectory(mactable_dump_dir);
+      DumpBridgeMacTablesToDirectory(mactable_load_dir);
     });
   }
 

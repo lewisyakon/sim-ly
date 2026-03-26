@@ -61,9 +61,7 @@ GPUType gpu_type;
 int ecmpmodel,max_jump,floadtime,m_mtu;
 int effective_floadtime;
 bool mactable_load_enable;
-bool mactable_dump_enable;
 std::string mactable_load_dir;
-std::string mactable_dump_dir;
 double pfc_high_watermark;
 double pfc_low_watermark;
 uint32_t node_num, switch_num, link_num, trace_num, nvswitch_num, gpus_per_server,
@@ -897,15 +895,11 @@ bool ReadConf(std::string network_conf)
   auto pfc_high_global_bak      = g_pfcHighWatermark;
   auto pfc_low_global_bak       = g_pfcLowWatermark;
   auto mactable_load_enable_bak = mactable_load_enable;
-  auto mactable_dump_enable_bak = mactable_dump_enable;
   auto mactable_load_dir_bak    = mactable_load_dir;
-  auto mactable_dump_dir_bak    = mactable_dump_dir;
   auto effective_floadtime_bak  = effective_floadtime;
   auto pfc_high_watermark_bak   = pfc_high_watermark;
   auto pfc_low_watermark_bak    = pfc_low_watermark;
   bool mactable_load_switch_seen = false;
-  bool mactable_dump_switch_seen = false;
-  bool legacy_dump_enable_value = mactable_dump_enable;
 
 
   // ---------- 1) 顶层通用 ----------
@@ -946,11 +940,6 @@ bool ReadConf(std::string network_conf)
       JGetBool(nw, "mactable_load_enable", mactable_load_enable);
       mactable_load_switch_seen = true;
     }
-    if (JHas(nw, "mactable_dump_enable"))
-    {
-      JGetBool(nw, "mactable_dump_enable", legacy_dump_enable_value);
-      mactable_dump_switch_seen = true;
-    }
     JGetStr(nw, "mactable_load_dir", mactable_load_dir);
     if (mactable_load_dir.empty())
     {
@@ -966,11 +955,6 @@ bool ReadConf(std::string network_conf)
     {
       JGetBool(mt, "load_enable", mactable_load_enable);
       mactable_load_switch_seen = true;
-    }
-    if (JHas(mt, "dump_enable"))
-    {
-      JGetBool(mt, "dump_enable", legacy_dump_enable_value);
-      mactable_dump_switch_seen = true;
     }
     JGetStr(mt, "dir", mactable_load_dir);
     JGetStr(mt, "load_dir", mactable_load_dir);
@@ -1181,9 +1165,7 @@ bool ReadConf(std::string network_conf)
       g_pfcHighWatermark = pfc_high_global_bak;
       g_pfcLowWatermark = pfc_low_global_bak;
       mactable_load_enable = mactable_load_enable_bak;
-      mactable_dump_enable = mactable_dump_enable_bak;
       mactable_load_dir = mactable_load_dir_bak;
-      mactable_dump_dir = mactable_dump_dir_bak;
       effective_floadtime = effective_floadtime_bak;
       pfc_high_watermark = pfc_high_watermark_bak;
       pfc_low_watermark = pfc_low_watermark_bak;
@@ -1191,27 +1173,16 @@ bool ReadConf(std::string network_conf)
     }
   }
 
-  if (!mactable_load_switch_seen && mactable_dump_switch_seen)
+  if (!mactable_load_switch_seen)
   {
-    mactable_load_enable = !legacy_dump_enable_value;
+    mactable_load_enable = false;
   }
-  if (mactable_load_switch_seen || mactable_dump_switch_seen)
-  {
-    mactable_dump_enable = !mactable_load_enable;
-  }
-
-  if ((mactable_load_enable || mactable_dump_enable) && mactable_load_dir.empty())
+  if (mactable_load_dir.empty())
   {
     mactable_load_dir = "mactable";
   }
-  mactable_dump_dir = mactable_load_dir;
-
-  if (mactable_load_enable || mactable_dump_enable)
-  {
-    const std::string mactableScenarioTag = BuildMacTableScenarioTag();
-    mactable_load_dir = AppendScenarioTagIfMissing(mactable_load_dir, mactableScenarioTag);
-    mactable_dump_dir = mactable_load_dir;
-  }
+  const std::string mactableScenarioTag = BuildMacTableScenarioTag();
+  mactable_load_dir = AppendScenarioTagIfMissing(mactable_load_dir, mactableScenarioTag);
 
   effective_floadtime = mactable_load_enable ? 1 : floadtime;
   effective_floadtime = std::max(1, effective_floadtime);
@@ -1261,9 +1232,7 @@ void SetConfig(){
     DropTailQueue_size="1000000";
     DropTailQueue_num="16";
     mactable_load_enable=false;
-    mactable_dump_enable=false;
     mactable_load_dir="mactable";
-    mactable_dump_dir="mactable";
     pfc_high_watermark=0.8;
     pfc_low_watermark=0.2;
     g_pfcHighWatermark = pfc_high_watermark;
