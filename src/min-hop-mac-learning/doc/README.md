@@ -24,8 +24,9 @@
   - 控制类优先
   - 数据类按 QP 轮询
   - 逐 slice 出网
-  - 接收侧最小乱序容忍
+  - bounded reorder window 与 overflow 处理
   - transport ACK
+  - ACK 侧带累计确认语义
   - 每 QP 在途窗口
   - oldest-unacked 单定时器
   - recovery 模式
@@ -35,11 +36,11 @@
 当前还没有完成的部分：
 
 - 真正的 `SQ / RQ / CQ`
-- bounded reorder window 的容量上限与 overflow 行为
 - `sq_depth/rq_depth` 与 scheduler / backpressure 的更深绑定
 - 更完整的 CQ 驱动发送推进
 - retransmission 更深地并入统一 scheduler
 - 动态 RTO
+- 事务完成统计与 transport 完整性的更严格绑定
 - 更完整的累计 ACK / recovery 策略细化
 
 ## 文档导航

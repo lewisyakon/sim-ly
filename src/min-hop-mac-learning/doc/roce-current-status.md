@@ -30,8 +30,10 @@
 8. 每 QP 一个 oldest-unacked 定时器
 9. recovery 模式
 10. ACK 高优先级
-11. 接收侧 future packet 的缓冲与按序释放
-12. 自动 ACK timeout 基线推导
+11. bounded reorder window 与 overflow 处理
+12. ACK 侧带累计确认语义
+13. 接收侧 future packet 的缓冲与按序释放
+14. 自动 ACK timeout 基线推导
 
 ## 2. 最近一次讨论后已经定死的口径
 
@@ -83,16 +85,25 @@
 - 当前 workload + 队列参数下，transport 层已经足够稳定，没有触发 timeout retransmission。
 - 这不能证明“重传路径永远正确”，但能说明当前结构修复后，ACK / 窗口 / 优先级这条链路已经不再自然制造重传风暴。
 
+最近进一步把 `transport_window_packets` 提高到接近当前 workload 的“近似一次性发送”上限时，也没有重新出现真实丢包和 retransmission，但总完成时间会明显变长。当前更合理的解释是：
+
+1. `PFC` 与 external path backpressure 已经能在硬丢包前接住压力
+2. ACK sideband 化后，不会再把反向有序控制流状态机带偏
+3. 更大的 sender window 会提高注入强度，增加排队与 pause/resume 周期
+4. 因此系统现在更像是进入了“无丢包但更高排队/更高回压”的性能区间，而不是再次进入 correctness 失败区间
+
 ## 4. 最近一轮现象的一个重要解释
 
 最近把队列长度从 `2000 -> 350 -> 200` 逐步缩小时，仍然没有明显看到新的丢包和重传。
 
 当前更合理的解释不是“队列大小完全不重要”，而是：
 
-1. `transportWindowPackets=32` 已经对每个 QP 的在途流量形成了强 admission control
+1. `transportWindowPackets` 已经对每个 QP 的在途流量形成了强 admission control
 2. ACK 高优先级后，窗口释放更快
-3. oldest-unacked 单 timer 把早期那种 timeout 风暴切掉了
-4. future packet 不再直接上送业务层，累计 ACK 行为更稳定
+3. ACK sideband 化后，不再被反向 reorder window 卡住
+4. oldest-unacked 单 timer 把早期那种 timeout 风暴切掉了
+5. future packet 不再直接上送业务层，累计 ACK 行为更稳定
+6. external path 现在按下游 RRQ 子队列阈值做 backpressure，不再出现“下游先炸、上游还在塞”的错位
 
 因此在当前这组 workload 下，更主导整体行为的已经是 transport 层的“类滑动窗口”，而不是设备队列长度本身。
 
@@ -102,12 +113,12 @@
 
 1. 真正的 `SQ / RQ / CQ`
 2. `SEND` 所需的 `RQ` 资源模型
-3. bounded reorder window 的容量上限与 overflow 行为
-4. retransmission 更深地并入统一 scheduler
-5. 更真实的 receiver-side `RQ` 资源模型
-6. `sq_depth/rq_depth` 与 scheduler / backpressure 的更深绑定
-7. CQ 驱动发送推进
-8. 动态 RTO
+3. retransmission 更深地并入统一 scheduler
+4. 更真实的 receiver-side `RQ` 资源模型
+5. `sq_depth/rq_depth` 与 scheduler / backpressure 的更深绑定
+6. CQ 驱动发送推进
+7. 动态 RTO
+8. 事务完成统计与 transport 完整性的更严格绑定
 9. 更完整的累计 ACK / recovery 策略细化
 
 ## 6. 当前为什么还没看到理想的多 QP 数据 RR
