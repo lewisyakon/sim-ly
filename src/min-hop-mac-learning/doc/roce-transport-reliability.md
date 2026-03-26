@@ -17,8 +17,10 @@
 5. 超时后的 recovery 模式
 6. 统一的待发重传路径
 7. future packet 的接收侧重排缓冲与按序释放
-8. ACK 高优先级发送
-9. 自动 ACK timeout 基线推导
+8. bounded reorder window 与 overflow 行为
+9. ACK 高优先级发送
+10. ACK sideband cumulative feedback
+11. 自动 ACK timeout 基线推导
 
 这意味着当前版本已经不是“无窗口、无 ACK、无重传”的 stage 1 状态了。
 
@@ -120,12 +122,30 @@
 2. ACK 报文使用 `RoceOpcode::Ack`。
 3. 业务 `ACT` 仍然只是 3P 控制报文，不和 transport ACK 混用。
 4. 发送侧对 ACK 使用累计确认：`ackPsn` 及之前的 outstanding 都会被清掉。
+5. ACK 现在按 sideband cumulative feedback 处理，不再参与反向普通控制流的 `expectedRxPsn / reorder window` 状态机。
+6. ACK 包自己的 `psn` 只锚定当前累计确认点，不再消耗反向普通控制流的 `nextPsn`。
 
 关键函数：
 
 - `MaybeSendRoceAck_()`
 - `HandleRoceAck_()`
 - `TrackRoceOutstandingPacket_()`
+- `HandleRoceRxHeader_()`
+
+这一步是最近一次最关键的结构修复。
+
+之前的问题是：
+
+1. ACK 一边承担累计确认语义
+2. 一边又被当成“反向可靠有序 packet”
+3. 于是只要反向 `expectedRxPsn` 卡住，后面的 ACK 即使 `ackPsn` 已经很新，也会被挡在 reorder/overflow 逻辑前面
+
+现在改成：
+
+1. ACK 到达接收入口后，直接走 `HandleRoceAck_()`
+2. 不再调用 `OnRxHeader()` 去走反向普通 packet 的有序检查
+3. stale ACK 只会自然失效，不会再把 reverse transport 状态机带偏
+4. 真正需要按序交付的反向业务控制报文仍然是 `ACT`
 
 ### 2.5 ACK 高优先级
 
@@ -148,6 +168,37 @@
 - `FlowIo::IsHighPriorityControlPacket(...)`
 
 因此现在的 ACK 不再和普通 DATA 完全同级排队。
+
+### 2.5A external path 与下游 RRQ 阈值对齐
+
+文件：
+
+- `src/min-hop-mac-learning/model/flow-io.h`
+- `src/min-hop-mac-learning/model/flow-io.cc`
+
+这一步不是 ACK 逻辑本身，但它直接影响最近大窗口实验为什么还能保持无丢包。
+
+当前 external path 的 backpressure 现在看的是：
+
+1. 下游真实 `RRQ` 子队列长度
+2. 与 `drop_tail_queue_size` 相同的 `high/low watermark`
+
+而不是只看上游 `FlowIo` 自己的 ingress 长度。
+
+这一步修正以后，行为从：
+
+- “下游 `RRQ/P2P` 已经过阈值甚至开始 drop，但上游还没 pause”
+
+变成了：
+
+- “下游 `RRQ` 到阈值后，external path 立刻 pause，直到子队列回落到 low watermark 再恢复”
+
+这也是最近把 sender window 拉到很大时，系统还能保持：
+
+- `PFC` 很活跃
+- 但没有真实 `DROP`
+
+的重要原因。
 
 ### 2.6 定时器与重传
 
@@ -384,19 +435,21 @@
 
 这不是单一原因，更像下面几件事叠加：
 
-1. `transportWindowPackets=32` 已经变成主导性的发送 admission control
+1. `transportWindowPackets` 已经变成主导性的发送 admission control
 2. ACK 变成高优先后，窗口释放更快，不容易虚假 timeout
-3. oldest-unacked 单 timer 避免了定时器风暴
-4. future packet 不再直接扰乱业务层，累计 ACK 行为更稳定
-5. 当前这轮 workload 和 queue size 组合，可能已经落在“窗口主导、网络未到拥塞阈值”的区间里
+3. ACK sideband 化后，不再把反向有序控制流状态机带偏
+4. oldest-unacked 单 timer 避免了定时器风暴
+5. future packet 不再直接扰乱业务层，累计 ACK 行为更稳定
+6. external path 现在会在下游 RRQ 子队列达到阈值时提前 pause
+7. 当前这轮 workload 和 queue size 组合，已经更像“无损但高回压”的区间，而不是“自然进入 drop/retransmission”的区间
 
-因此现在看到“把队列从 `2000 -> 350 -> 200` 缩小，但仿真时间几乎不变，且没有明显丢包/重传”，一个很合理的解释就是：
+因此现在看到“把 sender window 提得很大，甚至接近一次性发送极限，依然没有明显丢包/重传，但总时间反而变长”，一个很合理的解释就是：
 
-- 当前 transport 层自己的窗口与 ACK 优先级，已经把发包速度卡在网络真正拥塞之前了。
+- 当前 transport 层自己的窗口、ACK sideband 化，以及 external path 基于 RRQ 阈值的 backpressure，已经把系统从“易错区”推到了“无丢包但高排队/高回压”的区间。
 
 这不说明网络队列配置完全不重要，而是说明：
 
-- 在你当前这组 workload 和参数下，**发送端的类滑动窗口更主导**。
+- 在你当前这组 workload 和参数下，**发送端注入强度与回压耦合更主导**。
 
 ## 5. bounded reorder window 设计收敛
 
@@ -518,11 +571,11 @@ psn >= expectedRxPsn + reorderWindowPackets
 
 还缺的主要是：
 
-1. bounded reorder window 的容量上限与 overflow 行为
-2. `SQ / RQ / CQ` 的完整语义
-3. 更真实的 receiver-side `RQ` 资源模型
-4. retransmission 更深地并入统一 scheduler
-5. 动态 RTO（例如 SRTT/RTTVAR）
+1. `SQ / RQ / CQ` 的完整语义
+2. 更真实的 receiver-side `RQ` 资源模型
+3. retransmission 更深地并入统一 scheduler
+4. 动态 RTO（例如 SRTT/RTTVAR）
+5. 事务完成统计与 transport 完整性的更严格绑定
 6. 更完整的累计 ACK / recovery 策略细化
 
 ## 7. 建议怎么读代码

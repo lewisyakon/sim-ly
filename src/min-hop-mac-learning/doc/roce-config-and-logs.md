@@ -216,6 +216,8 @@
 
 - 接收侧刚刚发出了一个 transport ACK。
 - 它是协议 ACK，不是业务 `ACT`。
+- 当前 ACK 的 `psn` 只作为调试锚点，等于当前累计确认点。
+- 它不再表示“反向普通控制流中的一个必须按序交付的数据包”。
 
 #### `[ROCE][ACK][RX]`
 
@@ -224,6 +226,7 @@
 - 发送侧收到了一个 transport ACK。
 - `ackPsn` 表示累计确认边界。
 - 这条日志出现时，发送侧会清掉 `ackPsn` 及之前的 outstanding，并尝试继续调度新的普通 packet。
+- 当前 ACK 接收不再依赖反向 `expectedRxPsn` 追平，因此不会再出现“ACK 明明已经累计到高位，却因为反向乱序窗口卡住而不生效”的情况。
 
 #### `[ROCE][RTX][TIMEOUT]`
 
@@ -235,7 +238,7 @@
 
 含义：
 
-- 接收侧发现某个 future packet 超出了当前 `reorder_window_packets`。
+- 接收侧发现某个非 ACK future packet 超出了当前 `reorder_window_packets`。
 - 这个 packet 不会进入 reorder buffer，也不会上送业务层。
 - 当前处理策略是：
   - 保持累计 ACK 在 `expectedRxPsn - 1`
@@ -343,6 +346,7 @@ TriggerSendTo_now declared now time = 500000000123456789 src=0 dst=1 tag=5 size=
 - `full`
   - 用于调试调度器、QP 和逐 slice 行为。
   - 也用于调试 transport ACK / timeout / retransmission。
+  - 也适合观察大 sender window 下是“无损但高回压”，还是已经进入真实 drop / retransmission 区间。
   - 当前阶段要验证多活跃 QP 的 RR，建议先用这个等级。
 
 - `basic`

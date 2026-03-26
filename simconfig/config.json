@@ -50,7 +50,7 @@
     "sq_depth": 1024,
     "rq_depth": 1024,
     "transport_ack_enable": true,
-    "transport_window_packets": 1500,
+    "transport_window_packets": 32,
     "reorder_window_packets": 4,
     "ack_timeout_mode": "auto",
     "ack_timeout_factor": 2.0,
