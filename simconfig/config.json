@@ -1,5 +1,5 @@
 {
-  "workloadpath": "simworkload/65536_workload.txt",
+  "workloadpath": "simworkload/16384_workload.txt",
   "thread": 1,
   "gpu_type": "A100",                
   "gpus_per_server": 4,
@@ -21,8 +21,8 @@
   },
 
   "mactable": {
-    "load_enable": false,
-    "dir": "mactable"
+    "load_enable": true,
+    "dir": "mactable/topo-fattree_k-16_subnet-2_subnetk-16_gpusper-16_nvsper-1"
   },
 
   "pfc": {
@@ -30,20 +30,20 @@
     "drop_tail_queue_num": "16",
     "high_watermark": 0.8,
     "low_watermark": 0.2,
-    "log_level": "full"
+    "log_level": "off"
   },
 
   "topology": {
     "model": "fattree",
-    "k": 32,
+    "k": 16,
     "subnet_model": 2,              
-    "subnet_k": 8,                             
+    "subnet_k": 16,                             
     "hostperleaf": 2,                            
     "switch_delay_ns_override": 100 
   },
 
   "roce": {
-    "enable": false,
+    "enable": true,
     "mode": "rc_3phase",
     "data_use_write": true,
     "sq_depth": 1024,
@@ -56,7 +56,7 @@
     "ack_timeout_ns": 50000,
     "max_retransmissions": 8,
     "ether_type": "0x9999",
-    "log_level": "full"
+    "log_level": "off"
   }
 
 }

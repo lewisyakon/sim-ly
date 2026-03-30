@@ -14,6 +14,7 @@
 #include "ns3/packet.h"
 #include "ns3/point-to-point-channel.h"
 #include "ns3/point-to-point-net-device.h"
+#include "ns3/PppRoundRobinQueue.h"
 #include "ns3/simulator.h"
 
 #ifdef NS3_MPI
@@ -232,11 +233,19 @@ PointToPointHelper::Install(Ptr<Node> a, Ptr<Node> b)
     devA->SetAddress(Mac48Address::Allocate());
     a->AddDevice(devA);
     Ptr<Queue<Packet>> queueA = m_queueFactory.Create<Queue<Packet>>();
+    if (auto rrqA = DynamicCast<PppRoundRobinQueue<Packet>>(queueA))
+    {
+        rrqA->SyncQueueBaseMaxSize();
+    }
     devA->SetQueue(queueA);
     Ptr<PointToPointNetDevice> devB = m_deviceFactory.Create<PointToPointNetDevice>();
     devB->SetAddress(Mac48Address::Allocate());
     b->AddDevice(devB);
     Ptr<Queue<Packet>> queueB = m_queueFactory.Create<Queue<Packet>>();
+    if (auto rrqB = DynamicCast<PppRoundRobinQueue<Packet>>(queueB))
+    {
+        rrqB->SyncQueueBaseMaxSize();
+    }
     devB->SetQueue(queueB);
     if (m_enableFlowControl)
     {

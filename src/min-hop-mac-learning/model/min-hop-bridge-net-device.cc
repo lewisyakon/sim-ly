@@ -1407,6 +1407,7 @@ MinHopBridgeNetDevice::AddBridgePort(Ptr<NetDevice> bridgePort)
     Ptr<PppRoundRobinQueue<Packet>> ingressQueue = CreateObject<PppRoundRobinQueue<Packet>>();
     ingressQueue->SetAttribute("NumQueues", UintegerValue(ingressNumQueues));
     ingressQueue->SetAttribute("MaxPacketsPerQueue", UintegerValue(ingressMaxPacketsPerQueue));
+    ingressQueue->SyncQueueBaseMaxSize();
     m_ingressQueues[bridgePort] = ingressQueue;
 
     auto localIngressIt = m_ingressQueues.find(nullptr);
@@ -1423,6 +1424,7 @@ MinHopBridgeNetDevice::AddBridgePort(Ptr<NetDevice> bridgePort)
         localIngressIt->second->SetAttribute("NumQueues", UintegerValue(ingressNumQueues));
         localIngressIt->second->SetAttribute("MaxPacketsPerQueue",
                                              UintegerValue(ingressMaxPacketsPerQueue));
+        localIngressIt->second->SyncQueueBaseMaxSize();
     }
 
     NS_LOG_DEBUG("RegisterProtocolHandler for " << bridgePort->GetInstanceTypeId().GetName());

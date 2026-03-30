@@ -42,6 +42,7 @@ public:
   uint32_t GetSubQueueLength(uint32_t qid) const;
   uint64_t GetSubQueueDropPackets(uint32_t qid) const;
   uint32_t GetQueueIndexByDst(Mac48Address dst);
+  void SyncQueueBaseMaxSize();
   void PauseSubQueue(uint32_t qid);
   void ResumeSubQueue(uint32_t qid);
   bool IsSubQueuePaused(uint32_t qid) const;
@@ -111,6 +112,16 @@ uint32_t
 PppRoundRobinQueue<Item>::GetMaxPacketsPerQueue() const
 {
     return m_maxPacketsPerQueue;
+}
+
+template <typename Item>
+void
+PppRoundRobinQueue<Item>::SyncQueueBaseMaxSize()
+{
+    // QueueBase::MaxSize is only metadata for generic readers. Keep it aligned
+    // with the configured RRQ sub-queue capacity, but do not refresh it on the
+    // hot enqueue path where it may observe transient non-empty states.
+    this->SetMaxSize(QueueSize(QueueSizeUnit::PACKETS, m_numQueues * m_maxPacketsPerQueue));
 }
 
 template <typename Item>
@@ -226,8 +237,7 @@ PppRoundRobinQueue<Item>::PppRoundRobinQueue ()
   m_queueSelector = CreateObject<UniformRandomVariable> ();
   m_subQueueDropPackets.assign(m_numQueues, 0);
   m_pausedSubQueues.assign(m_numQueues, false);
-  // Keep QueueBase max size aligned so generic users (e.g., NetDevice) can read capacity.
-  this->SetMaxSize(QueueSize(QueueSizeUnit::PACKETS, m_numQueues * m_maxPacketsPerQueue));
+  SyncQueueBaseMaxSize();
 }
 
 template <typename Item>
@@ -337,9 +347,6 @@ bool
 PppRoundRobinQueue<Item>::Enqueue(Ptr<Item> item)
 {
   NS_LOG_FUNCTION(this << item);
-
-  // Attributes can be changed after construction; refresh derived max size.
-  this->SetMaxSize(QueueSize(QueueSizeUnit::PACKETS, m_numQueues * m_maxPacketsPerQueue));
 
   if (m_subQueues.size () != m_numQueues)
     {

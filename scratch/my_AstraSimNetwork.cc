@@ -399,7 +399,7 @@ int main(int argc, char *argv[]) {
                                                    : user_param.network_conf;
   // Enable SendFlowClient logs before network/app construction so [ROCE][CFG]
   // emitted during SetRoceConfig is visible in simulation.log.
-  LogComponentEnable("SendFlowClient",LOG_LEVEL_INFO);
+  // LogComponentEnable("SendFlowClient",LOG_LEVEL_INFO);
   AsciiTraceHelper ascii;
   Ptr<OutputStreamWrapper> stream = ascii.CreateFileStream("simulation.log");
   std::streambuf* oldbuf = std::clog.rdbuf(stream->GetStream()->rdbuf());
@@ -441,9 +441,9 @@ int main(int argc, char *argv[]) {
   // LogComponentEnable("OnOffApplication", LOG_LEVEL_INFO);
   // LogComponentEnable("PacketSink", LOG_LEVEL_INFO);
   LogComponentEnable("GENERIC_SIMULATION", LOG_LEVEL_INFO);
-  LogComponentEnable("MinHopBridgeNetDevice", LOG_LEVEL_INFO);
-  LogComponentEnable("PointToPointNetDevice", LOG_LEVEL_INFO);
-  LogComponentEnable("PppRoundRobinQueue", LOG_LEVEL_INFO);
+  // LogComponentEnable("MinHopBridgeNetDevice", LOG_LEVEL_INFO);
+  // LogComponentEnable("PointToPointNetDevice", LOG_LEVEL_INFO);
+  // LogComponentEnable("PppRoundRobinQueue", LOG_LEVEL_INFO);
   // LogComponentEnable("HybridSimulatorImpl",LOG_LEVEL_INFO);
   // LogComponentEnable("MtpInterface",LOG_LEVEL_INFO);
   // LogComponentEnable("GrantedTimeWindowMpiInterface",LOG_LEVEL_INFO);
