@@ -32,6 +32,7 @@
   - recovery 模式
   - ACK 高优先级
   - 自动 ACK timeout 基线
+  - 主程序级 `network drained / last FLOW_TX_DONE` 时间观测
 
 当前还没有完成的部分：
 

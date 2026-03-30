@@ -21,6 +21,7 @@
 9. ACK 高优先级发送
 10. ACK sideband cumulative feedback
 11. 自动 ACK timeout 基线推导
+12. 主程序级 `network drained / last FLOW_TX_DONE` 时间观测
 
 这意味着当前版本已经不是“无窗口、无 ACK、无重传”的 stage 1 状态了。
 
@@ -199,6 +200,48 @@
 - 但没有真实 `DROP`
 
 的重要原因。
+
+### 2.5B 主程序收尾时间观测
+
+文件：
+
+- `src/min-hop-mac-learning/model/my_sendflowclient.h`
+- `src/min-hop-mac-learning/model/my_sendflowclient.cc`
+- `scratch/my_AstraSimNetwork.cc`
+
+最近加了一组显式时间戳，用来替代之前那个不可靠的“从 `Simulator::Run()` 结束时刻反推网络排空时间”的做法。
+
+当前做法是：
+
+1. `sendflowclient::realsend()` 更新最后一次网络发送活动时间。
+2. `sendflowclient::HandleRead()` 更新最后一次网络接收活动时间。
+3. `[FLOW][TX_DONE]` 额外更新最后一次业务完成时间。
+4. `my_AstraSimNetwork.cc` 在 `Run()` 返回后直接读取这两个显式时间戳，而不是再去看 LP / simulator 的尾时间。
+
+因此现在主程序会输出两条更可信的时间：
+
+- `[main] network drained`
+- `[main] last FLOW_TX_DONE`
+
+并且统一只给出：
+
+- `ns`
+- `us`
+- `ms`
+
+以及相对 workload `fire()` 起点的 `since_workload_start`。
+
+这组输出的目的不是替代 Astra-Sim 自己的：
+
+- `all passes finished at time: ...`
+
+而是把：
+
+1. workload/stream 完成
+2. 3P 事务完成
+3. 网络活动结束
+
+这三种时间口径拆开。
 
 ### 2.6 定时器与重传
 

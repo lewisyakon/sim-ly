@@ -93,6 +93,45 @@
 
 ## 3. 日志输出含义
 
+### 3.0 主程序收尾时间日志
+
+当前 `scratch/my_AstraSimNetwork.cc` 在 `Simulator::Run()` 返回后会额外输出两条主程序级时间：
+
+```text
+[main] network drained abs_time(ns)=... abs_time(us)=... abs_time(ms)=... since_workload_start(ns)=... since_workload_start(us)=... since_workload_start(ms)=...
+[main] last FLOW_TX_DONE abs_time(ns)=... abs_time(us)=... abs_time(ms)=... since_workload_start(ns)=... since_workload_start(us)=... since_workload_start(ms)=...
+```
+
+这两条和 Astra-Sim 终端里的：
+
+```text
+all passes finished at time: ...
+```
+
+不是一个口径。
+
+- `network drained`
+  - 不是 `Simulator::Run()` 的最终退出时刻。
+  - 当前定义为 `sendflowclient` 视角下最后一次真实网络活动时间。
+  - 它会在真实 `realsend()` 和 `HandleRead()` 上更新，因此更接近“网络侧最后一个包活动结束”的时刻。
+
+- `last FLOW_TX_DONE`
+  - 当前定义为最后一个 `[FLOW][TX_DONE]` 发生的时间。
+  - 它更接近业务事务全部闭环的时刻。
+
+- `since_workload_start`
+  - 统一以 Astra-Sim workload `fire()` 的时间作为零点。
+  - 当前默认对应 `warmupSeconds`，也就是常见配置里 `floadtime_s` 之后的业务开始时刻。
+
+因此后面看时间时，建议这么分：
+
+- Astra-Sim 的 `all passes finished`
+  - workload / stream 层口径
+- `[main] last FLOW_TX_DONE`
+  - 3P 事务层口径
+- `[main] network drained`
+  - 网络活动口径
+
 ### 3.1 配置与激活日志
 
 示例：

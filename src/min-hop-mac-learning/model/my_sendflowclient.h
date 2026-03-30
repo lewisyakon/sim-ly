@@ -34,6 +34,9 @@ class RoceThreePhaseFsm;
 class RoceSimHeader;
 class RoceTxScheduler;
 struct RoceTxSlice;
+
+uint64_t GetLastNetworkActivityTimeFs();
+uint64_t GetLastFlowTxDoneTimeFs();
 }
 
 
@@ -139,7 +142,9 @@ private:
   void ProcessThreePhasePayload_(Ptr<Packet> payload,
                                  const ThreePHeader& TPheader,
                                  const Address& from,
-                                 uint32_t formIndex);
+                                 uint32_t formIndex,
+                                 bool hasTransportFragmentId = false,
+                                 uint32_t transportFragmentId = 0);
   void ArmRoceRetransTimer_(const RoceQpKey& qpKey);
   void CancelRoceRetransTimer_(const RoceQpKey& qpKey);
   uint32_t GetRoceOutstandingCount_(const RoceQpKey& qpKey) const;
@@ -164,6 +169,8 @@ private:
   std::map<RoceFlowKey, uint64_t> m_dataPacketsExpected;
   // 当前已收到的 DATA 包数量
   std::map<RoceFlowKey, uint64_t> m_dataPacketsReceived;
+  // RoCE DATA 只统计第一次成功交付到 3P 的唯一 transport fragment。
+  std::map<RoceFlowKey, std::set<uint32_t>> m_deliveredDataFragmentIds;
 
 
   // 预期 ACT 包的总数
@@ -193,6 +200,8 @@ private:
     ThreePHeader tpHeader;
     Address from;
     uint32_t formIndex = 0;
+    bool hasTransportFragmentId = false;
+    uint32_t transportFragmentId = 0;
   };
 
   int reqlen,acklen;

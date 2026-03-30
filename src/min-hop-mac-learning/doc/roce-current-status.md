@@ -92,6 +92,24 @@
 3. 更大的 sender window 会提高注入强度，增加排队与 pause/resume 周期
 4. 因此系统现在更像是进入了“无丢包但更高排队/更高回压”的性能区间，而不是再次进入 correctness 失败区间
 
+另外，当前主程序收尾阶段已经新增两条时间观测：
+
+1. `[main] last FLOW_TX_DONE`
+2. `[main] network drained`
+
+这两条都同时输出到终端和 `simulation.log`，并且统一给出：
+
+- `abs_time(ns/us/ms)`
+- `since_workload_start(ns/us/ms)`
+
+这一步的目的，是把：
+
+- Astra-Sim workload 完成
+- 3P 事务完成
+- 网络活动结束
+
+这三类时间明确拆开，避免后续再把它们混成一个“总完成时间”。
+
 ## 4. 最近一轮现象的一个重要解释
 
 最近把队列长度从 `2000 -> 350 -> 200` 逐步缩小时，仍然没有明显看到新的丢包和重传。

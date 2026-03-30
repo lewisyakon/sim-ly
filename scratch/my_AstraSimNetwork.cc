@@ -27,6 +27,7 @@
 #include "ns3/network-module.h"
 #include "my_entry.h"
 #include <execinfo.h>
+#include <algorithm>
 #include <fstream>
 #include <iostream>
 #include <queue>
@@ -553,11 +554,40 @@ int main(int argc, char *argv[]) {
   Simulator::Run(); 
 
   uint64_t eventCount = Simulator::GetEventCount();
+  const uint64_t lastNetworkActivityTimeFs = GetLastNetworkActivityTimeFs();
+  const uint64_t lastFlowTxDoneTimeFs = GetLastFlowTxDoneTimeFs();
+  const uint64_t workloadStartTimeFs =
+      static_cast<uint64_t>(warmupSeconds) * 1000000000000000ULL;
+  auto emitMainMetric = [](const std::string& msg) {
+    NS_LOG_INFO(msg);
+    std::cout << msg << std::endl;
+  };
+  auto buildTimeMetric = [workloadStartTimeFs](const std::string& label, uint64_t absTimeFs) {
+    const uint64_t relativeTimeFs =
+        absTimeFs >= workloadStartTimeFs ? (absTimeFs - workloadStartTimeFs) : 0;
+    const double absTimeNs = static_cast<double>(absTimeFs) / 1e6;
+    const double absTimeUs = static_cast<double>(absTimeFs) / 1e9;
+    const double absTimeMs = static_cast<double>(absTimeFs) / 1e12;
+    const double relativeTimeNs = static_cast<double>(relativeTimeFs) / 1e6;
+    const double relativeTimeUs = static_cast<double>(relativeTimeFs) / 1e9;
+    const double relativeTimeMs = static_cast<double>(relativeTimeFs) / 1e12;
+    std::ostringstream oss;
+    oss << "[main] " << label
+        << " abs_time(ns)=" << absTimeNs
+        << " abs_time(us)=" << absTimeUs
+        << " abs_time(ms)=" << absTimeMs
+        << " since_workload_start(ns)=" << relativeTimeNs
+        << " since_workload_start(us)=" << relativeTimeUs
+        << " since_workload_start(ms)=" << relativeTimeMs;
+    return oss.str();
+  };
   // NS_LOG_INFO(" * * * total events : " << eventCount );
   // NS_LOG_INFO("[Rendezvous]: recv="<<totRendezvousRecv<<" send="<<totRendezvousSend);
 
-  uint64_t eventCounts[mx_sys], sendCounts[mx_sys];
   #ifdef NS3_MPI
+  uint64_t eventCounts[mx_sys], sendCounts[mx_sys];
+  uint64_t networkActivityTimes[mx_sys];
+  uint64_t flowTxDoneTimes[mx_sys];
   MPI_Gather(&eventCount,
           1,
           MPI_UNSIGNED_LONG_LONG,
@@ -574,10 +604,37 @@ int main(int argc, char *argv[]) {
           MPI_UNSIGNED_LONG_LONG,
           0,
           MpiInterface::GetCommunicator());
+  MPI_Gather(&lastNetworkActivityTimeFs,
+          1,
+          MPI_UNSIGNED_LONG_LONG,
+          networkActivityTimes,
+          1,
+          MPI_UNSIGNED_LONG_LONG,
+          0,
+          MpiInterface::GetCommunicator());
+  MPI_Gather(&lastFlowTxDoneTimeFs,
+          1,
+          MPI_UNSIGNED_LONG_LONG,
+          flowTxDoneTimes,
+          1,
+          MPI_UNSIGNED_LONG_LONG,
+          0,
+          MpiInterface::GetCommunicator());
 
   if(MpiInterface::GetSystemId() == 0){
     NS_LOG_INFO("[main] total send count="<<std::accumulate(sendCounts, sendCounts + conf::system, 0ULL));
     NS_LOG_INFO("[main] total events="<<std::accumulate(eventCounts, eventCounts + conf::system, 0ULL));
+    const uint64_t maxNetworkActivityTimeFs =
+        *std::max_element(networkActivityTimes, networkActivityTimes + conf::system);
+    const uint64_t maxFlowTxDoneTimeFs =
+        *std::max_element(flowTxDoneTimes, flowTxDoneTimes + conf::system);
+    emitMainMetric(buildTimeMetric("network drained", maxNetworkActivityTimeFs));
+    emitMainMetric(buildTimeMetric("last FLOW_TX_DONE", maxFlowTxDoneTimeFs));
+  }
+  #elif NS3_MTP
+  {
+    emitMainMetric(buildTimeMetric("network drained", lastNetworkActivityTimeFs));
+    emitMainMetric(buildTimeMetric("last FLOW_TX_DONE", lastFlowTxDoneTimeFs));
   }
   #endif
 

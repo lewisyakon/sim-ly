@@ -8,6 +8,7 @@
 #include "roce-tx-scheduler.h"
 #include "roce-three-phase-fsm.h"
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <sstream>
 #include <chrono>
@@ -20,6 +21,37 @@ NS_LOG_COMPONENT_DEFINE("SendFlowClient");
 namespace {
 
 constexpr uint16_t kRoceBthBytes = 12;
+std::atomic<uint64_t> g_lastNetworkActivityTimeFs{0};
+std::atomic<uint64_t> g_lastFlowTxDoneTimeFs{0};
+
+void
+UpdateMaxTimestamp(std::atomic<uint64_t>* target, uint64_t timeFs) {
+  if (target == nullptr) {
+    return;
+  }
+  uint64_t observed = target->load(std::memory_order_relaxed);
+  while (observed < timeFs &&
+         !target->compare_exchange_weak(observed,
+                                        timeFs,
+                                        std::memory_order_relaxed,
+                                        std::memory_order_relaxed)) {
+  }
+}
+
+void
+RecordLastNetworkActivity() {
+  UpdateMaxTimestamp(
+      &g_lastNetworkActivityTimeFs,
+      static_cast<uint64_t>(Simulator::Now().GetFemtoSeconds()));
+}
+
+void
+RecordLastFlowTxDone() {
+  const uint64_t nowFs =
+      static_cast<uint64_t>(Simulator::Now().GetFemtoSeconds());
+  UpdateMaxTimestamp(&g_lastNetworkActivityTimeFs, nowFs);
+  UpdateMaxTimestamp(&g_lastFlowTxDoneTimeFs, nowFs);
+}
 
 std::string
 ToLowerCopy(std::string v) {
@@ -145,6 +177,16 @@ EnsureQpReadyToSend(RoceQpEngine* engine, const RoceQpKey& key) {
 
 } // namespace
 
+uint64_t
+GetLastNetworkActivityTimeFs() {
+  return g_lastNetworkActivityTimeFs.load(std::memory_order_relaxed);
+}
+
+uint64_t
+GetLastFlowTxDoneTimeFs() {
+  return g_lastFlowTxDoneTimeFs.load(std::memory_order_relaxed);
+}
+
 
 // ---------- 客户端实现 ----------
 
@@ -180,6 +222,7 @@ void sendflowclient::HandleRead(Ptr<Socket> socket)
   Address from;
 
   while ((packet = socket->RecvFrom(from))) {
+    RecordLastNetworkActivity();
     Ptr<Packet> p = packet->Copy();
     ThreePHeader TPheader;
     HopCountHeader hopHeader;
@@ -228,7 +271,12 @@ void sendflowclient::HandleRead(Ptr<Socket> socket)
       if (bufferedForReorder) {
         const RoceQpKey qpKey{src, dst, roceHeader.GetQpn()};
         m_roceBufferedUpperPackets[qpKey][roceHeader.GetPsn()] =
-            BufferedRoceUpperPacket{p->Copy(), TPheader, from, formIndex};
+            BufferedRoceUpperPacket{p->Copy(),
+                                    TPheader,
+                                    from,
+                                    formIndex,
+                                    TPheader.GetState() == ThreePHeader::DATA,
+                                    roceHeader.GetPsn()};
         if (IsRoceFullLogEnabled(m_roceCfg)) {
           NS_LOG_INFO("[ROCE][RX][REORDER_BUFFER] node=" << GetNode()->GetId()
                       << " src=" << src
@@ -252,7 +300,12 @@ void sendflowclient::HandleRead(Ptr<Socket> socket)
     //                  << ", header datasize=" << datasize
     //                  << ", actual packet size=" << packet->GetSize());
 
-    ProcessThreePhasePayload_(p, TPheader, from, formIndex);
+    ProcessThreePhasePayload_(p,
+                              TPheader,
+                              from,
+                              formIndex,
+                              hasRoceHeader && TPheader.GetState() == ThreePHeader::DATA,
+                              hasRoceHeader ? roceHeader.GetPsn() : 0);
     if (hasRoceHeader) {
       const RoceQpKey qpKey{src, dst, roceHeader.GetQpn()};
       MaybeReleaseBufferedRocePackets_(qpKey);
@@ -264,7 +317,9 @@ void
 sendflowclient::ProcessThreePhasePayload_(Ptr<Packet> p,
                                           const ThreePHeader& TPheader,
                                           const Address& from,
-                                          uint32_t formIndex)
+                                          uint32_t formIndex,
+                                          bool hasTransportFragmentId,
+                                          uint32_t transportFragmentId)
 {
   const uint32_t tag = TPheader.GetTag();
   const uint32_t src = TPheader.GetSrc();
@@ -299,6 +354,23 @@ sendflowclient::ProcessThreePhasePayload_(Ptr<Packet> p,
     }
 
     if (m_dataPacketsExpected.count(flowKey)!=0) {
+        if (hasTransportFragmentId) {
+            const bool inserted =
+                m_deliveredDataFragmentIds[flowKey].insert(transportFragmentId).second;
+            if (!inserted) {
+                if (IsRoceFullLogEnabled(m_roceCfg)) {
+                    NS_LOG_INFO("[ROCE][RX][DUPLICATE_DATA_IGNORED] node=" << GetNode()->GetId()
+                                << " tag=" << tag
+                                << " src=" << src
+                                << " dst=" << dst
+                                << " fragmentPsn=" << transportFragmentId
+                                << " deliveredCount=" << m_dataPacketsReceived[flowKey]
+                                << "/" << m_dataPacketsExpected[flowKey]
+                                << " TIME=" << Simulator::Now().GetFemtoSeconds());
+                }
+                break;
+            }
+        }
         m_dataPacketsReceived[flowKey]++;
         if (m_dataPacketsReceived[flowKey] == m_dataPacketsExpected[flowKey]) {
             Address ackDest = from;
@@ -342,6 +414,7 @@ sendflowclient::ProcessThreePhasePayload_(Ptr<Packet> p,
 
             m_dataPacketsExpected.erase(flowKey);
             m_dataPacketsReceived.erase(flowKey);
+            m_deliveredDataFragmentIds.erase(flowKey);
         }
     } else {
         NS_LOG_WARN("{tag,src,dst}= " << tag<<"  "<<src<<" "<<dst << ": Received DATA packet without expected count setup.");
@@ -357,6 +430,7 @@ sendflowclient::ProcessThreePhasePayload_(Ptr<Packet> p,
         if (m_ackPacketsReceived[flowKey] == m_ackPacketsExpected[flowKey]) {
             if (m_sendfunctable.find(flowKey) != m_sendfunctable.end()) {
                 fuc_and_par fp = m_sendfunctable[flowKey];
+                RecordLastFlowTxDone();
                 NS_LOG_INFO("[FLOW][TX_DONE] {tag,src,dst}= "
                             << tag << " " << src << " " << dst
                             << " actPackets=" << m_ackPacketsReceived[flowKey]
@@ -414,7 +488,9 @@ sendflowclient::MaybeReleaseBufferedRocePackets_(const RoceQpKey& qpKey)
     ProcessThreePhasePayload_(it->second.payload->Copy(),
                               it->second.tpHeader,
                               it->second.from,
-                              it->second.formIndex);
+                              it->second.formIndex,
+                              it->second.hasTransportFragmentId,
+                              it->second.transportFragmentId);
     packets.erase(it);
   }
   if (packets.empty()) {
@@ -446,6 +522,7 @@ sendflowclient::TriggerSendTo_now(PacketSocketAddress dstadd,uint64_t datasize,u
 void
 sendflowclient::realsend(Ptr<Packet> packet,const Address& dest,FlowSendMode sendmodel,int mindex)
 {
+    RecordLastNetworkActivity();
     m_io->Send(dest,packet,sendmodel,mindex);
 }
 
