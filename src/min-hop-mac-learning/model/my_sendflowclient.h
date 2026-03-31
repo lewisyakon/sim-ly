@@ -61,6 +61,7 @@ public:
   void erase_recvhash(int tag,int src,int dst);
 
   void write_flowtag(int tag,int src,int dst,AstraSim::sim_request request);
+  void erase_flowtag(int tag,int src,int dst);
   AstraSim::sim_request get_flowtag(int tag,int src,int dst);
 
   uint64_t get_recvhash(int tag,int src,int dst);

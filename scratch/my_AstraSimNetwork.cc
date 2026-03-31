@@ -232,6 +232,7 @@ public:
         // #endif
         ehd->flowTag=clientHelper->get_flowtag(tag,src,rank).flowTag;
         t.msg_handler(t.fun_arg);
+        clientHelper->erase_flowtag(tag,src,rank);
         // NS_LOG_INFO("flowid= " << flow_id << " 接收确认 ");
         goto sim_recv_end_section;
       } else if (count > t.count) {

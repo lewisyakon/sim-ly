@@ -98,7 +98,7 @@ void (*msg_handler)(void *fun_arg), void *fun_arg, int tag, AstraSim::sim_reques
     // AstraSim::RecvPacketEventHadndlerData* ehd = (AstraSim::RecvPacketEventHadndlerData*) fun_arg;
     ehd->flowTag=request->flowTag;
     clientHelper->set_sendfunc(request->flowTag.tag_id,src,dst,{msg_handler,fun_arg});
-    clientHelper->write_flowtag(tag,src,dst,*request); 
+    clientHelper->write_flowtag(request->flowTag.tag_id,src,dst,*request); 
 
     
     

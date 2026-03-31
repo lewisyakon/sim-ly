@@ -159,7 +159,18 @@ void SendFlow(int src, int dst, uint64_t maxPacketCount,
     cs.ExitSection();
     #endif
   }
-  NcclLog->writeLog(NcclLogLevel::DEBUG,"waiting_to_notify_receiver  current_flow_id  %d src  %d dst  %d count  %d",request->flowTag.current_flow_id,src,dst,waiting_to_notify_receiver[std::make_pair(request->flowTag.tag_id,std::make_pair(src,dst))]);
+  const auto pendingNotifyKey =
+      std::make_pair(request->flowTag.current_flow_id, std::make_pair(src, dst));
+  const auto pendingNotifyIt = waiting_to_notify_receiver.find(pendingNotifyKey);
+  const int pendingNotifyCount =
+      (pendingNotifyIt == waiting_to_notify_receiver.end()) ? 0 : pendingNotifyIt->second;
+  NcclLog->writeLog(
+      NcclLogLevel::DEBUG,
+      "waiting_to_notify_receiver  current_flow_id  %d src  %d dst  %d count  %d",
+      request->flowTag.current_flow_id,
+      src,
+      dst,
+      pendingNotifyCount);
   }
 }
 
@@ -326,7 +337,21 @@ void qp_finish(FILE *fout, Ptr<RdmaQueuePair> q) {
       NcclLog->writeLog(NcclLogLevel::ERROR,"could not find the tag, there must be something wrong");
       exit(-1);
     }
-    flowTag = sender_src_port_map[make_pair(q->sport, make_pair(sid, did))];
+    const auto senderKey = make_pair(q->sport, make_pair(sid, did));
+    auto senderIt = sender_src_port_map.find(senderKey);
+    if (senderIt == sender_src_port_map.end()) {
+      NcclLog->writeLog(
+          NcclLogLevel::ERROR,
+          "send_finish missing sender_src_port_map entry sid %u did %u sport %u",
+          sid,
+          did,
+          q->sport);
+      #ifdef NS3_MTP
+      cs.ExitSection();
+      #endif
+      return;
+    }
+    flowTag = senderIt->second;
     sender_src_port_map.erase(make_pair(q->sport, make_pair(sid, did)));
     received_chunksize[std::make_pair(flowTag.current_flow_id,std::make_pair(sid,did))]+=q->m_size;
     if(!is_receive_finished(sid,did,flowTag)) {

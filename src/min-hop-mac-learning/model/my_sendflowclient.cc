@@ -370,6 +370,9 @@ sendflowclient::ProcessThreePhasePayload_(Ptr<Packet> p,
 
             m_ackPacketsExpected.erase(flowKey);
             m_ackPacketsReceived.erase(flowKey);
+            m_request.erase(flowKey);
+            m_recvfuncflag.erase(flowKey);
+            m_roceFlowToQpn.erase(flowKey);
         }
     } else {
         NS_LOG_WARN("{tag,src,dst}= " << tag<<"  "<<src<<" "<<dst << ": Received ACT packet without expected count setup.");
@@ -932,6 +935,13 @@ sendflowclient::HandleRoceRetransTimeout_(RoceQpKey qpKey) {
     }
     m_rocePendingRetransmissions.erase(qpKey);
     m_roceRecoveryTargetPsns.erase(qpKey);
+    // Flow abort cleanup: keep per-flow tables bounded even when transport gives up.
+    m_sendfunctable.erase(outstanding.flowKey);
+    m_ackPacketsExpected.erase(outstanding.flowKey);
+    m_ackPacketsReceived.erase(outstanding.flowKey);
+    m_request.erase(outstanding.flowKey);
+    m_recvfuncflag.erase(outstanding.flowKey);
+    m_roceFlowToQpn.erase(outstanding.flowKey);
     ScheduleRoceDispatch_();
     return;
   }
@@ -1221,8 +1231,9 @@ sendflowclient::set_sendfunc(int tag,int src,int dst,fuc_and_par fp){
 void
 sendflowclient::set_recvfunc(int tag,int src,int dst,fuc_and_par fp){
     const RoceFlowKey flowKey{static_cast<uint32_t>(tag), static_cast<uint32_t>(src), static_cast<uint32_t>(dst)};
-    if(m_recvfuncflag[flowKey] == 1){
-      m_recvfuncflag[flowKey] = 0;
+    auto flagIt = m_recvfuncflag.find(flowKey);
+    if (flagIt != m_recvfuncflag.end() && flagIt->second){
+      m_recvfuncflag.erase(flagIt);
 
       // NS_LOG_INFO("[RZV] CALLBACK fired tag="<<tag<<" src="<<src<<" dst="<<dst);
       
@@ -1258,9 +1269,23 @@ void
 sendflowclient::write_flowtag(int tag,int src,int dst,AstraSim::sim_request request){
     m_request[RoceFlowKey{static_cast<uint32_t>(tag), static_cast<uint32_t>(src), static_cast<uint32_t>(dst)}]=request;
 }
+void
+sendflowclient::erase_flowtag(int tag,int src,int dst){
+  m_request.erase(
+      RoceFlowKey{static_cast<uint32_t>(tag), static_cast<uint32_t>(src), static_cast<uint32_t>(dst)});
+}
 AstraSim::sim_request
 sendflowclient::get_flowtag(int tag,int src,int dst){
-  return m_request[RoceFlowKey{static_cast<uint32_t>(tag), static_cast<uint32_t>(src), static_cast<uint32_t>(dst)}];
+  const RoceFlowKey flowKey{
+      static_cast<uint32_t>(tag), static_cast<uint32_t>(src), static_cast<uint32_t>(dst)};
+  auto it = m_request.find(flowKey);
+  if (it == m_request.end()) {
+    NS_LOG_WARN("get_flowtag missing key tag=" << tag
+                << " src=" << src
+                << " dst=" << dst);
+    return AstraSim::sim_request{};
+  }
+  return it->second;
 }
 
 bool
