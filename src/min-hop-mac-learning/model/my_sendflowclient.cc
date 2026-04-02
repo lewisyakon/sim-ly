@@ -1570,6 +1570,46 @@ sendflowclient::IsRoceEnabled() const {
   return m_roceCfg.enable && m_roceMode != RoceMode::Legacy;
 }
 
+sendflowclient::RuntimeTableStats
+sendflowclient::GetRuntimeTableStats() const {
+  RuntimeTableStats stats;
+  stats.sendFuncEntries = m_sendfunctable.size();
+  stats.recvFuncEntries = m_recvfunctable.size();
+  stats.requestEntries = m_request.size();
+  stats.recvFuncFlagEntries = m_recvfuncflag.size();
+  stats.recvHashEntries = m_recvHash.size();
+  stats.dataExpectedEntries = m_dataPacketsExpected.size();
+  stats.dataReceivedEntries = m_dataPacketsReceived.size();
+  stats.ackExpectedEntries = m_ackPacketsExpected.size();
+  stats.ackReceivedEntries = m_ackPacketsReceived.size();
+  stats.allDataSizeEntries = m_alldatasize.size();
+  stats.roceFlowToQpnEntries = m_roceFlowToQpn.size();
+  stats.roceOutstandingQps = m_roceOutstandingPackets.size();
+  for (const auto& [_, packets] : m_roceOutstandingPackets) {
+    stats.roceOutstandingPackets += packets.size();
+  }
+  stats.roceRetransTimerQps = m_roceRetransTimers.size();
+  stats.roceBufferedQps = m_roceBufferedUpperPackets.size();
+  for (const auto& [_, buffered] : m_roceBufferedUpperPackets) {
+    stats.roceBufferedPackets += buffered.size();
+  }
+  stats.rocePendingRetransQps = m_rocePendingRetransmissions.size();
+  stats.roceRecoveryTargetQps = m_roceRecoveryTargetPsns.size();
+  if (m_roceTxScheduler != nullptr) {
+    stats.rocePendingWorkItems = m_roceTxScheduler->GetPendingWorkCount();
+  }
+  stats.totalTrackedEntries =
+      stats.sendFuncEntries + stats.recvFuncEntries + stats.requestEntries +
+      stats.recvFuncFlagEntries + stats.recvHashEntries +
+      stats.dataExpectedEntries + stats.dataReceivedEntries +
+      stats.ackExpectedEntries + stats.ackReceivedEntries +
+      stats.allDataSizeEntries + stats.roceFlowToQpnEntries +
+      stats.roceOutstandingPackets + stats.roceRetransTimerQps +
+      stats.roceBufferedPackets + stats.rocePendingRetransQps +
+      stats.roceRecoveryTargetQps + stats.rocePendingWorkItems;
+  return stats;
+}
+
 uint32_t
 sendflowclient::GetOrAllocRoceQpn_(uint32_t tag, uint32_t src, uint32_t dst) {
   const RoceFlowKey flowKey{tag, src, dst};

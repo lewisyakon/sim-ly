@@ -27,6 +27,7 @@
 #include "FlowTagHeader.h"
 #include "flow-io.h"
 #include "roce-sim-types.h"
+#include <cstdint>
 
 namespace ns3 {
 class RoceQpEngine;
@@ -48,6 +49,29 @@ struct fuc_and_par{
 class sendflowclient : public Application
 {
 public:
+  struct RuntimeTableStats {
+    uint64_t sendFuncEntries = 0;
+    uint64_t recvFuncEntries = 0;
+    uint64_t requestEntries = 0;
+    uint64_t recvFuncFlagEntries = 0;
+    uint64_t recvHashEntries = 0;
+    uint64_t dataExpectedEntries = 0;
+    uint64_t dataReceivedEntries = 0;
+    uint64_t ackExpectedEntries = 0;
+    uint64_t ackReceivedEntries = 0;
+    uint64_t allDataSizeEntries = 0;
+    uint64_t roceFlowToQpnEntries = 0;
+    uint64_t roceOutstandingQps = 0;
+    uint64_t roceOutstandingPackets = 0;
+    uint64_t roceRetransTimerQps = 0;
+    uint64_t roceBufferedQps = 0;
+    uint64_t roceBufferedPackets = 0;
+    uint64_t rocePendingRetransQps = 0;
+    uint64_t roceRecoveryTargetQps = 0;
+    uint64_t rocePendingWorkItems = 0;
+    uint64_t totalTrackedEntries = 0;
+  };
+
   sendflowclient();
   virtual ~sendflowclient();
 
@@ -74,6 +98,7 @@ public:
   void SetRoceMode(RoceMode mode);
   RoceMode GetRoceMode() const;
   bool IsRoceEnabled() const;
+  RuntimeTableStats GetRuntimeTableStats() const;
   
 private:
   virtual void StartApplication(void);

@@ -2207,6 +2207,7 @@ void Sys::handleEvent(void* arg) {
     AstraSim::SendPacketEventHandlerData* ehd = (AstraSim::SendPacketEventHandlerData*) arg;
     if(ehd->owner!=nullptr)
       ehd->owner->sendcallback(ehd);
+    delete ehd;
   }
 }
 

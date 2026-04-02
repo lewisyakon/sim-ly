@@ -29,6 +29,7 @@
 #include <execinfo.h>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <queue>
 #include <stdio.h>
 #include <string>
@@ -37,6 +38,8 @@
 #include <unistd.h>
 #include <vector>
 #include <chrono>
+#include <algorithm>
+#include <cstdint>
 #include <nlohmann/json.hpp>
 #ifdef NS3_MTP
 #include "ns3/mtp-module.h"
@@ -324,6 +327,256 @@ static std::string ResolvePpScheduleFromConfig(const std::string& config_path) {
   return "gpipe";
 }
 
+struct ProcessMemSnapshot {
+  uint64_t vmRssKb = 0;
+  uint64_t vmSizeKb = 0;
+  uint64_t vmHwmKb = 0;
+  uint64_t vmDataKb = 0;
+  bool valid = false;
+};
+
+struct MemWatchConfig {
+  bool enable = false;
+  double intervalSeconds = 100.0;
+  uint32_t maxSamples = 120;
+  uint32_t topNodes = 0;
+  std::vector<int> watchNodes{0};
+};
+
+struct MemWatchState {
+  MemWatchConfig cfg;
+  uint32_t sampleIndex = 0;
+  uint64_t lastEventCount = 0;
+  uint64_t lastVmRssKb = 0;
+  bool hasLast = false;
+};
+
+static bool ParseStatusValueKb(const std::string& line,
+                               const std::string& key,
+                               uint64_t* valueKb) {
+  if (valueKb == nullptr) {
+    return false;
+  }
+  if (line.rfind(key, 0) != 0) {
+    return false;
+  }
+  std::istringstream iss(line.substr(key.size()));
+  uint64_t value = 0;
+  if (!(iss >> value)) {
+    return false;
+  }
+  *valueKb = value;
+  return true;
+}
+
+static ProcessMemSnapshot ReadProcessMemSnapshot() {
+  ProcessMemSnapshot snapshot;
+  std::ifstream in("/proc/self/status");
+  if (!in.is_open()) {
+    return snapshot;
+  }
+
+  std::string line;
+  while (std::getline(in, line)) {
+    ParseStatusValueKb(line, "VmRSS:", &snapshot.vmRssKb);
+    ParseStatusValueKb(line, "VmSize:", &snapshot.vmSizeKb);
+    ParseStatusValueKb(line, "VmHWM:", &snapshot.vmHwmKb);
+    ParseStatusValueKb(line, "VmData:", &snapshot.vmDataKb);
+  }
+  snapshot.valid = true;
+  return snapshot;
+}
+
+static MemWatchConfig ResolveMemWatchConfigFromConfig(const std::string& config_path) {
+  MemWatchConfig cfg;
+  std::ifstream in(config_path);
+  if (!in.is_open()) {
+    return cfg;
+  }
+
+  nlohmann::json j;
+  try {
+    in >> j;
+  } catch (...) {
+    return cfg;
+  }
+  if (!j.contains("debug") || !j["debug"].is_object()) {
+    return cfg;
+  }
+
+  const auto& debug = j["debug"];
+  if (debug.contains("mem_log_enable") && debug["mem_log_enable"].is_boolean()) {
+    cfg.enable = debug["mem_log_enable"].get<bool>();
+  }
+  if (debug.contains("mem_log_interval_s") && debug["mem_log_interval_s"].is_number()) {
+    const double interval = debug["mem_log_interval_s"].get<double>();
+    if (interval > 0) {
+      cfg.intervalSeconds = interval;
+    }
+  }
+  if (debug.contains("mem_log_max_samples") && debug["mem_log_max_samples"].is_number_integer()) {
+    const int samples = debug["mem_log_max_samples"].get<int>();
+    if (samples > 0) {
+      cfg.maxSamples = static_cast<uint32_t>(samples);
+    }
+  }
+  if (debug.contains("mem_log_top_nodes") && debug["mem_log_top_nodes"].is_number_integer()) {
+    const int topNodes = debug["mem_log_top_nodes"].get<int>();
+    if (topNodes >= 0) {
+      cfg.topNodes = static_cast<uint32_t>(topNodes);
+    }
+  }
+  if (debug.contains("mem_log_nodes") && debug["mem_log_nodes"].is_array()) {
+    cfg.watchNodes.clear();
+    for (const auto& v : debug["mem_log_nodes"]) {
+      if (!v.is_number_integer()) {
+        continue;
+      }
+      const int nodeId = v.get<int>();
+      if (nodeId >= 0) {
+        cfg.watchNodes.push_back(nodeId);
+      }
+    }
+    std::sort(cfg.watchNodes.begin(), cfg.watchNodes.end());
+    cfg.watchNodes.erase(std::unique(cfg.watchNodes.begin(), cfg.watchNodes.end()),
+                         cfg.watchNodes.end());
+  }
+  return cfg;
+}
+
+static bool IsNodeOwnedByCurrentRank(int nodeId) {
+  auto nodeIt = nodetable.find(nodeId);
+  if (nodeIt == nodetable.end() || nodeIt->second == nullptr) {
+    return false;
+  }
+#ifdef NS3_MPI
+  return nodeIt->second->GetSystemId() == MpiInterface::GetSystemId();
+#else
+  return true;
+#endif
+}
+
+static void LogNodeMemWatchStats(
+    int nodeId,
+    const sendflowclient::RuntimeTableStats& stats,
+    const std::string& prefix = "[MemWatch][node]") {
+  std::ostringstream oss;
+  oss << prefix
+      << " node=" << nodeId
+      << " tracked=" << stats.totalTrackedEntries
+      << " sendCb=" << stats.sendFuncEntries
+      << " recvCb=" << stats.recvFuncEntries
+      << " req=" << stats.requestEntries
+      << " recvHash=" << stats.recvHashEntries
+      << " dataExp=" << stats.dataExpectedEntries
+      << " ackExp=" << stats.ackExpectedEntries
+      << " qpn=" << stats.roceFlowToQpnEntries
+      << " roceOutPkts=" << stats.roceOutstandingPackets
+      << " roceBufPkts=" << stats.roceBufferedPackets
+      << " rocePendingWork=" << stats.rocePendingWorkItems
+      << " roceRtxQps=" << stats.rocePendingRetransQps;
+  std::clog << oss.str() << '\n';
+}
+
+static void MaybeLogTopNodesByTrackedEntries(
+    const std::shared_ptr<MemWatchState>& state) {
+  if (state == nullptr || state->cfg.topNodes == 0) {
+    return;
+  }
+  struct RankedNode {
+    int nodeId = -1;
+    sendflowclient::RuntimeTableStats stats;
+  };
+
+  std::vector<RankedNode> ranked;
+  ranked.reserve(nodeapptable.size());
+  for (const auto& [nodeId, app] : nodeapptable) {
+    if (app == nullptr || !IsNodeOwnedByCurrentRank(nodeId)) {
+      continue;
+    }
+    sendflowclient::RuntimeTableStats stats = app->GetRuntimeTableStats();
+    if (stats.totalTrackedEntries == 0) {
+      continue;
+    }
+    ranked.push_back(RankedNode{nodeId, stats});
+  }
+  if (ranked.empty()) {
+    return;
+  }
+
+  std::sort(ranked.begin(),
+            ranked.end(),
+            [](const RankedNode& a, const RankedNode& b) {
+              return a.stats.totalTrackedEntries > b.stats.totalTrackedEntries;
+            });
+  const size_t maxCount = std::min(ranked.size(), static_cast<size_t>(state->cfg.topNodes));
+  for (size_t i = 0; i < maxCount; ++i) {
+    LogNodeMemWatchStats(
+        ranked[i].nodeId,
+        ranked[i].stats,
+        "[MemWatch][top" + std::to_string(i + 1) + "]");
+  }
+}
+
+static void EmitMemWatchSample(const std::shared_ptr<MemWatchState>& state,
+                               bool scheduleNext) {
+  if (state == nullptr || !state->cfg.enable) {
+    return;
+  }
+
+  state->sampleIndex++;
+  const uint64_t eventCount = Simulator::GetEventCount();
+  const ProcessMemSnapshot mem = ReadProcessMemSnapshot();
+
+  int64_t deltaEvents = 0;
+  int64_t deltaRssKb = 0;
+  if (state->hasLast) {
+    deltaEvents = static_cast<int64_t>(eventCount) -
+                  static_cast<int64_t>(state->lastEventCount);
+    deltaRssKb = static_cast<int64_t>(mem.vmRssKb) -
+                 static_cast<int64_t>(state->lastVmRssKb);
+  }
+  state->lastEventCount = eventCount;
+  state->lastVmRssKb = mem.vmRssKb;
+  state->hasLast = true;
+
+  std::clog << "[MemWatch][sample=" << state->sampleIndex << "]"
+            << " rank=" << conf::rank
+            << " simTime=" << Simulator::Now().GetSeconds() << "s"
+            << " eventCount=" << eventCount
+            << " dEvent=" << (deltaEvents >= 0 ? "+" : "") << deltaEvents
+            << " VmRSS=" << mem.vmRssKb << "kB"
+            << " dRSS=" << (deltaRssKb >= 0 ? "+" : "") << deltaRssKb << "kB"
+            << " VmSize=" << mem.vmSizeKb << "kB"
+            << " VmData=" << mem.vmDataKb << "kB"
+            << " VmHWM=" << mem.vmHwmKb << "kB"
+            << " procStatusOK=" << mem.valid
+            << '\n';
+
+  for (int nodeId : state->cfg.watchNodes) {
+    auto appIt = nodeapptable.find(nodeId);
+    if (appIt == nodeapptable.end() || appIt->second == nullptr ||
+        !IsNodeOwnedByCurrentRank(nodeId)) {
+      continue;
+    }
+    LogNodeMemWatchStats(nodeId, appIt->second->GetRuntimeTableStats());
+  }
+  MaybeLogTopNodesByTrackedEntries(state);
+
+  if (!scheduleNext) {
+    return;
+  }
+  if (state->sampleIndex >= state->cfg.maxSamples) {
+    std::clog << "[MemWatch] stop sampling: reached max samples="
+              << state->cfg.maxSamples << '\n';
+    return;
+  }
+  Simulator::Schedule(Seconds(state->cfg.intervalSeconds),
+                      &EmitMemWatchSample,
+                      state,
+                      true);
+}
+
 static int user_param_prase(int argc,char * argv[],struct user_param* user_param){
   int opt;
   while ((opt = getopt(argc,argv,"ht:w:g:s:n:c:"))!=-1){
@@ -398,6 +651,7 @@ int main(int argc, char *argv[]) {
   
   network_config = user_param.network_conf.empty() ? "simconfig/config.json"
                                                    : user_param.network_conf;
+  const MemWatchConfig memWatchCfg = ResolveMemWatchConfigFromConfig(network_config);
   // Enable SendFlowClient logs before network/app construction so [ROCE][CFG]
   // emitted during SetRoceConfig is visible in simulation.log.
   // LogComponentEnable("SendFlowClient",LOG_LEVEL_INFO);
@@ -545,6 +799,26 @@ int main(int argc, char *argv[]) {
     GetGlobalStart();
   });  
   #endif
+
+  std::shared_ptr<MemWatchState> memWatchState;
+  if (memWatchCfg.enable) {
+    memWatchState = std::make_shared<MemWatchState>();
+    memWatchState->cfg = memWatchCfg;
+    const double monitorStartSeconds =
+        std::max(0.0, static_cast<double>(warmupSeconds) - 1.0);
+    std::clog << "[MemWatch] enabled=1"
+              << " rank=" << conf::rank
+              << " startTime=" << monitorStartSeconds << "s"
+              << " interval=" << memWatchState->cfg.intervalSeconds << "s"
+              << " maxSamples=" << memWatchState->cfg.maxSamples
+              << " watchNodeCount=" << memWatchState->cfg.watchNodes.size()
+              << " topNodes=" << memWatchState->cfg.topNodes
+              << '\n';
+    ns3::Simulator::Schedule(ns3::Seconds(monitorStartSeconds),
+                             &EmitMemWatchSample,
+                             memWatchState,
+                             true);
+  }
   // ns3::Simulator::Schedule(ns3::Seconds(190), [nodes_num,systems](){
   //     printlearnstate();
   // });
@@ -552,6 +826,10 @@ int main(int argc, char *argv[]) {
   std::cout << "simulator run " << std::endl;
   Simulator::Stop(Seconds(2000000000));
   Simulator::Run(); 
+
+  if (memWatchState != nullptr && memWatchState->cfg.enable) {
+    EmitMemWatchSample(memWatchState, false);
+  }
 
   uint64_t eventCount = Simulator::GetEventCount();
   // NS_LOG_INFO(" * * * total events : " << eventCount );

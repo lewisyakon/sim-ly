@@ -57,6 +57,14 @@
     "max_retransmissions": 8,
     "ether_type": "0x9999",
     "log_level": "off"
+  },
+
+  "debug": {
+    "mem_log_enable": true,
+    "mem_log_interval_s": 200,
+    "mem_log_max_samples": 40,
+    "mem_log_nodes": [0, 1, 2, 3, 8192, 8193, 16384, 16385, 24576, 24577],
+    "mem_log_top_nodes": 2
   }
 
 }
