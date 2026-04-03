@@ -59,9 +59,46 @@ RoceTxScheduler::HasPendingWork() const {
   return m_pendingWorkCount != 0;
 }
 
+bool
+RoceTxScheduler::HasPendingWorkForQp(const RoceQpKey& qpKey) const {
+  auto it = m_workQueues.find(qpKey);
+  if (it == m_workQueues.end()) {
+    return false;
+  }
+  for (const auto& work : it->second) {
+    if (work.remainingBytes != 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 uint64_t
 RoceTxScheduler::GetPendingWorkCount() const {
   return m_pendingWorkCount;
+}
+
+void
+RoceTxScheduler::DropQp(const RoceQpKey& qpKey) {
+  auto it = m_workQueues.find(qpKey);
+  if (it != m_workQueues.end()) {
+    while (!it->second.empty()) {
+      it->second.pop_front();
+      if (m_pendingWorkCount != 0) {
+        --m_pendingWorkCount;
+      }
+    }
+    m_workQueues.erase(it);
+  }
+
+  auto dropFromActive = [&qpKey](std::deque<RoceQpKey>* active) {
+    if (active == nullptr) {
+      return;
+    }
+    active->erase(std::remove(active->begin(), active->end(), qpKey), active->end());
+  };
+  dropFromActive(&m_controlActiveQps);
+  dropFromActive(&m_dataActiveQps);
 }
 
 bool
@@ -102,6 +139,10 @@ RoceTxScheduler::PickFromClass_(RoceTxClass txClass,
     }
 
     DropEmptyFrontWork_(qpKey);
+    it = m_workQueues.find(qpKey);
+    if (it == m_workQueues.end()) {
+      continue;
+    }
     if (!QueueHasSendableWork_(it->second)) {
       continue;
     }
@@ -138,6 +179,8 @@ RoceTxScheduler::PickFromClass_(RoceTxClass txClass,
       }
       if (QueueHasSendableWork_(it->second)) {
         active.push_back(qpKey);
+      } else if (it->second.empty()) {
+        m_workQueues.erase(it);
       }
     } else {
       active.push_back(qpKey);
@@ -176,6 +219,9 @@ RoceTxScheduler::DropEmptyFrontWork_(const RoceQpKey& qpKey) {
     if (m_pendingWorkCount != 0) {
       --m_pendingWorkCount;
     }
+  }
+  if (it->second.empty()) {
+    m_workQueues.erase(it);
   }
 }
 

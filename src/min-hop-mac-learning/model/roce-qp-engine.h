@@ -50,6 +50,7 @@ public:
 
   uint32_t GetExpectedRxPsn(const RoceQpKey& key) const;
   uint32_t GetPendingRxCount(const RoceQpKey& key) const;
+  void EraseQp(const RoceQpKey& key);
 
   // Completion 队列接口。
   void NotifyTxCompletion(const RoceQpKey& key, uint32_t wrId, bool success);

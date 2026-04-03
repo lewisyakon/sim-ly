@@ -1,5 +1,5 @@
 {
-  "workloadpath": "simworkload/65536_workload.txt",
+  "workloadpath": "simworkload/8192_workload.txt",
   "thread": 1,
   "gpu_type": "A100",                
   "gpus_per_server": 4,
@@ -22,7 +22,7 @@
 
   "mactable": {
     "load_enable": true,
-    "dir": "mactable/topo-fattree_k-16_subnet-2_subnetk-16_gpusper-16_nvsper-1"
+    "dir": "mactable/topo-fattree_k-16_subnet-2_subnetk-8_gpusper-8_nvsper-1"
   },
 
   "pfc": {
@@ -35,7 +35,7 @@
 
   "topology": {
     "model": "fattree",
-    "k": 32,
+    "k": 16,
     "subnet_model": 2,              
     "subnet_k": 8,                             
     "hostperleaf": 2,                            
@@ -61,10 +61,10 @@
 
   "debug": {
     "mem_log_enable": true,
-    "mem_log_interval_s": 200,
-    "mem_log_max_samples": 40,
-    "mem_log_nodes": [0, 1, 2, 3, 8192, 8193, 16384, 16385, 24576, 24577],
-    "mem_log_top_nodes": 2
+    "mem_log_interval_s": 60,
+    "mem_log_max_samples": 120,
+    "mem_log_nodes": [0, 1, 2, 3, 8192, 8193, 9214, 9215],
+    "mem_log_top_nodes": 4
   }
 
 }

@@ -562,6 +562,7 @@ static void EmitMemWatchSample(const std::shared_ptr<MemWatchState>& state,
     LogNodeMemWatchStats(nodeId, appIt->second->GetRuntimeTableStats());
   }
   MaybeLogTopNodesByTrackedEntries(state);
+  std::clog.flush();
 
   if (!scheduleNext) {
     return;
@@ -569,6 +570,7 @@ static void EmitMemWatchSample(const std::shared_ptr<MemWatchState>& state,
   if (state->sampleIndex >= state->cfg.maxSamples) {
     std::clog << "[MemWatch] stop sampling: reached max samples="
               << state->cfg.maxSamples << '\n';
+    std::clog.flush();
     return;
   }
   Simulator::Schedule(Seconds(state->cfg.intervalSeconds),
@@ -658,6 +660,8 @@ int main(int argc, char *argv[]) {
   AsciiTraceHelper ascii;
   Ptr<OutputStreamWrapper> stream = ascii.CreateFileStream("simulation.log");
   std::streambuf* oldbuf = std::clog.rdbuf(stream->GetStream()->rdbuf());
+  const std::ios_base::fmtflags oldClogFlags = std::clog.flags();
+  std::clog << std::unitbuf;
 
   AstraSim::Workload::SetDefaultPPScheduleByString(
       ResolvePpScheduleFromConfig(network_config));
@@ -872,6 +876,12 @@ int main(int argc, char *argv[]) {
   #endif
 
   Simulator::Destroy();
+  for (auto*& injector : overlayInjectors) {
+    if (injector != nullptr) {
+      delete injector;
+      injector = nullptr;
+    }
+  }
   #ifdef NS3_MPI
   MpiInterface::Disable();
   #elif NS3_MTP
@@ -880,6 +890,7 @@ int main(int argc, char *argv[]) {
   #endif
   
   std::clog.flush();
+  std::clog.flags(oldClogFlags);
   std::clog.rdbuf(oldbuf);   // 恢复到原始 buffer（非常关键）
   stream = nullptr;          // 释放 OutputStreamWrapper（可选，确保先恢复再销毁）
   

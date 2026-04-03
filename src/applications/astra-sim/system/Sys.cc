@@ -114,6 +114,10 @@ Sys::~Sys() {
   #else
     exitSimLoop("Exiting");
   #endif
+  if (NI != nullptr) {
+    delete NI;
+    NI = nullptr;
+  }
 }
 
 Sys::Sys(

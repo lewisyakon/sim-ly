@@ -161,6 +161,7 @@ sendflowclient::sendflowclient()
 }
 sendflowclient::~sendflowclient()
 {
+  StopApplication();
 }
 
 void sendflowclient::StartApplication()
@@ -170,6 +171,45 @@ void sendflowclient::StartApplication()
 
 void sendflowclient::StopApplication()
 {
+  if (m_roceDispatchEvent.IsPending()) {
+    m_roceDispatchEvent.Cancel();
+  }
+  for (auto& [_, timerState] : m_roceRetransTimers) {
+    if (timerState.event.IsPending()) {
+      timerState.event.Cancel();
+    }
+  }
+  m_roceRetransTimers.clear();
+
+  if (m_io) {
+    m_io->Stop();
+  }
+
+  m_sendfunctable.clear();
+  m_recvfunctable.clear();
+  m_request.clear();
+  m_recvfuncflag.clear();
+  m_recvHash.clear();
+  m_dataPacketsExpected.clear();
+  m_dataPacketsReceived.clear();
+  m_ackPacketsExpected.clear();
+  m_ackPacketsReceived.clear();
+  m_alldatasize.clear();
+  m_roceFlowToQpn.clear();
+  m_roceOutstandingPackets.clear();
+  m_roceBufferedUpperPackets.clear();
+  m_rocePendingRetransmissions.clear();
+  m_roceRecoveryTargetPsns.clear();
+
+  if (m_roceTxScheduler) {
+    m_roceTxScheduler->Reset();
+  }
+  if (m_roceQpEngine) {
+    m_roceQpEngine->Reset();
+  }
+  if (m_roceFsm) {
+    m_roceFsm->Reset();
+  }
 }
 
 
@@ -342,6 +382,7 @@ sendflowclient::ProcessThreePhasePayload_(Ptr<Packet> p,
 
             m_dataPacketsExpected.erase(flowKey);
             m_dataPacketsReceived.erase(flowKey);
+            m_alldatasize.erase(flowKey);
         }
     } else {
         NS_LOG_WARN("{tag,src,dst}= " << tag<<"  "<<src<<" "<<dst << ": Received DATA packet without expected count setup.");
@@ -368,11 +409,8 @@ sendflowclient::ProcessThreePhasePayload_(Ptr<Packet> p,
                 NS_LOG_WARN("{tag,src,dst}= " << tag<<"  "<<src<<" "<<dst <<": (Sender) Callback not found for flowid.");
             }
 
-            m_ackPacketsExpected.erase(flowKey);
-            m_ackPacketsReceived.erase(flowKey);
-            m_request.erase(flowKey);
-            m_recvfuncflag.erase(flowKey);
-            m_roceFlowToQpn.erase(flowKey);
+            CleanupFlowRuntimeTables_(flowKey);
+            CleanupRoceQpRuntimeState_(flowKey);
         }
     } else {
         NS_LOG_WARN("{tag,src,dst}= " << tag<<"  "<<src<<" "<<dst << ": Received ACT packet without expected count setup.");
@@ -730,6 +768,12 @@ sendflowclient::FinalizeRoceSliceDispatch_(const RoceTxSlice& slice) {
                 << " TIME=" << Simulator::Now().GetFemtoSeconds());
     fp.msg_handler(fp.fun_arg);
     m_sendfunctable.erase(it);
+    return;
+  }
+
+  if (slice.state == ThreePHeader::ACT && !m_roceCfg.enableTransportAck) {
+    // 关闭 transport ACK 时，ACT 发完后不会再收到 ACK 回包；这里直接回收 QP 状态。
+    CleanupRoceQpRuntimeState_(slice.flowKey, &slice.qpKey);
   }
 }
 
@@ -860,6 +904,7 @@ sendflowclient::HandleRoceAck_(const RoceFlowKey& flowKey,
   const uint32_t oldestOutstandingBefore = mapIt->second.begin()->first;
   const uint32_t recoveryTargetBefore = GetRoceRecoveryTargetPsn_(qpKey);
   auto& packets = mapIt->second;
+  bool qpDrained = false;
   for (auto it = packets.begin(); it != packets.end();) {
     if (it->first > ackPsn) {
       ++it;
@@ -870,6 +915,7 @@ sendflowclient::HandleRoceAck_(const RoceFlowKey& flowKey,
   if (packets.empty()) {
     CancelRoceRetransTimer_(qpKey);
     m_roceOutstandingPackets.erase(mapIt);
+    qpDrained = true;
   } else {
     ArmRoceRetransTimer_(qpKey);
   }
@@ -896,6 +942,15 @@ sendflowclient::HandleRoceAck_(const RoceFlowKey& flowKey,
                 << " recoveryTargetBefore=" << recoveryTargetBefore
                 << " recoveryTargetAfter=" << GetRoceRecoveryTargetPsn_(qpKey)
                 << " TIME=" << Simulator::Now().GetFemtoSeconds());
+  }
+
+  if (qpDrained) {
+    const bool hasPendingSchedulerWork =
+        m_roceTxScheduler != nullptr &&
+        m_roceTxScheduler->HasPendingWorkForQp(qpKey);
+    if (!hasPendingSchedulerWork) {
+      CleanupRoceQpRuntimeState_(flowKey, &qpKey);
+    }
   }
   ScheduleRoceDispatch_();
 }
@@ -935,13 +990,9 @@ sendflowclient::HandleRoceRetransTimeout_(RoceQpKey qpKey) {
     }
     m_rocePendingRetransmissions.erase(qpKey);
     m_roceRecoveryTargetPsns.erase(qpKey);
-    // Flow abort cleanup: keep per-flow tables bounded even when transport gives up.
-    m_sendfunctable.erase(outstanding.flowKey);
-    m_ackPacketsExpected.erase(outstanding.flowKey);
-    m_ackPacketsReceived.erase(outstanding.flowKey);
-    m_request.erase(outstanding.flowKey);
-    m_recvfuncflag.erase(outstanding.flowKey);
-    m_roceFlowToQpn.erase(outstanding.flowKey);
+    // Flow abort cleanup: keep per-flow/QP tables bounded even when transport gives up.
+    CleanupFlowRuntimeTables_(outstanding.flowKey);
+    CleanupRoceQpRuntimeState_(outstanding.flowKey, &qpKey);
     ScheduleRoceDispatch_();
     return;
   }
@@ -1044,6 +1095,58 @@ sendflowclient::CollectBlockedRoceQps_() const {
     blocked.insert(qpKey);
   }
   return blocked;
+}
+
+void
+sendflowclient::CleanupFlowRuntimeTables_(const RoceFlowKey& flowKey) {
+  m_sendfunctable.erase(flowKey);
+  m_recvfunctable.erase(flowKey);
+  m_request.erase(flowKey);
+  m_recvfuncflag.erase(flowKey);
+  m_recvHash.erase(flowKey);
+  m_dataPacketsExpected.erase(flowKey);
+  m_dataPacketsReceived.erase(flowKey);
+  m_ackPacketsExpected.erase(flowKey);
+  m_ackPacketsReceived.erase(flowKey);
+  m_alldatasize.erase(flowKey);
+}
+
+void
+sendflowclient::CleanupRoceQpRuntimeState_(const RoceFlowKey& flowKey,
+                                           const RoceQpKey* qpHint) {
+  RoceQpKey qpKey;
+  bool hasQpKey = false;
+  if (qpHint != nullptr && qpHint->qpn != 0) {
+    qpKey = *qpHint;
+    hasQpKey = true;
+  } else {
+    auto qpnIt = m_roceFlowToQpn.find(flowKey);
+    if (qpnIt != m_roceFlowToQpn.end()) {
+      qpKey = RoceQpKey{flowKey.src, flowKey.dst, qpnIt->second};
+      hasQpKey = true;
+    }
+  }
+
+  m_roceFlowToQpn.erase(flowKey);
+  if (m_roceFsm != nullptr) {
+    m_roceFsm->ResetFlow(flowKey);
+  }
+
+  if (!hasQpKey) {
+    return;
+  }
+
+  CancelRoceRetransTimer_(qpKey);
+  m_roceOutstandingPackets.erase(qpKey);
+  m_roceBufferedUpperPackets.erase(qpKey);
+  m_rocePendingRetransmissions.erase(qpKey);
+  m_roceRecoveryTargetPsns.erase(qpKey);
+  if (m_roceTxScheduler != nullptr) {
+    m_roceTxScheduler->DropQp(qpKey);
+  }
+  if (m_roceQpEngine != nullptr) {
+    m_roceQpEngine->EraseQp(qpKey);
+  }
 }
 
 

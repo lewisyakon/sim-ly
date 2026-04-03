@@ -62,7 +62,9 @@ public:
 
   bool Enqueue(const RoceTxWorkItem& item);
   bool HasPendingWork() const;
+  bool HasPendingWorkForQp(const RoceQpKey& qpKey) const;
   uint64_t GetPendingWorkCount() const;
+  void DropQp(const RoceQpKey& qpKey);
 
   bool PickNextSlice(uint32_t maxSliceBytes,
                      const std::set<RoceQpKey>* blockedQps,

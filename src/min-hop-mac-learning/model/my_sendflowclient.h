@@ -175,6 +175,9 @@ private:
   std::set<RoceQpKey> CollectBlockedRoceQps_() const;
   uint32_t GetOrAllocRoceQpn_(uint32_t tag, uint32_t src, uint32_t dst);
   void RememberRoceQpn_(uint32_t tag, uint32_t src, uint32_t dst, uint32_t qpn);
+  void CleanupFlowRuntimeTables_(const RoceFlowKey& flowKey);
+  void CleanupRoceQpRuntimeState_(const RoceFlowKey& flowKey,
+                                  const RoceQpKey* qpHint = nullptr);
 
 
   std::map<RoceFlowKey, ns3::fuc_and_par> m_sendfunctable;  // key: flowid

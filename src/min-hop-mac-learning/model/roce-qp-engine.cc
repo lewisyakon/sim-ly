@@ -275,6 +275,11 @@ RoceQpEngine::GetPendingRxCount(const RoceQpKey& key) const {
 }
 
 void
+RoceQpEngine::EraseQp(const RoceQpKey& key) {
+  m_qps.erase(key);
+}
+
+void
 RoceQpEngine::NotifyTxCompletion(const RoceQpKey& key,
                                  uint32_t wrId,
                                  bool success) {
