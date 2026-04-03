@@ -279,6 +279,22 @@ RoceQpEngine::EraseQp(const RoceQpKey& key) {
   m_qps.erase(key);
 }
 
+RoceQpEngine::RuntimeStats
+RoceQpEngine::GetRuntimeStats() const {
+  RuntimeStats stats;
+  stats.qpCount = m_qps.size();
+  stats.completionCount = m_completions.size();
+  for (const auto& [_, ctx] : m_qps) {
+    stats.pendingRxPsnCount += ctx.pendingRxPsns.size();
+    stats.txPackets += ctx.txPackets;
+    stats.rxPackets += ctx.rxPackets;
+    stats.rxOutOfOrderPackets += ctx.rxOutOfOrderPackets;
+    stats.rxDuplicatePackets += ctx.rxDuplicatePackets;
+    stats.rxReorderOverflowPackets += ctx.rxReorderOverflowPackets;
+  }
+  return stats;
+}
+
 void
 RoceQpEngine::NotifyTxCompletion(const RoceQpKey& key,
                                  uint32_t wrId,

@@ -28,6 +28,7 @@
 #include "flow-io.h"
 #include "roce-sim-types.h"
 #include <cstdint>
+#include <deque>
 
 namespace ns3 {
 class RoceQpEngine;
@@ -69,6 +70,47 @@ public:
     uint64_t rocePendingRetransQps = 0;
     uint64_t roceRecoveryTargetQps = 0;
     uint64_t rocePendingWorkItems = 0;
+    uint64_t roceQpContextEntries = 0;
+    uint64_t rocePendingRxPsnEntries = 0;
+    uint64_t roceCompletionEntries = 0;
+    uint64_t roceQpTxPackets = 0;
+    uint64_t roceQpRxPackets = 0;
+    uint64_t roceQpRxOutOfOrderPackets = 0;
+    uint64_t roceQpRxDuplicatePackets = 0;
+    uint64_t roceQpRxReorderOverflowPackets = 0;
+    uint64_t roceFsmStateEntries = 0;
+    uint64_t roceFsmCompletedEntries = 0;
+    uint64_t flowIoTxBufferedPackets = 0;
+    uint64_t flowIoTxBufferedBytes = 0;
+    uint64_t flowIoExternalIngressPackets = 0;
+    uint64_t flowIoExternalIngressBytes = 0;
+    uint64_t flowIoExternalHoldPackets = 0;
+    uint64_t flowIoExternalHoldBytes = 0;
+    uint64_t flowIoTotalBufferedPackets = 0;
+    uint64_t flowIoTotalBufferedBytes = 0;
+    uint64_t flowIoTotalBufferedApproxBytes = 0;
+    uint64_t roceOutstandingPayloadBytes = 0;
+    uint64_t roceOutstandingApproxBytes = 0;
+    uint64_t roceBufferedUpperPayloadBytes = 0;
+    uint64_t roceBufferedUpperApproxBytes = 0;
+    uint64_t rocePendingRetransPayloadBytes = 0;
+    uint64_t rocePendingRetransApproxBytes = 0;
+    uint64_t queuePayloadBytes = 0;
+    uint64_t queueApproxBytes = 0;
+    uint64_t roceDispatchEventPending = 0;
+    uint64_t roceRetransTimerEventsPending = 0;
+    uint64_t rocePendingEvents = 0;
+    uint64_t flowIoDrainEventPending = 0;
+    uint64_t flowIoExternalDrainEventPending = 0;
+    uint64_t flowIoPendingEvents = 0;
+    uint64_t legacyPendingDataFlows = 0;
+    uint64_t legacyPendingDataPackets = 0;
+    uint64_t legacyPendingDataApproxBytes = 0;
+    uint64_t legacyDataDrainEventPending = 0;
+    uint64_t pendingEventCount = 0;
+    uint64_t rocePendingEventApproxBytes = 0;
+    uint64_t flowIoPendingEventApproxBytes = 0;
+    uint64_t pendingEventApproxBytes = 0;
     uint64_t totalTrackedEntries = 0;
   };
 
@@ -178,6 +220,16 @@ private:
   void CleanupFlowRuntimeTables_(const RoceFlowKey& flowKey);
   void CleanupRoceQpRuntimeState_(const RoceFlowKey& flowKey,
                                   const RoceQpKey* qpHint = nullptr);
+  void EnqueueLegacyDataFlow_(const Address& dest,
+                              uint64_t datasize,
+                              uint16_t payloadBudget,
+                              uint32_t tag,
+                              uint32_t src,
+                              uint32_t dst,
+                              FlowSendMode sendmodel,
+                              int mindex);
+  void ScheduleLegacyDataDrain_(bool immediate);
+  void DrainLegacyDataFlows_();
 
 
   std::map<RoceFlowKey, ns3::fuc_and_par> m_sendfunctable;  // key: flowid
@@ -224,6 +276,20 @@ private:
     uint32_t formIndex = 0;
   };
 
+  struct LegacyPendingDataFlow {
+    Address dest;
+    uint64_t totalBytes = 0;
+    uint64_t remainingBytes = 0;
+    uint64_t totalPackets = 0;
+    uint64_t packetIndex = 0;
+    uint16_t payloadBudget = 1;
+    uint32_t tag = 0;
+    uint32_t src = 0;
+    uint32_t dst = 0;
+    FlowSendMode sendMode = FlowSendMode::External;
+    int mindex = 0;
+  };
+
   int reqlen,acklen;
   uint32_t localbridgeindex;
   ns3::Ptr<ns3::FlowIo> m_io;
@@ -243,6 +309,9 @@ private:
   uint64_t m_nextRoceWorkId = 1;
   EventId m_roceDispatchEvent;
   bool m_roceActiveLogged = false;
+  std::deque<LegacyPendingDataFlow> m_legacyPendingDataFlows;
+  EventId m_legacyDataDrainEvent;
+  Time m_legacyDataRetryInterval = MicroSeconds(2);
 };
 
 

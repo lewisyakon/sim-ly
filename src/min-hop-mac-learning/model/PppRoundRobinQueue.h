@@ -40,6 +40,11 @@ public:
   uint32_t GetNumQueues() const;
   uint32_t GetMaxPacketsPerQueue() const;
   uint32_t GetSubQueueLength(uint32_t qid) const;
+  uint32_t GetPriorityQueueLength() const;
+  uint32_t GetSubQueueTotalLength() const;
+  uint64_t GetPriorityQueueBytes() const;
+  uint64_t GetSubQueueTotalBytes() const;
+  uint64_t GetTotalBufferedApproxBytes() const;
   uint64_t GetSubQueueDropPackets(uint32_t qid) const;
   uint32_t GetQueueIndexByDst(Mac48Address dst);
   void SyncQueueBaseMaxSize();
@@ -68,6 +73,8 @@ private:
   std::vector<bool> m_pausedSubQueues;
   std::deque<Ptr<Item>> m_priority_que;
   uint32_t m_currentTotalPackets;
+  uint64_t m_priorityBytes;
+  uint64_t m_subQueueBytes;
   uint64_t m_dropPackets;
   uint64_t m_dropBytes;
   bool m_lastDequeuedFromSubQueue;
@@ -133,6 +140,46 @@ PppRoundRobinQueue<Item>::GetSubQueueLength(uint32_t qid) const
         return 0;
     }
     return static_cast<uint32_t>(m_subQueues[qid].size());
+}
+
+template <typename Item>
+uint32_t
+PppRoundRobinQueue<Item>::GetPriorityQueueLength() const
+{
+    return static_cast<uint32_t>(m_priority_que.size());
+}
+
+template <typename Item>
+uint32_t
+PppRoundRobinQueue<Item>::GetSubQueueTotalLength() const
+{
+    uint32_t total = 0;
+    for (const auto& q : m_subQueues)
+    {
+        total += static_cast<uint32_t>(q.size());
+    }
+    return total;
+}
+
+template <typename Item>
+uint64_t
+PppRoundRobinQueue<Item>::GetPriorityQueueBytes() const
+{
+    return m_priorityBytes;
+}
+
+template <typename Item>
+uint64_t
+PppRoundRobinQueue<Item>::GetSubQueueTotalBytes() const
+{
+    return m_subQueueBytes;
+}
+
+template <typename Item>
+uint64_t
+PppRoundRobinQueue<Item>::GetTotalBufferedApproxBytes() const
+{
+    return m_priorityBytes + m_subQueueBytes;
 }
 
 template <typename Item>
@@ -223,6 +270,8 @@ PppRoundRobinQueue<Item>::PppRoundRobinQueue ()
   : Queue<Item>(),
     m_rrIndex (0),
     m_currentTotalPackets (0),
+    m_priorityBytes (0),
+    m_subQueueBytes (0),
     m_dropPackets(0),
     m_dropBytes(0),
     m_lastDequeuedFromSubQueue(false),
@@ -370,6 +419,7 @@ PppRoundRobinQueue<Item>::Enqueue(Ptr<Item> item)
   // Keep simulated flow protocols (0x9999 legacy, 0x8915 RoCEv1-like) on RR sub-queues.
   if (pppHeader.GetProtocol() != 0x9999 && pppHeader.GetProtocol() != 0x8915) {
     m_currentTotalPackets++;
+    m_priorityBytes += static_cast<uint64_t>(item->GetSize());
     m_priority_que.push_back(item);
     this->m_nPackets++;
     this->m_nBytes += item->GetSize();
@@ -386,6 +436,7 @@ PppRoundRobinQueue<Item>::Enqueue(Ptr<Item> item)
       TPheader.GetState()==ThreePHeader::ACT ||
       TPheader.GetState()==ThreePHeader::IDLE){
     m_currentTotalPackets++;
+    m_priorityBytes += static_cast<uint64_t>(item->GetSize());
     m_priority_que.push_back(item);
     this->m_nPackets++;
     this->m_nBytes += item->GetSize();
@@ -423,6 +474,7 @@ PppRoundRobinQueue<Item>::Enqueue(Ptr<Item> item)
 
   m_subQueues[idx].push_back (item);
   m_currentTotalPackets++;
+  m_subQueueBytes += static_cast<uint64_t>(item->GetSize());
   this->m_nPackets++;
   this->m_nBytes += item->GetSize();
   this->m_nTotalReceivedPackets++;
@@ -441,6 +493,14 @@ PppRoundRobinQueue<Item>::Dequeue()
     Ptr<Item> p=m_priority_que.front();
     m_priority_que.pop_front();
     m_currentTotalPackets--;
+    if (m_priorityBytes < static_cast<uint64_t>(p->GetSize()))
+      {
+        m_priorityBytes = 0;
+      }
+    else
+      {
+        m_priorityBytes -= static_cast<uint64_t>(p->GetSize());
+      }
     m_lastDequeuedFromSubQueue = false;
     if (this->m_nPackets.Get() == 0)
       {
@@ -475,6 +535,14 @@ PppRoundRobinQueue<Item>::Dequeue()
           Ptr<Item> p = m_subQueues[currentIdx].front ();
           m_subQueues[currentIdx].pop_front ();
           m_currentTotalPackets--;
+          if (m_subQueueBytes < static_cast<uint64_t>(p->GetSize()))
+            {
+              m_subQueueBytes = 0;
+            }
+          else
+            {
+              m_subQueueBytes -= static_cast<uint64_t>(p->GetSize());
+            }
           m_lastDequeuedFromSubQueue = true;
           m_lastDequeuedSubQueueId = currentIdx;
           if (this->m_nPackets.Get() == 0)

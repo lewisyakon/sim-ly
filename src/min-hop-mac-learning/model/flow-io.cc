@@ -37,6 +37,7 @@ struct FlowIoDropStats
 };
 
 FlowIoDropStats g_flowIoDropStats;
+constexpr uint64_t kApproxSchedulerEventBytes = 128;
 
 void
 PrintFlowIoDropSummary()
@@ -212,6 +213,10 @@ FlowIo::EnsureQueueState()
   {
     m_externalIngressPaused.assign(m_numTxQueues, false);
   }
+  if (m_externalIngressBackpressured.size() != m_numTxQueues)
+  {
+    m_externalIngressBackpressured.assign(m_numTxQueues, false);
+  }
   if (m_externalIngressRrIndex >= m_numTxQueues)
   {
     m_externalIngressRrIndex = 0;
@@ -286,6 +291,30 @@ FlowIo::ResumeTxQueue(uint32_t queueId)
   {
     ScheduleDrain();
   }
+}
+
+bool
+FlowIo::IsSendPathPaused(const Address& dest, FlowSendMode mode) const
+{
+  if (m_numTxQueues == 0)
+  {
+    return false;
+  }
+  const uint32_t qid = ClassifyQueueId(dest) % m_numTxQueues;
+
+  // External 路径的 pause 由 externalIngressPaused/hold 队列体现。
+  if (mode == FlowSendMode::External && m_bindMode != RxBindMode::BridgeOnly)
+  {
+    const bool ingressPaused =
+        qid < m_externalIngressPaused.size() && m_externalIngressPaused[qid];
+    const bool hasHeldPackets =
+        qid < m_externalHoldQueues.size() && !m_externalHoldQueues[qid].empty();
+    const bool backpressured =
+        qid < m_externalIngressBackpressured.size() && m_externalIngressBackpressured[qid];
+    return ingressPaused || hasHeldPackets || backpressured;
+  }
+
+  return qid < m_pausedTxQueues.size() && m_pausedTxQueues[qid];
 }
 
 void
@@ -364,6 +393,7 @@ FlowIo::Stop()
   m_externalIngressQueues.clear();
   m_externalHoldQueues.clear();
   m_externalIngressPaused.clear();
+  m_externalIngressBackpressured.clear();
 
   if (m_node)
   {
@@ -383,6 +413,65 @@ FlowIo::Stop()
   }
   m_socks.clear();
   m_sock2dev.clear();
+}
+
+FlowIo::DebugBufferStats
+FlowIo::GetDebugBufferStats() const
+{
+  DebugBufferStats stats;
+  for (const auto& item : m_txBuffer)
+  {
+    stats.txBufferedPackets++;
+    stats.txBufferedApproxBytes += sizeof(BufferedTx);
+    if (item.pkt)
+    {
+      const uint64_t payloadBytes = item.pkt->GetSize();
+      stats.txBufferedBytes += payloadBytes;
+      stats.txBufferedApproxBytes += payloadBytes;
+    }
+  }
+  for (const auto& q : m_externalIngressQueues)
+  {
+    for (const auto& item : q)
+    {
+      stats.externalIngressPackets++;
+      stats.externalIngressApproxBytes += sizeof(ExternalBufferedTx);
+      if (item.pkt)
+      {
+        const uint64_t payloadBytes = item.pkt->GetSize();
+        stats.externalIngressBytes += payloadBytes;
+        stats.externalIngressApproxBytes += payloadBytes;
+      }
+    }
+  }
+  for (const auto& q : m_externalHoldQueues)
+  {
+    for (const auto& item : q)
+    {
+      stats.externalHoldPackets++;
+      stats.externalHoldApproxBytes += sizeof(ExternalBufferedTx);
+      if (item.pkt)
+      {
+        const uint64_t payloadBytes = item.pkt->GetSize();
+        stats.externalHoldBytes += payloadBytes;
+        stats.externalHoldApproxBytes += payloadBytes;
+      }
+    }
+  }
+  stats.totalBufferedPackets = stats.txBufferedPackets +
+                               stats.externalIngressPackets +
+                               stats.externalHoldPackets;
+  stats.totalBufferedBytes = stats.txBufferedBytes +
+                             stats.externalIngressBytes +
+                             stats.externalHoldBytes;
+  stats.totalBufferedApproxBytes = stats.txBufferedApproxBytes +
+                                   stats.externalIngressApproxBytes +
+                                   stats.externalHoldApproxBytes;
+  stats.drainEventPending = m_drainEvent.IsPending() ? 1 : 0;
+  stats.externalIngressDrainEventPending = m_externalIngressDrainEvent.IsPending() ? 1 : 0;
+  stats.pendingEvents = stats.drainEventPending + stats.externalIngressDrainEventPending;
+  stats.pendingEventApproxBytes = stats.pendingEvents * kApproxSchedulerEventBytes;
+  return stats;
 }
 
 bool
@@ -621,6 +710,10 @@ FlowIo::RefreshExternalIngressPauseState(uint32_t queueId, bool anticipateEnqueu
   if (!m_externalIngressPaused[queueId] && ratio >= g_pfcHighWatermark)
   {
     m_externalIngressPaused[queueId] = true;
+    if (queueId < m_externalIngressBackpressured.size())
+    {
+      m_externalIngressBackpressured[queueId] = true;
+    }
     if (IsPfcFullLogEnabled())
     {
       NS_LOG_UNCOND("[PFC][THRESH][EXTERNAL][PAUSE] node="
@@ -634,6 +727,12 @@ FlowIo::RefreshExternalIngressPauseState(uint32_t queueId, bool anticipateEnqueu
   else if (m_externalIngressPaused[queueId] && ratio <= g_pfcLowWatermark)
   {
     m_externalIngressPaused[queueId] = false;
+    if (queueId < m_externalIngressBackpressured.size() &&
+        m_externalIngressQueues[queueId].empty() &&
+        m_externalHoldQueues[queueId].empty())
+    {
+      m_externalIngressBackpressured[queueId] = false;
+    }
     if (IsPfcFullLogEnabled())
     {
       NS_LOG_UNCOND("[PFC][THRESH][EXTERNAL][RESUME] node="
@@ -657,6 +756,10 @@ FlowIo::EnqueueExternalIngress(uint32_t queueId, const Address& dest, Ptr<Packet
 
   if (m_externalIngressQueues[qid].size() >= maxPerQueue)
   {
+    if (qid < m_externalIngressBackpressured.size())
+    {
+      m_externalIngressBackpressured[qid] = true;
+    }
     ++m_externalIngressDrops;
     m_externalIngressDropBytes += pkt->GetSize();
     static uint64_t sExternalIngressDropLogCount = 0;
@@ -677,6 +780,15 @@ FlowIo::EnqueueExternalIngress(uint32_t queueId, const Address& dest, Ptr<Packet
   }
 
   m_externalIngressQueues[qid].push_back({qid, dest, pkt->Copy()});
+  const double backlogRatio =
+      maxPerQueue > 0
+          ? static_cast<double>(m_externalIngressQueues[qid].size()) /
+                static_cast<double>(maxPerQueue)
+          : 0.0;
+  if (qid < m_externalIngressBackpressured.size() && backlogRatio >= g_pfcHighWatermark)
+  {
+    m_externalIngressBackpressured[qid] = true;
+  }
   (void)RefreshExternalIngressPauseState(qid, false);
 }
 
@@ -803,6 +915,10 @@ FlowIo::DrainExternalIngress()
     if (!SendOnDevice(m_outDev, item.dest, item.pkt))
     {
       blocked = true;
+      if (qid < m_externalIngressBackpressured.size())
+      {
+        m_externalIngressBackpressured[qid] = true;
+      }
       static uint64_t sExtBlockedLogCount = 0;
       if (sExtBlockedLogCount < 200 || (sExtBlockedLogCount % 10000) == 0)
       {
@@ -821,6 +937,13 @@ FlowIo::DrainExternalIngress()
     ++sent;
     (void)RefreshExternalIngressPauseState(qid, false);
     TryRefillExternalIngress(qid);
+    if (qid < m_externalIngressBackpressured.size() &&
+        !m_externalIngressPaused[qid] &&
+        m_externalIngressQueues[qid].empty() &&
+        m_externalHoldQueues[qid].empty())
+    {
+      m_externalIngressBackpressured[qid] = false;
+    }
     visited = 0;
   }
 

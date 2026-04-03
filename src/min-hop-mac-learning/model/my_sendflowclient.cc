@@ -20,6 +20,7 @@ NS_LOG_COMPONENT_DEFINE("SendFlowClient");
 namespace {
 
 constexpr uint16_t kRoceBthBytes = 12;
+constexpr uint64_t kApproxSchedulerEventBytes = 128;
 
 std::string
 ToLowerCopy(std::string v) {
@@ -174,6 +175,10 @@ void sendflowclient::StopApplication()
   if (m_roceDispatchEvent.IsPending()) {
     m_roceDispatchEvent.Cancel();
   }
+  if (m_legacyDataDrainEvent.IsPending()) {
+    m_legacyDataDrainEvent.Cancel();
+  }
+  m_legacyPendingDataFlows.clear();
   for (auto& [_, timerState] : m_roceRetransTimers) {
     if (timerState.event.IsPending()) {
       timerState.event.Cancel();
@@ -488,6 +493,125 @@ void
 sendflowclient::realsend(Ptr<Packet> packet,const Address& dest,FlowSendMode sendmodel,int mindex)
 {
     m_io->Send(dest,packet,sendmodel,mindex);
+}
+
+void
+sendflowclient::EnqueueLegacyDataFlow_(const Address& dest,
+                                       uint64_t datasize,
+                                       uint16_t payloadBudget,
+                                       uint32_t tag,
+                                       uint32_t src,
+                                       uint32_t dst,
+                                       FlowSendMode sendmodel,
+                                       int mindex) {
+  LegacyPendingDataFlow flow;
+  flow.dest = dest;
+  flow.totalBytes = datasize;
+  flow.remainingBytes = datasize;
+  flow.payloadBudget = std::max<uint16_t>(1, payloadBudget);
+  flow.totalPackets =
+      std::max<uint64_t>(1, (datasize + static_cast<uint64_t>(flow.payloadBudget) - 1) /
+                                static_cast<uint64_t>(flow.payloadBudget));
+  flow.packetIndex = 0;
+  flow.tag = tag;
+  flow.src = src;
+  flow.dst = dst;
+  flow.sendMode = sendmodel;
+  flow.mindex = mindex;
+
+  m_legacyPendingDataFlows.push_back(std::move(flow));
+  ScheduleLegacyDataDrain_(true);
+}
+
+void
+sendflowclient::ScheduleLegacyDataDrain_(bool immediate) {
+  if (m_legacyPendingDataFlows.empty()) {
+    return;
+  }
+
+  if (m_legacyDataDrainEvent.IsPending()) {
+    if (immediate) {
+      m_legacyDataDrainEvent.Cancel();
+      m_legacyDataDrainEvent =
+          Simulator::ScheduleNow(&sendflowclient::DrainLegacyDataFlows_, this);
+    }
+    return;
+  }
+
+  if (immediate) {
+    m_legacyDataDrainEvent =
+        Simulator::ScheduleNow(&sendflowclient::DrainLegacyDataFlows_, this);
+  } else {
+    m_legacyDataDrainEvent =
+        Simulator::Schedule(m_legacyDataRetryInterval,
+                            &sendflowclient::DrainLegacyDataFlows_,
+                            this);
+  }
+}
+
+void
+sendflowclient::DrainLegacyDataFlows_() {
+  if (m_legacyPendingDataFlows.empty()) {
+    return;
+  }
+
+  const auto SafePayloadBytes = [](int64_t rawBytes) -> uint16_t {
+    return rawBytes > 0 ? static_cast<uint16_t>(rawBytes) : 0;
+  };
+
+  const uint32_t roundBudget = static_cast<uint32_t>(m_legacyPendingDataFlows.size());
+  bool madeProgress = false;
+  for (uint32_t i = 0; i < roundBudget && !m_legacyPendingDataFlows.empty(); ++i) {
+    LegacyPendingDataFlow flow = std::move(m_legacyPendingDataFlows.front());
+    m_legacyPendingDataFlows.pop_front();
+
+    if (flow.packetIndex >= flow.totalPackets || flow.remainingBytes == 0) {
+      continue;
+    }
+
+    if (m_io != nullptr && m_io->IsSendPathPaused(flow.dest, flow.sendMode)) {
+      m_legacyPendingDataFlows.push_back(std::move(flow));
+      continue;
+    }
+
+    HopCountHeader hopHeader;
+    hopHeader.SetHopCount(0);
+    hopHeader.SetIsFlood(false);
+
+    ThreePHeader tpHeader;
+    tpHeader.SetState(ThreePHeader::DATA);
+    tpHeader.SetTag(flow.tag);
+    tpHeader.SetSrc(flow.src);
+    tpHeader.SetDst(flow.dst);
+    tpHeader.SetDataSize(flow.totalBytes);
+
+    FlowTagHeader flowTagHeader;
+    flowTagHeader.FromFlowTag(get_flowtag(flow.tag, flow.src, flow.dst).flowTag);
+    flowTagHeader.set_packetnum(flow.totalPackets);
+
+    const uint64_t wireBytes =
+        std::min<uint64_t>(flow.remainingBytes, static_cast<uint64_t>(flow.payloadBudget));
+    const uint16_t realPacketSize = SafePayloadBytes(
+        static_cast<int64_t>(wireBytes) - tpHeader.GetSerializedSize() -
+        hopHeader.GetSerializedSize() - flowTagHeader.GetSerializedSize());
+    Ptr<Packet> packet = Create<Packet>(realPacketSize);
+    packet->AddHeader(flowTagHeader);
+    packet->AddHeader(tpHeader);
+    packet->AddHeader(hopHeader);
+    realsend(packet, flow.dest, flow.sendMode, flow.mindex);
+    madeProgress = true;
+
+    flow.packetIndex += 1;
+    flow.remainingBytes =
+        (flow.remainingBytes > flow.payloadBudget) ? (flow.remainingBytes - flow.payloadBudget) : 0;
+    if (flow.packetIndex < flow.totalPackets && flow.remainingBytes > 0) {
+      m_legacyPendingDataFlows.push_back(std::move(flow));
+    }
+  }
+
+  if (!m_legacyPendingDataFlows.empty()) {
+    ScheduleLegacyDataDrain_(madeProgress);
+  }
 }
 
 void
@@ -970,6 +1094,25 @@ sendflowclient::HandleRoceRetransTimeout_(RoceQpKey qpKey) {
 
   RoceOutstandingPacket& outstanding = packetIt->second;
   const uint32_t psn = outstanding.psn;
+  if (m_io != nullptr && m_io->IsSendPathPaused(outstanding.dest, outstanding.sendMode)) {
+    if (IsRoceBasicLogEnabled(m_roceCfg)) {
+      NS_LOG_INFO("[ROCE][RTX][PAUSE_HOLD] tag=" << outstanding.flowKey.tag
+                  << " node=" << GetNode()->GetId()
+                  << " src=" << outstanding.flowKey.src
+                  << " dst=" << outstanding.flowKey.dst
+                  << " qpn=" << qpKey.qpn
+                  << " psn=" << psn
+                  << " retries=" << outstanding.retries
+                  << " outstandingCount=" << GetRoceOutstandingCount_(qpKey)
+                  << " oldestOutstanding=" << GetRoceOldestOutstandingPsn_(qpKey)
+                  << " recoveryTarget=" << GetRoceRecoveryTargetPsn_(qpKey)
+                  << " TIME=" << Simulator::Now().GetFemtoSeconds());
+    }
+    // pause 期间仅重臂超时，不累计 retry。
+    ArmRoceRetransTimer_(qpKey);
+    return;
+  }
+
   if (outstanding.retries >= m_roceCfg.maxRetransmissions) {
     NS_LOG_WARN("[ROCE][RTX][DROP] tag=" << outstanding.flowKey.tag
                 << " node=" << GetNode()->GetId()
@@ -1026,6 +1169,15 @@ sendflowclient::ArmRoceRetransTimer_(const RoceQpKey& qpKey) {
   }
 
   const uint32_t oldestPsn = outstandingIt->second.begin()->first;
+  auto timerIt = m_roceRetransTimers.find(qpKey);
+  if (timerIt != m_roceRetransTimers.end() &&
+      timerIt->second.event.IsPending() &&
+      timerIt->second.trackedPsn == oldestPsn) {
+    // 对同一 oldest PSN 保持已有定时器，避免每发一个新包都 cancel+reschedule，
+    // 在大规模场景下会显著放大调度事件数和内存占用。
+    return;
+  }
+
   auto& timerState = m_roceRetransTimers[qpKey];
   if (timerState.event.IsPending()) {
     timerState.event.Cancel();
@@ -1245,55 +1397,66 @@ sendflowclient::SendPacket(ThreePHeader::State state, const Address& dest, uint6
   }
   
   if (state==ThreePHeader::DATA){
+    // 发送前记录 ACT 等待状态；仅收到 ACT 才会回调并清理该 flow。
+    m_ackPacketsExpected[flowKey] = 1;
+    m_ackPacketsReceived[flowKey] = 0;
+
+    if (!IsRoceEnabled()) {
+      // Legacy 模式按背压逐包推进：被 FlowIo 标记为 pause/backpressure 时暂停造包，
+      // 等链路恢复后继续，避免在阻塞期间持续向 FlowIo 缓冲区灌包。
+      EnqueueLegacyDataFlow_(dest,
+                             datasize,
+                             payloadBudget,
+                             tag,
+                             src,
+                             dst,
+                             sendmodel,
+                             mindex);
+      return;
+    }
+
+    // RoCE 模式通常走 EnqueueRoceWork_，这里只保留兼容回退路径。
     uint64_t numPackets;
     if (datasize<payloadBudget) numPackets=1;
     else {
       if (datasize % payloadBudget==0) numPackets=datasize / payloadBudget;
       else numPackets = (datasize / payloadBudget) + 1;
     }
-    // m_ackPacketsExpected[{tag,{src,dst}}] = numPackets;
-    // 发送前记录act
-    m_ackPacketsExpected[flowKey] = 1;
-    m_ackPacketsReceived[flowKey] = 0; // 初始化 ACT 计数器
     FTHeader.FromFlowTag(get_flowtag(tag,src,dst).flowTag);
     FTHeader.set_packetnum(numPackets);
     TPheader.SetDataSize(datasize);
 
     uint64_t len = datasize;
     for (uint64_t i = 0; i < numPackets; ++i) {
-        uint16_t real_packet_size = 0;
-        if (len >= payloadBudget) {
-          real_packet_size = SafePayloadBytes(
-              static_cast<int64_t>(payloadBudget) - TPheader.GetSerializedSize() -
-              hopHeader.GetSerializedSize() - FTHeader.GetSerializedSize());
-          packet = Create<Packet>(real_packet_size);
-          
-        } 
-        else {
-          real_packet_size = SafePayloadBytes(
-              static_cast<int64_t>(len) - TPheader.GetSerializedSize() -
-              hopHeader.GetSerializedSize() - FTHeader.GetSerializedSize());
-          packet = Create<Packet>(real_packet_size);
-        }
-        RoceSimHeader roceHeader;
-        const bool hasRoceHeader =
-            BuildRoceTxHeader_(state,
-                               datasize,
-                               static_cast<uint32_t>(real_packet_size),
-                               tag,
-                               src,
-                               dst,
-                               &roceHeader);
-        packet->AddHeader(FTHeader);
-        if (hasRoceHeader) {
-          packet->AddHeader(roceHeader);
-        }
-        packet->AddHeader(TPheader);
-        packet->AddHeader(hopHeader);
-        
-        realsend(packet,dest,sendmodel,mindex);
-      
-        len = (len > payloadBudget) ? (len - payloadBudget) : 0;
+      uint16_t real_packet_size = 0;
+      if (len >= payloadBudget) {
+        real_packet_size = SafePayloadBytes(
+            static_cast<int64_t>(payloadBudget) - TPheader.GetSerializedSize() -
+            hopHeader.GetSerializedSize() - FTHeader.GetSerializedSize());
+        packet = Create<Packet>(real_packet_size);
+      } else {
+        real_packet_size = SafePayloadBytes(
+            static_cast<int64_t>(len) - TPheader.GetSerializedSize() -
+            hopHeader.GetSerializedSize() - FTHeader.GetSerializedSize());
+        packet = Create<Packet>(real_packet_size);
+      }
+      RoceSimHeader roceHeader;
+      const bool hasRoceHeader =
+          BuildRoceTxHeader_(state,
+                             datasize,
+                             static_cast<uint32_t>(real_packet_size),
+                             tag,
+                             src,
+                             dst,
+                             &roceHeader);
+      packet->AddHeader(FTHeader);
+      if (hasRoceHeader) {
+        packet->AddHeader(roceHeader);
+      }
+      packet->AddHeader(TPheader);
+      packet->AddHeader(hopHeader);
+      realsend(packet,dest,sendmodel,mindex);
+      len = (len > payloadBudget) ? (len - payloadBudget) : 0;
     }
   }
   if (state==ThreePHeader::ACT){
@@ -1688,19 +1851,105 @@ sendflowclient::GetRuntimeTableStats() const {
   stats.allDataSizeEntries = m_alldatasize.size();
   stats.roceFlowToQpnEntries = m_roceFlowToQpn.size();
   stats.roceOutstandingQps = m_roceOutstandingPackets.size();
-  for (const auto& [_, packets] : m_roceOutstandingPackets) {
+  for (const auto& [qpKey, packets] : m_roceOutstandingPackets) {
+    (void)qpKey;
     stats.roceOutstandingPackets += packets.size();
+    for (const auto& [psn, outstanding] : packets) {
+      (void)psn;
+      const uint64_t payloadBytes =
+          outstanding.packet ? static_cast<uint64_t>(outstanding.packet->GetSize()) : 0;
+      stats.roceOutstandingPayloadBytes += payloadBytes;
+      stats.roceOutstandingApproxBytes += payloadBytes + sizeof(RoceOutstandingPacket);
+    }
   }
   stats.roceRetransTimerQps = m_roceRetransTimers.size();
+  for (const auto& [_, timerState] : m_roceRetransTimers) {
+    if (timerState.event.IsPending()) {
+      stats.roceRetransTimerEventsPending++;
+    }
+  }
+  stats.roceDispatchEventPending = m_roceDispatchEvent.IsPending() ? 1 : 0;
+  stats.rocePendingEvents = stats.roceRetransTimerEventsPending +
+                            stats.roceDispatchEventPending;
+  stats.rocePendingEventApproxBytes =
+      stats.rocePendingEvents * kApproxSchedulerEventBytes;
   stats.roceBufferedQps = m_roceBufferedUpperPackets.size();
-  for (const auto& [_, buffered] : m_roceBufferedUpperPackets) {
+  for (const auto& [qpKey, buffered] : m_roceBufferedUpperPackets) {
+    (void)qpKey;
     stats.roceBufferedPackets += buffered.size();
+    for (const auto& [psn, upper] : buffered) {
+      (void)psn;
+      const uint64_t payloadBytes =
+          upper.payload ? static_cast<uint64_t>(upper.payload->GetSize()) : 0;
+      stats.roceBufferedUpperPayloadBytes += payloadBytes;
+      stats.roceBufferedUpperApproxBytes += payloadBytes + sizeof(BufferedRoceUpperPacket);
+    }
   }
   stats.rocePendingRetransQps = m_rocePendingRetransmissions.size();
+  for (const auto& [_, outstanding] : m_rocePendingRetransmissions) {
+    const uint64_t payloadBytes =
+        outstanding.packet ? static_cast<uint64_t>(outstanding.packet->GetSize()) : 0;
+    stats.rocePendingRetransPayloadBytes += payloadBytes;
+    stats.rocePendingRetransApproxBytes += payloadBytes + sizeof(RoceOutstandingPacket);
+  }
   stats.roceRecoveryTargetQps = m_roceRecoveryTargetPsns.size();
   if (m_roceTxScheduler != nullptr) {
     stats.rocePendingWorkItems = m_roceTxScheduler->GetPendingWorkCount();
   }
+  if (m_roceQpEngine != nullptr) {
+    const auto qpStats = m_roceQpEngine->GetRuntimeStats();
+    stats.roceQpContextEntries = qpStats.qpCount;
+    stats.rocePendingRxPsnEntries = qpStats.pendingRxPsnCount;
+    stats.roceCompletionEntries = qpStats.completionCount;
+    stats.roceQpTxPackets = qpStats.txPackets;
+    stats.roceQpRxPackets = qpStats.rxPackets;
+    stats.roceQpRxOutOfOrderPackets = qpStats.rxOutOfOrderPackets;
+    stats.roceQpRxDuplicatePackets = qpStats.rxDuplicatePackets;
+    stats.roceQpRxReorderOverflowPackets = qpStats.rxReorderOverflowPackets;
+  }
+  if (m_roceFsm != nullptr) {
+    const auto fsmStats = m_roceFsm->GetRuntimeStats();
+    stats.roceFsmStateEntries = fsmStats.stateCount;
+    stats.roceFsmCompletedEntries = fsmStats.completedCount;
+  }
+  if (m_io != nullptr) {
+    const auto ioStats = m_io->GetDebugBufferStats();
+    stats.flowIoTxBufferedPackets = ioStats.txBufferedPackets;
+    stats.flowIoTxBufferedBytes = ioStats.txBufferedBytes;
+    stats.flowIoExternalIngressPackets = ioStats.externalIngressPackets;
+    stats.flowIoExternalIngressBytes = ioStats.externalIngressBytes;
+    stats.flowIoExternalHoldPackets = ioStats.externalHoldPackets;
+    stats.flowIoExternalHoldBytes = ioStats.externalHoldBytes;
+    stats.flowIoTotalBufferedPackets = ioStats.totalBufferedPackets;
+    stats.flowIoTotalBufferedBytes = ioStats.totalBufferedBytes;
+    stats.flowIoTotalBufferedApproxBytes = ioStats.totalBufferedApproxBytes;
+    stats.flowIoDrainEventPending = ioStats.drainEventPending;
+    stats.flowIoExternalDrainEventPending = ioStats.externalIngressDrainEventPending;
+    stats.flowIoPendingEvents = ioStats.pendingEvents;
+    stats.flowIoPendingEventApproxBytes = ioStats.pendingEventApproxBytes;
+  }
+  stats.legacyPendingDataFlows = m_legacyPendingDataFlows.size();
+  for (const auto& flow : m_legacyPendingDataFlows) {
+    const uint64_t remainingPackets =
+        (flow.totalPackets > flow.packetIndex) ? (flow.totalPackets - flow.packetIndex) : 0;
+    stats.legacyPendingDataPackets += remainingPackets;
+    stats.legacyPendingDataApproxBytes += sizeof(LegacyPendingDataFlow);
+  }
+  stats.legacyDataDrainEventPending = m_legacyDataDrainEvent.IsPending() ? 1 : 0;
+  stats.queuePayloadBytes =
+      stats.roceOutstandingPayloadBytes + stats.roceBufferedUpperPayloadBytes +
+      stats.rocePendingRetransPayloadBytes + stats.flowIoTotalBufferedBytes;
+  stats.queueApproxBytes =
+      stats.roceOutstandingApproxBytes + stats.roceBufferedUpperApproxBytes +
+      stats.rocePendingRetransApproxBytes + stats.flowIoTotalBufferedApproxBytes +
+      stats.legacyPendingDataApproxBytes;
+  stats.pendingEventCount = stats.rocePendingEvents +
+                            stats.flowIoPendingEvents +
+                            stats.legacyDataDrainEventPending;
+  stats.pendingEventApproxBytes =
+      stats.rocePendingEventApproxBytes +
+      stats.flowIoPendingEventApproxBytes +
+      stats.legacyDataDrainEventPending * kApproxSchedulerEventBytes;
   stats.totalTrackedEntries =
       stats.sendFuncEntries + stats.recvFuncEntries + stats.requestEntries +
       stats.recvFuncFlagEntries + stats.recvHashEntries +
@@ -1709,7 +1958,11 @@ sendflowclient::GetRuntimeTableStats() const {
       stats.allDataSizeEntries + stats.roceFlowToQpnEntries +
       stats.roceOutstandingPackets + stats.roceRetransTimerQps +
       stats.roceBufferedPackets + stats.rocePendingRetransQps +
-      stats.roceRecoveryTargetQps + stats.rocePendingWorkItems;
+      stats.roceRecoveryTargetQps + stats.rocePendingWorkItems +
+      stats.roceQpContextEntries + stats.rocePendingRxPsnEntries +
+      stats.roceCompletionEntries + stats.roceFsmStateEntries +
+      stats.flowIoTotalBufferedPackets + stats.legacyPendingDataFlows +
+      stats.pendingEventCount;
   return stats;
 }
 

@@ -50,6 +50,28 @@ RoceThreePhaseFsm::IsCompleted(const RoceFlowKey& key) const {
   return GetState(key) == ThreePhaseState::Completed;
 }
 
+RoceThreePhaseFsm::RuntimeStats
+RoceThreePhaseFsm::GetRuntimeStats() const {
+  RuntimeStats stats;
+  stats.stateCount = m_states.size();
+  for (const auto& [_, state] : m_states) {
+    switch (state) {
+      case ThreePhaseState::RequestIssued:
+        stats.requestIssuedCount++;
+        break;
+      case ThreePhaseState::DataIssued:
+        stats.dataIssuedCount++;
+        break;
+      case ThreePhaseState::Completed:
+        stats.completedCount++;
+        break;
+      default:
+        break;
+    }
+  }
+  return stats;
+}
+
 bool
 RoceThreePhaseFsm::IsEnabled() const {
   return m_cfg.enable;

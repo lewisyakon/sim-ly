@@ -680,9 +680,9 @@ DumpBridgeMacTablesToDirectory(const std::string& dir)
         }
     }
 
-    NS_LOG_UNCOND("[MACTABLE][DUMP] dir=" << dir << " ok=" << ok
-                                          << " fail=" << fail
-                                          << " skip=" << skip);
+    NS_LOG_INFO("[MACTABLE][DUMP] dir=" << dir << " ok=" << ok
+                                        << " fail=" << fail
+                                        << " skip=" << skip);
     return fail == 0;
 }
 
@@ -692,7 +692,7 @@ LoadBridgeMacTablesFromDirectory(const std::string& dir)
     std::vector<Ptr<MinHopBridgeNetDevice>> bridges = CollectAllBridgeDevices();
     if (bridges.empty())
     {
-        NS_LOG_UNCOND("[MACTABLE][LOAD] no bridge devices found.");
+        NS_LOG_INFO("[MACTABLE][LOAD] no bridge devices found.");
         return false;
     }
 
@@ -710,7 +710,7 @@ LoadBridgeMacTablesFromDirectory(const std::string& dir)
         if (!PathExists(file))
         {
             ++fail;
-            NS_LOG_UNCOND("[MACTABLE][LOAD] missing file: " << file);
+            NS_LOG_INFO("[MACTABLE][LOAD] missing file: " << file);
             continue;
         }
         if (dev->readmactable(file))
@@ -723,9 +723,9 @@ LoadBridgeMacTablesFromDirectory(const std::string& dir)
         }
     }
 
-    NS_LOG_UNCOND("[MACTABLE][LOAD] dir=" << dir << " ok=" << ok
-                                          << " fail=" << fail
-                                          << " skip=" << skip);
+    NS_LOG_INFO("[MACTABLE][LOAD] dir=" << dir << " ok=" << ok
+                                        << " fail=" << fail
+                                        << " skip=" << skip);
     return ok > 0 && fail == 0;
 }
 

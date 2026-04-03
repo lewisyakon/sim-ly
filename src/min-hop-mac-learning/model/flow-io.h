@@ -36,6 +36,26 @@ enum class RxBindMode : uint8_t
 class FlowIo : public Object
 {
 public:
+  struct DebugBufferStats
+  {
+    uint64_t txBufferedPackets = 0;
+    uint64_t txBufferedBytes = 0;
+    uint64_t txBufferedApproxBytes = 0;
+    uint64_t externalIngressPackets = 0;
+    uint64_t externalIngressBytes = 0;
+    uint64_t externalIngressApproxBytes = 0;
+    uint64_t externalHoldPackets = 0;
+    uint64_t externalHoldBytes = 0;
+    uint64_t externalHoldApproxBytes = 0;
+    uint64_t totalBufferedPackets = 0;
+    uint64_t totalBufferedBytes = 0;
+    uint64_t totalBufferedApproxBytes = 0;
+    uint64_t drainEventPending = 0;
+    uint64_t externalIngressDrainEventPending = 0;
+    uint64_t pendingEvents = 0;
+    uint64_t pendingEventApproxBytes = 0;
+  };
+
   // 直接绑定原来的 HandleRead(Ptr<Socket>)
   using SocketRxCallback = Callback<void, Ptr<Socket>>;
 
@@ -60,6 +80,9 @@ public:
   void Start(const SocketRxCallback& cb); // 创建/绑定 sockets，直接设置 cb 为 recv callback
   void Stop();
 
+  // 调试统计：用于内存观测，返回 FlowIo 软件缓冲队列规模。
+  DebugBufferStats GetDebugBufferStats() const;
+
   // --- 发送 ---
   void Send(const Address& dest,
             Ptr<Packet> pkt,
@@ -67,6 +90,8 @@ public:
             uint32_t rxInDevIndexForLoopback = UINT32_MAX);
   void PauseTxQueue(uint32_t queueId);
   void ResumeTxQueue(uint32_t queueId);
+  // 查询某个发送路径当前是否被 pause 阻塞（用于上层重传策略判定）。
+  bool IsSendPathPaused(const Address& dest, FlowSendMode mode) const;
 
 private:
   struct BufferedTx
@@ -130,6 +155,9 @@ private:
   std::vector<std::deque<ExternalBufferedTx>> m_externalIngressQueues;
   std::vector<std::deque<ExternalBufferedTx>> m_externalHoldQueues;
   std::vector<bool> m_externalIngressPaused;
+  // Runtime backpressure bit set when external drain is blocked/overflowing.
+  // Upper layer can use IsSendPathPaused() to stop creating new packets.
+  std::vector<bool> m_externalIngressBackpressured;
   EventId m_externalIngressDrainEvent;
   uint32_t m_externalIngressRrIndex = 0;
   uint64_t m_externalIngressDrops = 0;

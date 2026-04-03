@@ -16,6 +16,17 @@ namespace ns3 {
 // - 接收侧校验、乱序跟踪并产出 completion
 class RoceQpEngine {
 public:
+  struct RuntimeStats {
+    uint64_t qpCount = 0;
+    uint64_t pendingRxPsnCount = 0;
+    uint64_t completionCount = 0;
+    uint64_t txPackets = 0;
+    uint64_t rxPackets = 0;
+    uint64_t rxOutOfOrderPackets = 0;
+    uint64_t rxDuplicatePackets = 0;
+    uint64_t rxReorderOverflowPackets = 0;
+  };
+
   RoceQpEngine() = default;
 
   // 注入配置并清理运行态。
@@ -51,6 +62,7 @@ public:
   uint32_t GetExpectedRxPsn(const RoceQpKey& key) const;
   uint32_t GetPendingRxCount(const RoceQpKey& key) const;
   void EraseQp(const RoceQpKey& key);
+  RuntimeStats GetRuntimeStats() const;
 
   // Completion 队列接口。
   void NotifyTxCompletion(const RoceQpKey& key, uint32_t wrId, bool success);

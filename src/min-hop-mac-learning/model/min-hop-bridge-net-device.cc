@@ -20,6 +20,7 @@
 #include <mutex>
 #include <iostream>
 #include <iomanip>
+#include <limits>
 
 namespace ns3
 {
@@ -1332,7 +1333,7 @@ std::vector<MinHopBridgeNetDevice::IngressQueueSnapshot>
 MinHopBridgeNetDevice::GetIngressQueueSnapshots() const
 {
     std::vector<IngressQueueSnapshot> snapshots;
-    snapshots.reserve(m_ports.size());
+    snapshots.reserve(m_ports.size() + 1);
 
     for (uint32_t portIndex = 0; portIndex < m_ports.size(); ++portIndex)
     {
@@ -1344,9 +1345,16 @@ MinHopBridgeNetDevice::GetIngressQueueSnapshots() const
         }
 
         IngressQueueSnapshot snapshot;
+        snapshot.isLocalInjectionQueue = false;
         snapshot.portIndex = portIndex;
         snapshot.portMac = Mac48Address::ConvertFrom(port->GetAddress());
         snapshot.maxPacketsPerQueue = qIt->second->GetMaxPacketsPerQueue();
+        snapshot.totalPackets = qIt->second->GetNPackets();
+        snapshot.priorityPackets = qIt->second->GetPriorityQueueLength();
+        snapshot.subQueuePackets = qIt->second->GetSubQueueTotalLength();
+        snapshot.priorityBytes = qIt->second->GetPriorityQueueBytes();
+        snapshot.subQueueBytes = qIt->second->GetSubQueueTotalBytes();
+        snapshot.approxBytes = snapshot.priorityBytes + snapshot.subQueueBytes;
         const uint32_t numQueues = qIt->second->GetNumQueues();
         snapshot.subQueueLengths.reserve(numQueues);
         snapshot.subQueueDropPackets.reserve(numQueues);
@@ -1357,6 +1365,31 @@ MinHopBridgeNetDevice::GetIngressQueueSnapshots() const
         }
 
         snapshots.push_back(snapshot);
+    }
+
+    auto localIt = m_ingressQueues.find(nullptr);
+    if (localIt != m_ingressQueues.end() && localIt->second)
+    {
+        IngressQueueSnapshot localSnapshot;
+        localSnapshot.isLocalInjectionQueue = true;
+        localSnapshot.portIndex = std::numeric_limits<uint32_t>::max();
+        localSnapshot.portMac = Mac48Address();
+        localSnapshot.maxPacketsPerQueue = localIt->second->GetMaxPacketsPerQueue();
+        localSnapshot.totalPackets = localIt->second->GetNPackets();
+        localSnapshot.priorityPackets = localIt->second->GetPriorityQueueLength();
+        localSnapshot.subQueuePackets = localIt->second->GetSubQueueTotalLength();
+        localSnapshot.priorityBytes = localIt->second->GetPriorityQueueBytes();
+        localSnapshot.subQueueBytes = localIt->second->GetSubQueueTotalBytes();
+        localSnapshot.approxBytes = localSnapshot.priorityBytes + localSnapshot.subQueueBytes;
+        const uint32_t numQueues = localIt->second->GetNumQueues();
+        localSnapshot.subQueueLengths.reserve(numQueues);
+        localSnapshot.subQueueDropPackets.reserve(numQueues);
+        for (uint32_t qid = 0; qid < numQueues; ++qid)
+        {
+            localSnapshot.subQueueLengths.push_back(localIt->second->GetSubQueueLength(qid));
+            localSnapshot.subQueueDropPackets.push_back(localIt->second->GetSubQueueDropPackets(qid));
+        }
+        snapshots.push_back(localSnapshot);
     }
 
     return snapshots;

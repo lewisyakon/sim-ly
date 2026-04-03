@@ -93,9 +93,16 @@ class MinHopBridgeNetDevice : public NetDevice
 
     struct IngressQueueSnapshot
     {
+        bool isLocalInjectionQueue = false;
         uint32_t portIndex;
         Mac48Address portMac;
         uint32_t maxPacketsPerQueue;
+        uint32_t totalPackets = 0;
+        uint32_t priorityPackets = 0;
+        uint32_t subQueuePackets = 0;
+        uint64_t priorityBytes = 0;
+        uint64_t subQueueBytes = 0;
+        uint64_t approxBytes = 0;
         std::vector<uint32_t> subQueueLengths;
         std::vector<uint64_t> subQueueDropPackets;
     };

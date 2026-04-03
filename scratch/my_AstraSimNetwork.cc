@@ -25,6 +25,10 @@
 #include "ns3/csma-module.h"
 #include "ns3/internet-module.h"
 #include "ns3/network-module.h"
+#include "ns3/node-list.h"
+#include "ns3/point-to-point-net-device.h"
+#include "ns3/min-hop-bridge-net-device.h"
+#include "ns3/PppRoundRobinQueue.h"
 #include "my_entry.h"
 #include <execinfo.h>
 #include <fstream>
@@ -35,10 +39,12 @@
 #include <string>
 #include <sstream>
 #include <thread>
+#include <atomic>
 #include <unistd.h>
 #include <vector>
 #include <chrono>
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <nlohmann/json.hpp>
 #ifdef NS3_MTP
@@ -332,15 +338,40 @@ struct ProcessMemSnapshot {
   uint64_t vmSizeKb = 0;
   uint64_t vmHwmKb = 0;
   uint64_t vmDataKb = 0;
+  uint64_t vmSwapKb = 0;
+  uint64_t rssAnonKb = 0;
+  uint64_t rssFileKb = 0;
+  uint64_t rssShmemKb = 0;
   bool valid = false;
 };
 
 struct MemWatchConfig {
   bool enable = false;
+  bool useWallClock = true;
   double intervalSeconds = 100.0;
   uint32_t maxSamples = 120;
   uint32_t topNodes = 0;
-  std::vector<int> watchNodes{0};
+  uint32_t nodeDetailEverySamples = 6;
+  std::vector<int> watchNodes;
+};
+
+struct QueueMemStats {
+  uint64_t p2pRrqDevices = 0;
+  uint64_t p2pRrqTotalPackets = 0;
+  uint64_t p2pRrqPriorityPackets = 0;
+  uint64_t p2pRrqSubQueuePackets = 0;
+  uint64_t p2pRrqPriorityBytes = 0;
+  uint64_t p2pRrqSubQueueBytes = 0;
+  uint64_t p2pRrqApproxBytes = 0;
+
+  uint64_t bridgeIngressQueues = 0;
+  uint64_t bridgeIngressLocalQueues = 0;
+  uint64_t bridgeIngressTotalPackets = 0;
+  uint64_t bridgeIngressPriorityPackets = 0;
+  uint64_t bridgeIngressSubQueuePackets = 0;
+  uint64_t bridgeIngressPriorityBytes = 0;
+  uint64_t bridgeIngressSubQueueBytes = 0;
+  uint64_t bridgeIngressApproxBytes = 0;
 };
 
 struct MemWatchState {
@@ -348,7 +379,20 @@ struct MemWatchState {
   uint32_t sampleIndex = 0;
   uint64_t lastEventCount = 0;
   uint64_t lastVmRssKb = 0;
+  uint64_t lastVmSwapKb = 0;
+  uint64_t lastTrackedEntries = 0;
+  sendflowclient::RuntimeTableStats lastAggStats;
+  QueueMemStats lastQueueStats;
+  bool hasLastAggStats = false;
+  bool hasLastQueueStats = false;
   bool hasLast = false;
+  std::atomic<bool> stopRequested{false};
+  std::atomic<bool> wallSampleScheduled{false};
+  std::atomic<bool> maxSamplesLogged{false};
+  std::atomic<bool> invalidContextLogged{false};
+  uint32_t wallEventContext = ns3::Simulator::NO_CONTEXT;
+  std::thread wallSamplerThread;
+  std::chrono::steady_clock::time_point wallStartTime;
 };
 
 static bool ParseStatusValueKb(const std::string& line,
@@ -382,9 +426,17 @@ static ProcessMemSnapshot ReadProcessMemSnapshot() {
     ParseStatusValueKb(line, "VmSize:", &snapshot.vmSizeKb);
     ParseStatusValueKb(line, "VmHWM:", &snapshot.vmHwmKb);
     ParseStatusValueKb(line, "VmData:", &snapshot.vmDataKb);
+    ParseStatusValueKb(line, "VmSwap:", &snapshot.vmSwapKb);
+    ParseStatusValueKb(line, "RssAnon:", &snapshot.rssAnonKb);
+    ParseStatusValueKb(line, "RssFile:", &snapshot.rssFileKb);
+    ParseStatusValueKb(line, "RssShmem:", &snapshot.rssShmemKb);
   }
   snapshot.valid = true;
   return snapshot;
+}
+
+static void MemWatchLog(const std::string& line) {
+  NS_LOG_UNCOND(line);
 }
 
 static MemWatchConfig ResolveMemWatchConfigFromConfig(const std::string& config_path) {
@@ -408,10 +460,33 @@ static MemWatchConfig ResolveMemWatchConfigFromConfig(const std::string& config_
   if (debug.contains("mem_log_enable") && debug["mem_log_enable"].is_boolean()) {
     cfg.enable = debug["mem_log_enable"].get<bool>();
   }
+  if (debug.contains("mem_log_time_mode") && debug["mem_log_time_mode"].is_string()) {
+    std::string mode = debug["mem_log_time_mode"].get<std::string>();
+    std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
+      return static_cast<char>(std::tolower(c));
+    });
+    if (mode == "sim") {
+      cfg.useWallClock = false;
+    } else if (mode == "wall") {
+      cfg.useWallClock = true;
+    }
+  }
   if (debug.contains("mem_log_interval_s") && debug["mem_log_interval_s"].is_number()) {
     const double interval = debug["mem_log_interval_s"].get<double>();
     if (interval > 0) {
       cfg.intervalSeconds = interval;
+    }
+  }
+  if (debug.contains("mem_log_interval_us") && debug["mem_log_interval_us"].is_number()) {
+    const double intervalUs = debug["mem_log_interval_us"].get<double>();
+    if (intervalUs > 0) {
+      cfg.intervalSeconds = intervalUs * 1e-6;
+    }
+  }
+  if (debug.contains("mem_log_interval_ns") && debug["mem_log_interval_ns"].is_number()) {
+    const double intervalNs = debug["mem_log_interval_ns"].get<double>();
+    if (intervalNs > 0) {
+      cfg.intervalSeconds = intervalNs * 1e-9;
     }
   }
   if (debug.contains("mem_log_max_samples") && debug["mem_log_max_samples"].is_number_integer()) {
@@ -424,6 +499,13 @@ static MemWatchConfig ResolveMemWatchConfigFromConfig(const std::string& config_
     const int topNodes = debug["mem_log_top_nodes"].get<int>();
     if (topNodes >= 0) {
       cfg.topNodes = static_cast<uint32_t>(topNodes);
+    }
+  }
+  if (debug.contains("mem_log_node_detail_every_samples") &&
+      debug["mem_log_node_detail_every_samples"].is_number_integer()) {
+    const int every = debug["mem_log_node_detail_every_samples"].get<int>();
+    if (every >= 0) {
+      cfg.nodeDetailEverySamples = static_cast<uint32_t>(every);
     }
   }
   if (debug.contains("mem_log_nodes") && debug["mem_log_nodes"].is_array()) {
@@ -456,29 +538,369 @@ static bool IsNodeOwnedByCurrentRank(int nodeId) {
 #endif
 }
 
+static uint32_t ResolveMemWatchEventContext(const MemWatchConfig& cfg) {
+  const uint32_t nNodes = ns3::NodeList::GetNNodes();
+  auto IsValidNodeId = [nNodes](int nodeId) -> bool {
+    return nodeId >= 0 && static_cast<uint32_t>(nodeId) < nNodes;
+  };
+
+  for (int nodeId : cfg.watchNodes) {
+    if (IsValidNodeId(nodeId) && IsNodeOwnedByCurrentRank(nodeId)) {
+      return static_cast<uint32_t>(nodeId);
+    }
+  }
+
+  for (const auto& [nodeId, app] : nodeapptable) {
+    if (app == nullptr) {
+      continue;
+    }
+    if (IsValidNodeId(nodeId) && IsNodeOwnedByCurrentRank(nodeId)) {
+      return static_cast<uint32_t>(nodeId);
+    }
+  }
+
+  if (nNodes > 0) {
+    return 0;
+  }
+  return ns3::Simulator::NO_CONTEXT;
+}
+
+static uint64_t BytesToKb(uint64_t bytes) {
+  return bytes / 1024;
+}
+
+static QueueMemStats CollectNodeQueueMemStats(int nodeId) {
+  QueueMemStats stats;
+  if (nodeId < 0 || static_cast<uint32_t>(nodeId) >= ns3::NodeList::GetNNodes()) {
+    return stats;
+  }
+  if (!IsNodeOwnedByCurrentRank(nodeId)) {
+    return stats;
+  }
+
+  Ptr<Node> node = ns3::NodeList::GetNode(static_cast<uint32_t>(nodeId));
+  if (node == nullptr) {
+    return stats;
+  }
+
+  for (uint32_t devIdx = 0; devIdx < node->GetNDevices(); ++devIdx) {
+    Ptr<NetDevice> dev = node->GetDevice(devIdx);
+
+    if (Ptr<PointToPointNetDevice> p2p = DynamicCast<PointToPointNetDevice>(dev)) {
+      Ptr<Queue<Packet>> queue = p2p->GetQueue();
+      if (queue != nullptr) {
+        Ptr<PppRoundRobinQueue<Packet>> rrq = DynamicCast<PppRoundRobinQueue<Packet>>(queue);
+        if (rrq != nullptr) {
+          const uint64_t priorityPkts = rrq->GetPriorityQueueLength();
+          const uint64_t subQueuePkts = rrq->GetSubQueueTotalLength();
+          const uint64_t priorityBytes = rrq->GetPriorityQueueBytes();
+          const uint64_t subQueueBytes = rrq->GetSubQueueTotalBytes();
+
+          stats.p2pRrqDevices += 1;
+          stats.p2pRrqTotalPackets += rrq->GetNPackets();
+          stats.p2pRrqPriorityPackets += priorityPkts;
+          stats.p2pRrqSubQueuePackets += subQueuePkts;
+          stats.p2pRrqPriorityBytes += priorityBytes;
+          stats.p2pRrqSubQueueBytes += subQueueBytes;
+          stats.p2pRrqApproxBytes += (priorityBytes + subQueueBytes);
+        }
+      }
+    }
+
+    if (Ptr<MinHopBridgeNetDevice> bridge = DynamicCast<MinHopBridgeNetDevice>(dev)) {
+      const auto snapshots = bridge->GetIngressQueueSnapshots();
+      for (const auto& snapshot : snapshots) {
+        stats.bridgeIngressQueues += 1;
+        if (snapshot.isLocalInjectionQueue) {
+          stats.bridgeIngressLocalQueues += 1;
+        }
+        stats.bridgeIngressTotalPackets += snapshot.totalPackets;
+        stats.bridgeIngressPriorityPackets += snapshot.priorityPackets;
+        stats.bridgeIngressSubQueuePackets += snapshot.subQueuePackets;
+        stats.bridgeIngressPriorityBytes += snapshot.priorityBytes;
+        stats.bridgeIngressSubQueueBytes += snapshot.subQueueBytes;
+        stats.bridgeIngressApproxBytes += snapshot.approxBytes;
+      }
+    }
+  }
+  return stats;
+}
+
+static QueueMemStats CollectAggregateQueueMemStats() {
+  QueueMemStats totals;
+  const uint32_t nNodes = ns3::NodeList::GetNNodes();
+  for (uint32_t nodeId = 0; nodeId < nNodes; ++nodeId) {
+    const QueueMemStats nodeStats = CollectNodeQueueMemStats(static_cast<int>(nodeId));
+    totals.p2pRrqDevices += nodeStats.p2pRrqDevices;
+    totals.p2pRrqTotalPackets += nodeStats.p2pRrqTotalPackets;
+    totals.p2pRrqPriorityPackets += nodeStats.p2pRrqPriorityPackets;
+    totals.p2pRrqSubQueuePackets += nodeStats.p2pRrqSubQueuePackets;
+    totals.p2pRrqPriorityBytes += nodeStats.p2pRrqPriorityBytes;
+    totals.p2pRrqSubQueueBytes += nodeStats.p2pRrqSubQueueBytes;
+    totals.p2pRrqApproxBytes += nodeStats.p2pRrqApproxBytes;
+
+    totals.bridgeIngressQueues += nodeStats.bridgeIngressQueues;
+    totals.bridgeIngressLocalQueues += nodeStats.bridgeIngressLocalQueues;
+    totals.bridgeIngressTotalPackets += nodeStats.bridgeIngressTotalPackets;
+    totals.bridgeIngressPriorityPackets += nodeStats.bridgeIngressPriorityPackets;
+    totals.bridgeIngressSubQueuePackets += nodeStats.bridgeIngressSubQueuePackets;
+    totals.bridgeIngressPriorityBytes += nodeStats.bridgeIngressPriorityBytes;
+    totals.bridgeIngressSubQueueBytes += nodeStats.bridgeIngressSubQueueBytes;
+    totals.bridgeIngressApproxBytes += nodeStats.bridgeIngressApproxBytes;
+  }
+  return totals;
+}
+
 static void LogNodeMemWatchStats(
     int nodeId,
     const sendflowclient::RuntimeTableStats& stats,
     const std::string& prefix = "[MemWatch][node]") {
+  const QueueMemStats queueStats = CollectNodeQueueMemStats(nodeId);
   std::ostringstream oss;
   oss << prefix
       << " node=" << nodeId
-      << " tracked=" << stats.totalTrackedEntries
-      << " sendCb=" << stats.sendFuncEntries
-      << " recvCb=" << stats.recvFuncEntries
-      << " req=" << stats.requestEntries
-      << " recvHash=" << stats.recvHashEntries
-      << " dataExp=" << stats.dataExpectedEntries
-      << " ackExp=" << stats.ackExpectedEntries
-      << " qpn=" << stats.roceFlowToQpnEntries
-      << " roceOutPkts=" << stats.roceOutstandingPackets
-      << " roceBufPkts=" << stats.roceBufferedPackets
-      << " rocePendingWork=" << stats.rocePendingWorkItems
-      << " roceRtxQps=" << stats.rocePendingRetransQps;
-  std::clog << oss.str() << '\n';
+      << " ioTotPkts=" << stats.flowIoTotalBufferedPackets
+      << " ioTxPkts=" << stats.flowIoTxBufferedPackets
+      << " ioExtIngressPkts=" << stats.flowIoExternalIngressPackets
+      << " ioExtHoldPkts=" << stats.flowIoExternalHoldPackets
+      << " ioTotBytes=" << stats.flowIoTotalBufferedBytes
+      << " ioApproxKB=" << BytesToKb(stats.flowIoTotalBufferedApproxBytes)
+      << " ioEvt=" << stats.flowIoPendingEvents
+      << " p2pRrqDev=" << queueStats.p2pRrqDevices
+      << " p2pRrqPkts=" << queueStats.p2pRrqTotalPackets
+      << " p2pRrqPriPkts=" << queueStats.p2pRrqPriorityPackets
+      << " p2pRrqSubPkts=" << queueStats.p2pRrqSubQueuePackets
+      << " p2pRrqPriKB=" << BytesToKb(queueStats.p2pRrqPriorityBytes)
+      << " p2pRrqSubKB=" << BytesToKb(queueStats.p2pRrqSubQueueBytes)
+      << " p2pRrqApproxKB=" << BytesToKb(queueStats.p2pRrqApproxBytes)
+      << " brInQ=" << queueStats.bridgeIngressQueues
+      << " brInLocalQ=" << queueStats.bridgeIngressLocalQueues
+      << " brInPkts=" << queueStats.bridgeIngressTotalPackets
+      << " brInPriPkts=" << queueStats.bridgeIngressPriorityPackets
+      << " brInSubPkts=" << queueStats.bridgeIngressSubQueuePackets
+      << " brInPriKB=" << BytesToKb(queueStats.bridgeIngressPriorityBytes)
+      << " brInSubKB=" << BytesToKb(queueStats.bridgeIngressSubQueueBytes)
+      << " brInApproxKB=" << BytesToKb(queueStats.bridgeIngressApproxBytes);
+  MemWatchLog(oss.str());
 }
 
-static void MaybeLogTopNodesByTrackedEntries(
+static sendflowclient::RuntimeTableStats CollectAggregateRuntimeTableStats() {
+  sendflowclient::RuntimeTableStats totals;
+  for (const auto& [nodeId, app] : nodeapptable) {
+    if (app == nullptr || !IsNodeOwnedByCurrentRank(nodeId)) {
+      continue;
+    }
+    const sendflowclient::RuntimeTableStats stats = app->GetRuntimeTableStats();
+    totals.sendFuncEntries += stats.sendFuncEntries;
+    totals.recvFuncEntries += stats.recvFuncEntries;
+    totals.requestEntries += stats.requestEntries;
+    totals.recvFuncFlagEntries += stats.recvFuncFlagEntries;
+    totals.recvHashEntries += stats.recvHashEntries;
+    totals.dataExpectedEntries += stats.dataExpectedEntries;
+    totals.dataReceivedEntries += stats.dataReceivedEntries;
+    totals.ackExpectedEntries += stats.ackExpectedEntries;
+    totals.ackReceivedEntries += stats.ackReceivedEntries;
+    totals.allDataSizeEntries += stats.allDataSizeEntries;
+    totals.roceFlowToQpnEntries += stats.roceFlowToQpnEntries;
+    totals.roceOutstandingQps += stats.roceOutstandingQps;
+    totals.roceOutstandingPackets += stats.roceOutstandingPackets;
+    totals.roceRetransTimerQps += stats.roceRetransTimerQps;
+    totals.roceBufferedQps += stats.roceBufferedQps;
+    totals.roceBufferedPackets += stats.roceBufferedPackets;
+    totals.rocePendingRetransQps += stats.rocePendingRetransQps;
+    totals.roceRecoveryTargetQps += stats.roceRecoveryTargetQps;
+    totals.rocePendingWorkItems += stats.rocePendingWorkItems;
+    totals.roceQpContextEntries += stats.roceQpContextEntries;
+    totals.rocePendingRxPsnEntries += stats.rocePendingRxPsnEntries;
+    totals.roceCompletionEntries += stats.roceCompletionEntries;
+    totals.roceQpTxPackets += stats.roceQpTxPackets;
+    totals.roceQpRxPackets += stats.roceQpRxPackets;
+    totals.roceQpRxOutOfOrderPackets += stats.roceQpRxOutOfOrderPackets;
+    totals.roceQpRxDuplicatePackets += stats.roceQpRxDuplicatePackets;
+    totals.roceQpRxReorderOverflowPackets += stats.roceQpRxReorderOverflowPackets;
+    totals.roceFsmStateEntries += stats.roceFsmStateEntries;
+    totals.roceFsmCompletedEntries += stats.roceFsmCompletedEntries;
+    totals.flowIoTxBufferedPackets += stats.flowIoTxBufferedPackets;
+    totals.flowIoTxBufferedBytes += stats.flowIoTxBufferedBytes;
+    totals.flowIoExternalIngressPackets += stats.flowIoExternalIngressPackets;
+    totals.flowIoExternalIngressBytes += stats.flowIoExternalIngressBytes;
+    totals.flowIoExternalHoldPackets += stats.flowIoExternalHoldPackets;
+    totals.flowIoExternalHoldBytes += stats.flowIoExternalHoldBytes;
+    totals.flowIoTotalBufferedPackets += stats.flowIoTotalBufferedPackets;
+    totals.flowIoTotalBufferedBytes += stats.flowIoTotalBufferedBytes;
+    totals.flowIoTotalBufferedApproxBytes += stats.flowIoTotalBufferedApproxBytes;
+    totals.roceOutstandingPayloadBytes += stats.roceOutstandingPayloadBytes;
+    totals.roceOutstandingApproxBytes += stats.roceOutstandingApproxBytes;
+    totals.roceBufferedUpperPayloadBytes += stats.roceBufferedUpperPayloadBytes;
+    totals.roceBufferedUpperApproxBytes += stats.roceBufferedUpperApproxBytes;
+    totals.rocePendingRetransPayloadBytes += stats.rocePendingRetransPayloadBytes;
+    totals.rocePendingRetransApproxBytes += stats.rocePendingRetransApproxBytes;
+    totals.queuePayloadBytes += stats.queuePayloadBytes;
+    totals.queueApproxBytes += stats.queueApproxBytes;
+    totals.roceDispatchEventPending += stats.roceDispatchEventPending;
+    totals.roceRetransTimerEventsPending += stats.roceRetransTimerEventsPending;
+    totals.rocePendingEvents += stats.rocePendingEvents;
+    totals.flowIoDrainEventPending += stats.flowIoDrainEventPending;
+    totals.flowIoExternalDrainEventPending += stats.flowIoExternalDrainEventPending;
+    totals.flowIoPendingEvents += stats.flowIoPendingEvents;
+    totals.pendingEventCount += stats.pendingEventCount;
+    totals.rocePendingEventApproxBytes += stats.rocePendingEventApproxBytes;
+    totals.flowIoPendingEventApproxBytes += stats.flowIoPendingEventApproxBytes;
+    totals.pendingEventApproxBytes += stats.pendingEventApproxBytes;
+    totals.totalTrackedEntries += stats.totalTrackedEntries;
+  }
+  return totals;
+}
+
+static void LogAggregateRuntimeTableStats(
+    const sendflowclient::RuntimeTableStats& stats,
+    const sendflowclient::RuntimeTableStats* lastStats,
+    const QueueMemStats& queueStats,
+    const QueueMemStats* lastQueueStats) {
+  const auto delta = [lastStats](uint64_t now,
+                                 uint64_t sendflowclient::RuntimeTableStats::*field) -> int64_t {
+    if (lastStats == nullptr) {
+      return 0;
+    }
+    return static_cast<int64_t>(now) - static_cast<int64_t>(lastStats->*field);
+  };
+  const auto deltaKb = [&delta](uint64_t now,
+                                uint64_t sendflowclient::RuntimeTableStats::*field) -> int64_t {
+    return delta(now, field) / 1024;
+  };
+  const auto queueDelta = [lastQueueStats](uint64_t now,
+                                           uint64_t QueueMemStats::*field) -> int64_t {
+    if (lastQueueStats == nullptr) {
+      return 0;
+    }
+    return static_cast<int64_t>(now) - static_cast<int64_t>(lastQueueStats->*field);
+  };
+  const auto queueDeltaKb = [&queueDelta](uint64_t now,
+                                          uint64_t QueueMemStats::*field) -> int64_t {
+    return queueDelta(now, field) / 1024;
+  };
+
+  std::ostringstream totalOss;
+  totalOss << "[MemWatch][focus][total]"
+           << " ioTotPkts=" << stats.flowIoTotalBufferedPackets
+           << " ioTxPkts=" << stats.flowIoTxBufferedPackets
+           << " ioExtIngressPkts=" << stats.flowIoExternalIngressPackets
+           << " ioExtHoldPkts=" << stats.flowIoExternalHoldPackets
+           << " ioTotBytes=" << stats.flowIoTotalBufferedBytes
+           << " ioApproxKB=" << BytesToKb(stats.flowIoTotalBufferedApproxBytes)
+           << " ioEvt=" << stats.flowIoPendingEvents
+           << " ioEvtApproxKB=" << BytesToKb(stats.flowIoPendingEventApproxBytes)
+           << " p2pRrqDev=" << queueStats.p2pRrqDevices
+           << " p2pRrqPkts=" << queueStats.p2pRrqTotalPackets
+           << " p2pRrqPriPkts=" << queueStats.p2pRrqPriorityPackets
+           << " p2pRrqSubPkts=" << queueStats.p2pRrqSubQueuePackets
+           << " p2pRrqPriKB=" << BytesToKb(queueStats.p2pRrqPriorityBytes)
+           << " p2pRrqSubKB=" << BytesToKb(queueStats.p2pRrqSubQueueBytes)
+           << " p2pRrqApproxKB=" << BytesToKb(queueStats.p2pRrqApproxBytes)
+           << " brInQ=" << queueStats.bridgeIngressQueues
+           << " brInLocalQ=" << queueStats.bridgeIngressLocalQueues
+           << " brInPkts=" << queueStats.bridgeIngressTotalPackets
+           << " brInPriPkts=" << queueStats.bridgeIngressPriorityPackets
+           << " brInSubPkts=" << queueStats.bridgeIngressSubQueuePackets
+           << " brInPriKB=" << BytesToKb(queueStats.bridgeIngressPriorityBytes)
+           << " brInSubKB=" << BytesToKb(queueStats.bridgeIngressSubQueueBytes)
+           << " brInApproxKB=" << BytesToKb(queueStats.bridgeIngressApproxBytes);
+  MemWatchLog(totalOss.str());
+
+  std::ostringstream deltaOss;
+  deltaOss << "[MemWatch][focus][delta]"
+           << " dIoTotPkts="
+           << (delta(stats.flowIoTotalBufferedPackets,
+                     &sendflowclient::RuntimeTableStats::flowIoTotalBufferedPackets) >= 0
+                   ? "+"
+                   : "")
+           << delta(stats.flowIoTotalBufferedPackets,
+                    &sendflowclient::RuntimeTableStats::flowIoTotalBufferedPackets)
+           << " dIoTotBytes="
+           << (delta(stats.flowIoTotalBufferedBytes,
+                     &sendflowclient::RuntimeTableStats::flowIoTotalBufferedBytes) >= 0
+                   ? "+"
+                   : "")
+           << delta(stats.flowIoTotalBufferedBytes,
+                    &sendflowclient::RuntimeTableStats::flowIoTotalBufferedBytes)
+           << " dIoApproxKB="
+           << (deltaKb(stats.flowIoTotalBufferedApproxBytes,
+                       &sendflowclient::RuntimeTableStats::flowIoTotalBufferedApproxBytes) >= 0
+                   ? "+"
+                   : "")
+           << deltaKb(stats.flowIoTotalBufferedApproxBytes,
+                      &sendflowclient::RuntimeTableStats::flowIoTotalBufferedApproxBytes)
+           << " dIoEvt="
+           << (delta(stats.flowIoPendingEvents,
+                     &sendflowclient::RuntimeTableStats::flowIoPendingEvents) >= 0
+                   ? "+"
+                   : "")
+           << delta(stats.flowIoPendingEvents,
+                    &sendflowclient::RuntimeTableStats::flowIoPendingEvents)
+           << " dP2pRrqPkts="
+           << (queueDelta(queueStats.p2pRrqTotalPackets, &QueueMemStats::p2pRrqTotalPackets) >= 0
+                   ? "+"
+                   : "")
+           << queueDelta(queueStats.p2pRrqTotalPackets, &QueueMemStats::p2pRrqTotalPackets)
+           << " dP2pRrqPriPkts="
+           << (queueDelta(queueStats.p2pRrqPriorityPackets, &QueueMemStats::p2pRrqPriorityPackets) >= 0
+                   ? "+"
+                   : "")
+           << queueDelta(queueStats.p2pRrqPriorityPackets, &QueueMemStats::p2pRrqPriorityPackets)
+           << " dP2pRrqSubPkts="
+           << (queueDelta(queueStats.p2pRrqSubQueuePackets, &QueueMemStats::p2pRrqSubQueuePackets) >= 0
+                   ? "+"
+                   : "")
+           << queueDelta(queueStats.p2pRrqSubQueuePackets, &QueueMemStats::p2pRrqSubQueuePackets)
+           << " dP2pRrqPriKB="
+           << (queueDeltaKb(queueStats.p2pRrqPriorityBytes, &QueueMemStats::p2pRrqPriorityBytes) >= 0
+                   ? "+"
+                   : "")
+           << queueDeltaKb(queueStats.p2pRrqPriorityBytes, &QueueMemStats::p2pRrqPriorityBytes)
+           << " dP2pRrqSubKB="
+           << (queueDeltaKb(queueStats.p2pRrqSubQueueBytes, &QueueMemStats::p2pRrqSubQueueBytes) >= 0
+                   ? "+"
+                   : "")
+           << queueDeltaKb(queueStats.p2pRrqSubQueueBytes, &QueueMemStats::p2pRrqSubQueueBytes)
+           << " dP2pRrqApproxKB="
+           << (queueDeltaKb(queueStats.p2pRrqApproxBytes, &QueueMemStats::p2pRrqApproxBytes) >= 0
+                   ? "+"
+                   : "")
+           << queueDeltaKb(queueStats.p2pRrqApproxBytes, &QueueMemStats::p2pRrqApproxBytes)
+           << " dBrInPkts="
+           << (queueDelta(queueStats.bridgeIngressTotalPackets, &QueueMemStats::bridgeIngressTotalPackets) >= 0
+                   ? "+"
+                   : "")
+           << queueDelta(queueStats.bridgeIngressTotalPackets, &QueueMemStats::bridgeIngressTotalPackets)
+           << " dBrInPriPkts="
+           << (queueDelta(queueStats.bridgeIngressPriorityPackets, &QueueMemStats::bridgeIngressPriorityPackets) >= 0
+                   ? "+"
+                   : "")
+           << queueDelta(queueStats.bridgeIngressPriorityPackets, &QueueMemStats::bridgeIngressPriorityPackets)
+           << " dBrInSubPkts="
+           << (queueDelta(queueStats.bridgeIngressSubQueuePackets, &QueueMemStats::bridgeIngressSubQueuePackets) >= 0
+                   ? "+"
+                   : "")
+           << queueDelta(queueStats.bridgeIngressSubQueuePackets, &QueueMemStats::bridgeIngressSubQueuePackets)
+           << " dBrInPriKB="
+           << (queueDeltaKb(queueStats.bridgeIngressPriorityBytes, &QueueMemStats::bridgeIngressPriorityBytes) >= 0
+                   ? "+"
+                   : "")
+           << queueDeltaKb(queueStats.bridgeIngressPriorityBytes, &QueueMemStats::bridgeIngressPriorityBytes)
+           << " dBrInSubKB="
+           << (queueDeltaKb(queueStats.bridgeIngressSubQueueBytes, &QueueMemStats::bridgeIngressSubQueueBytes) >= 0
+                   ? "+"
+                   : "")
+           << queueDeltaKb(queueStats.bridgeIngressSubQueueBytes, &QueueMemStats::bridgeIngressSubQueueBytes)
+           << " dBrInApproxKB="
+           << (queueDeltaKb(queueStats.bridgeIngressApproxBytes, &QueueMemStats::bridgeIngressApproxBytes) >= 0
+                   ? "+"
+                   : "")
+           << queueDeltaKb(queueStats.bridgeIngressApproxBytes, &QueueMemStats::bridgeIngressApproxBytes);
+  MemWatchLog(deltaOss.str());
+}
+
+static void MaybeLogTopNodesByFocusMemory(
     const std::shared_ptr<MemWatchState>& state) {
   if (state == nullptr || state->cfg.topNodes == 0) {
     return;
@@ -486,6 +908,8 @@ static void MaybeLogTopNodesByTrackedEntries(
   struct RankedNode {
     int nodeId = -1;
     sendflowclient::RuntimeTableStats stats;
+    QueueMemStats queueStats;
+    uint64_t focusBytes = 0;
   };
 
   std::vector<RankedNode> ranked;
@@ -495,10 +919,15 @@ static void MaybeLogTopNodesByTrackedEntries(
       continue;
     }
     sendflowclient::RuntimeTableStats stats = app->GetRuntimeTableStats();
-    if (stats.totalTrackedEntries == 0) {
+    QueueMemStats queueStats = CollectNodeQueueMemStats(nodeId);
+    const uint64_t focusBytes =
+        stats.flowIoTotalBufferedApproxBytes + queueStats.p2pRrqApproxBytes +
+        queueStats.bridgeIngressApproxBytes;
+    if (focusBytes == 0 && stats.flowIoTotalBufferedPackets == 0 &&
+        queueStats.p2pRrqTotalPackets == 0 && queueStats.bridgeIngressTotalPackets == 0) {
       continue;
     }
-    ranked.push_back(RankedNode{nodeId, stats});
+    ranked.push_back(RankedNode{nodeId, stats, queueStats, focusBytes});
   }
   if (ranked.empty()) {
     return;
@@ -507,15 +936,98 @@ static void MaybeLogTopNodesByTrackedEntries(
   std::sort(ranked.begin(),
             ranked.end(),
             [](const RankedNode& a, const RankedNode& b) {
-              return a.stats.totalTrackedEntries > b.stats.totalTrackedEntries;
+              return a.focusBytes > b.focusBytes;
             });
   const size_t maxCount = std::min(ranked.size(), static_cast<size_t>(state->cfg.topNodes));
   for (size_t i = 0; i < maxCount; ++i) {
     LogNodeMemWatchStats(
         ranked[i].nodeId,
         ranked[i].stats,
-        "[MemWatch][top" + std::to_string(i + 1) + "]");
+        "[MemWatch][topFocus" + std::to_string(i + 1) + "]");
   }
+
+  std::vector<RankedNode> ioRanked = ranked;
+  std::sort(ioRanked.begin(),
+            ioRanked.end(),
+            [](const RankedNode& a, const RankedNode& b) {
+              return a.stats.flowIoTotalBufferedApproxBytes > b.stats.flowIoTotalBufferedApproxBytes;
+            });
+  if (!ioRanked.empty() && ioRanked.front().stats.flowIoTotalBufferedApproxBytes > 0) {
+    for (size_t i = 0; i < maxCount; ++i) {
+      LogNodeMemWatchStats(
+          ioRanked[i].nodeId,
+          ioRanked[i].stats,
+          "[MemWatch][topFlowIo" + std::to_string(i + 1) + "]");
+    }
+  }
+
+  std::vector<RankedNode> p2pRrqRanked = ranked;
+  std::sort(p2pRrqRanked.begin(),
+            p2pRrqRanked.end(),
+            [](const RankedNode& a, const RankedNode& b) {
+              return a.queueStats.p2pRrqApproxBytes > b.queueStats.p2pRrqApproxBytes;
+            });
+  if (!p2pRrqRanked.empty() && p2pRrqRanked.front().queueStats.p2pRrqApproxBytes > 0) {
+    for (size_t i = 0; i < maxCount; ++i) {
+      LogNodeMemWatchStats(
+          p2pRrqRanked[i].nodeId,
+          p2pRrqRanked[i].stats,
+          "[MemWatch][topP2pRrq" + std::to_string(i + 1) + "]");
+    }
+  }
+
+  std::vector<RankedNode> bridgeIngressRanked = ranked;
+  std::sort(bridgeIngressRanked.begin(),
+            bridgeIngressRanked.end(),
+            [](const RankedNode& a, const RankedNode& b) {
+              return a.queueStats.bridgeIngressApproxBytes > b.queueStats.bridgeIngressApproxBytes;
+            });
+  if (!bridgeIngressRanked.empty() &&
+      bridgeIngressRanked.front().queueStats.bridgeIngressApproxBytes > 0) {
+    for (size_t i = 0; i < maxCount; ++i) {
+      LogNodeMemWatchStats(
+          bridgeIngressRanked[i].nodeId,
+          bridgeIngressRanked[i].stats,
+          "[MemWatch][topBridgeIngress" + std::to_string(i + 1) + "]");
+    }
+  }
+}
+
+static void EmitMemWatchNodeDetails(const std::shared_ptr<MemWatchState>& state,
+                                    const std::string& reasonTag) {
+  if (state == nullptr || (!state->cfg.watchNodes.size() && state->cfg.topNodes == 0)) {
+    return;
+  }
+  std::ostringstream oss;
+  oss << "[MemWatch][node-snapshot]"
+      << " rank=" << conf::rank
+      << " sample=" << state->sampleIndex
+      << " reason=" << reasonTag
+      << " watchNodeCount=" << state->cfg.watchNodes.size()
+      << " topNodes=" << state->cfg.topNodes;
+  MemWatchLog(oss.str());
+
+  for (int nodeId : state->cfg.watchNodes) {
+    auto appIt = nodeapptable.find(nodeId);
+    if (appIt == nodeapptable.end() || appIt->second == nullptr ||
+        !IsNodeOwnedByCurrentRank(nodeId)) {
+      continue;
+    }
+    LogNodeMemWatchStats(nodeId,
+                         appIt->second->GetRuntimeTableStats(),
+                         "[MemWatch][watch]");
+  }
+  MaybeLogTopNodesByFocusMemory(state);
+}
+
+static bool ShouldEmitPeriodicNodeDetails(const std::shared_ptr<MemWatchState>& state) {
+  if (state == nullptr) {
+    return false;
+  }
+  if (state->cfg.nodeDetailEverySamples == 0) {
+    return false;
+  }
+  return (state->sampleIndex % state->cfg.nodeDetailEverySamples) == 0;
 }
 
 static void EmitMemWatchSample(const std::shared_ptr<MemWatchState>& state,
@@ -528,55 +1040,294 @@ static void EmitMemWatchSample(const std::shared_ptr<MemWatchState>& state,
   const uint64_t eventCount = Simulator::GetEventCount();
   const ProcessMemSnapshot mem = ReadProcessMemSnapshot();
 
+  const bool hadLast = state->hasLast;
   int64_t deltaEvents = 0;
   int64_t deltaRssKb = 0;
-  if (state->hasLast) {
+  int64_t deltaSwapKb = 0;
+  if (hadLast) {
     deltaEvents = static_cast<int64_t>(eventCount) -
                   static_cast<int64_t>(state->lastEventCount);
     deltaRssKb = static_cast<int64_t>(mem.vmRssKb) -
                  static_cast<int64_t>(state->lastVmRssKb);
+    deltaSwapKb = static_cast<int64_t>(mem.vmSwapKb) -
+                  static_cast<int64_t>(state->lastVmSwapKb);
   }
   state->lastEventCount = eventCount;
   state->lastVmRssKb = mem.vmRssKb;
+  state->lastVmSwapKb = mem.vmSwapKb;
   state->hasLast = true;
 
-  std::clog << "[MemWatch][sample=" << state->sampleIndex << "]"
-            << " rank=" << conf::rank
-            << " simTime=" << Simulator::Now().GetSeconds() << "s"
-            << " eventCount=" << eventCount
-            << " dEvent=" << (deltaEvents >= 0 ? "+" : "") << deltaEvents
-            << " VmRSS=" << mem.vmRssKb << "kB"
-            << " dRSS=" << (deltaRssKb >= 0 ? "+" : "") << deltaRssKb << "kB"
-            << " VmSize=" << mem.vmSizeKb << "kB"
-            << " VmData=" << mem.vmDataKb << "kB"
-            << " VmHWM=" << mem.vmHwmKb << "kB"
-            << " procStatusOK=" << mem.valid
-            << '\n';
+  std::ostringstream oss;
+  oss << "[MemWatch][sample=" << state->sampleIndex << "]"
+      << " rank=" << conf::rank
+      << " simTime=" << Simulator::Now().GetSeconds() << "s"
+      << " eventCount=" << eventCount
+      << " dEvent=" << (deltaEvents >= 0 ? "+" : "") << deltaEvents
+      << " VmRSS=" << mem.vmRssKb << "kB"
+      << " dRSS=" << (deltaRssKb >= 0 ? "+" : "") << deltaRssKb << "kB"
+      << " VmSwap=" << mem.vmSwapKb << "kB"
+      << " dSwap=" << (deltaSwapKb >= 0 ? "+" : "") << deltaSwapKb << "kB"
+      << " VmSize=" << mem.vmSizeKb << "kB"
+      << " VmData=" << mem.vmDataKb << "kB"
+      << " RssAnon=" << mem.rssAnonKb << "kB"
+      << " RssFile=" << mem.rssFileKb << "kB"
+      << " RssShmem=" << mem.rssShmemKb << "kB"
+      << " VmHWM=" << mem.vmHwmKb << "kB"
+      << " procStatusOK=" << mem.valid;
+  MemWatchLog(oss.str());
 
-  for (int nodeId : state->cfg.watchNodes) {
-    auto appIt = nodeapptable.find(nodeId);
-    if (appIt == nodeapptable.end() || appIt->second == nullptr ||
-        !IsNodeOwnedByCurrentRank(nodeId)) {
-      continue;
-    }
-    LogNodeMemWatchStats(nodeId, appIt->second->GetRuntimeTableStats());
+  const sendflowclient::RuntimeTableStats aggStats = CollectAggregateRuntimeTableStats();
+  const QueueMemStats queueStats = CollectAggregateQueueMemStats();
+  sendflowclient::RuntimeTableStats prevAggStats;
+  const sendflowclient::RuntimeTableStats* lastAggStatsPtr = nullptr;
+  if (state->hasLastAggStats) {
+    prevAggStats = state->lastAggStats;
+    lastAggStatsPtr = &prevAggStats;
   }
-  MaybeLogTopNodesByTrackedEntries(state);
-  std::clog.flush();
+  QueueMemStats prevQueueStats;
+  const QueueMemStats* lastQueueStatsPtr = nullptr;
+  if (state->hasLastQueueStats) {
+    prevQueueStats = state->lastQueueStats;
+    lastQueueStatsPtr = &prevQueueStats;
+  }
+  state->lastTrackedEntries = aggStats.totalTrackedEntries;
+  LogAggregateRuntimeTableStats(aggStats, lastAggStatsPtr, queueStats, lastQueueStatsPtr);
+  state->lastAggStats = aggStats;
+  state->hasLastAggStats = true;
+  state->lastQueueStats = queueStats;
+  state->hasLastQueueStats = true;
+  if (ShouldEmitPeriodicNodeDetails(state)) {
+    EmitMemWatchNodeDetails(state, "periodic");
+  }
 
   if (!scheduleNext) {
     return;
   }
   if (state->sampleIndex >= state->cfg.maxSamples) {
-    std::clog << "[MemWatch] stop sampling: reached max samples="
-              << state->cfg.maxSamples << '\n';
-    std::clog.flush();
+    std::ostringstream stopOss;
+    stopOss << "[MemWatch] stop sampling: reached max samples="
+            << state->cfg.maxSamples;
+    MemWatchLog(stopOss.str());
     return;
   }
   Simulator::Schedule(Seconds(state->cfg.intervalSeconds),
                       &EmitMemWatchSample,
                       state,
                       true);
+}
+
+[[maybe_unused]] static void EmitMemWatchWallSample(
+    const std::shared_ptr<MemWatchState>& state) {
+  if (state == nullptr || !state->cfg.enable) {
+    return;
+  }
+  if (state->sampleIndex >= state->cfg.maxSamples) {
+    if (!state->maxSamplesLogged.exchange(true, std::memory_order_relaxed)) {
+      std::ostringstream stopOss;
+      stopOss << "[MemWatch] stop sampling: reached max samples="
+              << state->cfg.maxSamples;
+      MemWatchLog(stopOss.str());
+    }
+    state->stopRequested.store(true, std::memory_order_relaxed);
+    return;
+  }
+
+  state->sampleIndex++;
+  const ProcessMemSnapshot mem = ReadProcessMemSnapshot();
+  const bool hadLast = state->hasLast;
+  int64_t deltaRssKb = 0;
+  int64_t deltaSwapKb = 0;
+  if (hadLast) {
+    deltaRssKb = static_cast<int64_t>(mem.vmRssKb) -
+                 static_cast<int64_t>(state->lastVmRssKb);
+    deltaSwapKb = static_cast<int64_t>(mem.vmSwapKb) -
+                  static_cast<int64_t>(state->lastVmSwapKb);
+  }
+  state->lastVmRssKb = mem.vmRssKb;
+  state->lastVmSwapKb = mem.vmSwapKb;
+  state->hasLast = true;
+
+  const uint64_t wallElapsedMs = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - state->wallStartTime)
+          .count());
+  std::ostringstream oss;
+  oss << "[MemWatch][sample=" << state->sampleIndex << "]"
+      << " rank=" << conf::rank
+      << " wallTimeMs=" << wallElapsedMs
+      << " VmRSS=" << mem.vmRssKb << "kB"
+      << " dRSS=" << (deltaRssKb >= 0 ? "+" : "") << deltaRssKb << "kB"
+      << " VmSwap=" << mem.vmSwapKb << "kB"
+      << " dSwap=" << (deltaSwapKb >= 0 ? "+" : "") << deltaSwapKb << "kB"
+      << " VmSize=" << mem.vmSizeKb << "kB"
+      << " VmData=" << mem.vmDataKb << "kB"
+      << " RssAnon=" << mem.rssAnonKb << "kB"
+      << " RssFile=" << mem.rssFileKb << "kB"
+      << " RssShmem=" << mem.rssShmemKb << "kB"
+      << " VmHWM=" << mem.vmHwmKb << "kB"
+      << " procStatusOK=" << mem.valid;
+  MemWatchLog(oss.str());
+
+  const sendflowclient::RuntimeTableStats aggStats = CollectAggregateRuntimeTableStats();
+  const QueueMemStats queueStats = CollectAggregateQueueMemStats();
+  sendflowclient::RuntimeTableStats prevAggStats;
+  const sendflowclient::RuntimeTableStats* lastAggStatsPtr = nullptr;
+  if (state->hasLastAggStats) {
+    prevAggStats = state->lastAggStats;
+    lastAggStatsPtr = &prevAggStats;
+  }
+  QueueMemStats prevQueueStats;
+  const QueueMemStats* lastQueueStatsPtr = nullptr;
+  if (state->hasLastQueueStats) {
+    prevQueueStats = state->lastQueueStats;
+    lastQueueStatsPtr = &prevQueueStats;
+  }
+  state->lastTrackedEntries = aggStats.totalTrackedEntries;
+  LogAggregateRuntimeTableStats(aggStats, lastAggStatsPtr, queueStats, lastQueueStatsPtr);
+  state->lastAggStats = aggStats;
+  state->hasLastAggStats = true;
+  state->lastQueueStats = queueStats;
+  state->hasLastQueueStats = true;
+  if (ShouldEmitPeriodicNodeDetails(state)) {
+    EmitMemWatchNodeDetails(state, "periodic");
+  }
+}
+
+static void EmitMemWatchWallMemOnlySample(const std::shared_ptr<MemWatchState>& state) {
+  if (state == nullptr || !state->cfg.enable) {
+    return;
+  }
+  if (state->sampleIndex >= state->cfg.maxSamples) {
+    if (!state->maxSamplesLogged.exchange(true, std::memory_order_relaxed)) {
+      std::ostringstream stopOss;
+      stopOss << "[MemWatch] stop sampling: reached max samples="
+              << state->cfg.maxSamples;
+      MemWatchLog(stopOss.str());
+    }
+    state->stopRequested.store(true, std::memory_order_relaxed);
+    return;
+  }
+
+  state->sampleIndex++;
+  const ProcessMemSnapshot mem = ReadProcessMemSnapshot();
+  const bool hadLast = state->hasLast;
+  int64_t deltaRssKb = 0;
+  int64_t deltaSwapKb = 0;
+  if (hadLast) {
+    deltaRssKb = static_cast<int64_t>(mem.vmRssKb) -
+                 static_cast<int64_t>(state->lastVmRssKb);
+    deltaSwapKb = static_cast<int64_t>(mem.vmSwapKb) -
+                  static_cast<int64_t>(state->lastVmSwapKb);
+  }
+  state->lastVmRssKb = mem.vmRssKb;
+  state->lastVmSwapKb = mem.vmSwapKb;
+  state->hasLast = true;
+
+  const uint64_t wallElapsedMs = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - state->wallStartTime)
+          .count());
+  std::ostringstream oss;
+  oss << "[MemWatch][sample=" << state->sampleIndex << "]"
+      << " rank=" << conf::rank
+      << " wallTimeMs=" << wallElapsedMs
+      << " VmRSS=" << mem.vmRssKb << "kB"
+      << " dRSS=" << (deltaRssKb >= 0 ? "+" : "") << deltaRssKb << "kB"
+      << " VmSwap=" << mem.vmSwapKb << "kB"
+      << " dSwap=" << (deltaSwapKb >= 0 ? "+" : "") << deltaSwapKb << "kB"
+      << " VmSize=" << mem.vmSizeKb << "kB"
+      << " VmData=" << mem.vmDataKb << "kB"
+      << " RssAnon=" << mem.rssAnonKb << "kB"
+      << " RssFile=" << mem.rssFileKb << "kB"
+      << " RssShmem=" << mem.rssShmemKb << "kB"
+      << " VmHWM=" << mem.vmHwmKb << "kB"
+      << " procStatusOK=" << mem.valid
+      << " runtimeTables=skipped_mtp_wall";
+  MemWatchLog(oss.str());
+}
+
+#ifndef NS3_MTP
+static void RunMemWatchWallSampleEvent(const std::shared_ptr<MemWatchState>& state) {
+  if (state == nullptr) {
+    return;
+  }
+  state->wallSampleScheduled.store(false, std::memory_order_release);
+  EmitMemWatchWallSample(state);
+}
+
+static void RequestMemWatchWallSample(const std::shared_ptr<MemWatchState>& state) {
+  if (state == nullptr || !state->cfg.enable ||
+      state->stopRequested.load(std::memory_order_relaxed)) {
+    return;
+  }
+  bool expected = false;
+  if (!state->wallSampleScheduled.compare_exchange_strong(expected,
+                                                          true,
+                                                          std::memory_order_acq_rel)) {
+    return;
+  }
+  const uint32_t context = state->wallEventContext;
+  if (context == ns3::Simulator::NO_CONTEXT ||
+      context >= ns3::NodeList::GetNNodes()) {
+    state->wallSampleScheduled.store(false, std::memory_order_release);
+    if (!state->invalidContextLogged.exchange(true, std::memory_order_relaxed)) {
+      std::ostringstream oss;
+      oss << "[MemWatch] wall sampling disabled: invalid event context="
+          << context
+          << " nNodes=" << ns3::NodeList::GetNNodes();
+      MemWatchLog(oss.str());
+    }
+    state->stopRequested.store(true, std::memory_order_relaxed);
+    return;
+  }
+  ns3::Simulator::ScheduleWithContext(context,
+                                      ns3::Seconds(0),
+                                      &RunMemWatchWallSampleEvent,
+                                      state);
+}
+#endif
+
+static void StartMemWatchWallSampler(const std::shared_ptr<MemWatchState>& state) {
+  if (state == nullptr || !state->cfg.enable) {
+    return;
+  }
+  state->wallStartTime = std::chrono::steady_clock::now();
+  const auto interval = std::chrono::milliseconds(
+      static_cast<int64_t>(std::max(1.0, state->cfg.intervalSeconds * 1000.0)));
+#ifndef NS3_MTP
+  EmitMemWatchWallSample(state);
+#endif
+  state->wallSamplerThread = std::thread([state, interval]() {
+#ifdef NS3_MTP
+    EmitMemWatchWallMemOnlySample(state);
+    while (!state->stopRequested.load(std::memory_order_relaxed)) {
+      std::this_thread::sleep_for(interval);
+      if (state->stopRequested.load(std::memory_order_relaxed)) {
+        break;
+      }
+      EmitMemWatchWallMemOnlySample(state);
+    }
+#else
+    RequestMemWatchWallSample(state);
+    while (!state->stopRequested.load(std::memory_order_relaxed)) {
+      std::this_thread::sleep_for(interval);
+      if (state->stopRequested.load(std::memory_order_relaxed)) {
+        break;
+      }
+      RequestMemWatchWallSample(state);
+    }
+#endif
+  });
+}
+
+static void StopMemWatchWallSampler(const std::shared_ptr<MemWatchState>& state) {
+  if (state == nullptr) {
+    return;
+  }
+  state->stopRequested.store(true, std::memory_order_relaxed);
+  if (state->wallSamplerThread.joinable()) {
+    state->wallSamplerThread.join();
+  }
 }
 
 static int user_param_prase(int argc,char * argv[],struct user_param* user_param){
@@ -658,7 +1409,13 @@ int main(int argc, char *argv[]) {
   // emitted during SetRoceConfig is visible in simulation.log.
   // LogComponentEnable("SendFlowClient",LOG_LEVEL_INFO);
   AsciiTraceHelper ascii;
-  Ptr<OutputStreamWrapper> stream = ascii.CreateFileStream("simulation.log");
+  std::string simulationLogPath = "simulation.log";
+#ifdef NS3_MPI
+  if (conf::rank != 0) {
+    simulationLogPath = "simulation.rank" + std::to_string(conf::rank) + ".log";
+  }
+#endif
+  Ptr<OutputStreamWrapper> stream = ascii.CreateFileStream(simulationLogPath);
   std::streambuf* oldbuf = std::clog.rdbuf(stream->GetStream()->rdbuf());
   const std::ios_base::fmtflags oldClogFlags = std::clog.flags();
   std::clog << std::unitbuf;
@@ -699,7 +1456,7 @@ int main(int argc, char *argv[]) {
 
   // LogComponentEnable("OnOffApplication", LOG_LEVEL_INFO);
   // LogComponentEnable("PacketSink", LOG_LEVEL_INFO);
-  LogComponentEnable("GENERIC_SIMULATION", LOG_LEVEL_INFO);
+  LogComponentEnable("GENERIC_SIMULATION", LOG_LEVEL_ERROR);
   // LogComponentEnable("MinHopBridgeNetDevice", LOG_LEVEL_INFO);
   // LogComponentEnable("PointToPointNetDevice", LOG_LEVEL_INFO);
   // LogComponentEnable("PppRoundRobinQueue", LOG_LEVEL_INFO);
@@ -808,20 +1565,36 @@ int main(int argc, char *argv[]) {
   if (memWatchCfg.enable) {
     memWatchState = std::make_shared<MemWatchState>();
     memWatchState->cfg = memWatchCfg;
+    memWatchState->wallEventContext = ResolveMemWatchEventContext(memWatchState->cfg);
     const double monitorStartSeconds =
         std::max(0.0, static_cast<double>(warmupSeconds) - 1.0);
-    std::clog << "[MemWatch] enabled=1"
-              << " rank=" << conf::rank
-              << " startTime=" << monitorStartSeconds << "s"
-              << " interval=" << memWatchState->cfg.intervalSeconds << "s"
-              << " maxSamples=" << memWatchState->cfg.maxSamples
-              << " watchNodeCount=" << memWatchState->cfg.watchNodes.size()
-              << " topNodes=" << memWatchState->cfg.topNodes
-              << '\n';
-    ns3::Simulator::Schedule(ns3::Seconds(monitorStartSeconds),
-                             &EmitMemWatchSample,
-                             memWatchState,
-                             true);
+    std::ostringstream oss;
+    oss << "[MemWatch] enabled=1"
+        << " rank=" << conf::rank
+        << " timeMode=" << (memWatchState->cfg.useWallClock ? "wall" : "sim")
+        << " startTime=" << monitorStartSeconds << "s"
+        << " interval=" << memWatchState->cfg.intervalSeconds << "s"
+        << " maxSamples=" << memWatchState->cfg.maxSamples
+        << " nodeDetailEverySamples=" << memWatchState->cfg.nodeDetailEverySamples
+        << " wallEventContext=" << memWatchState->wallEventContext
+        << " watchNodeCount=" << memWatchState->cfg.watchNodes.size()
+        << " topNodes=" << memWatchState->cfg.topNodes;
+    MemWatchLog(oss.str());
+#ifdef NS3_MTP
+    if (memWatchState->cfg.useWallClock) {
+      MemWatchLog("[MemWatch] NS3_MTP + wall mode: runtime table/node details are disabled for thread safety; use sim mode for detailed queue/event analysis.");
+    }
+#endif
+    if (memWatchState->cfg.useWallClock) {
+      ns3::Simulator::Schedule(ns3::Seconds(monitorStartSeconds),
+                               &StartMemWatchWallSampler,
+                               memWatchState);
+    } else {
+      ns3::Simulator::Schedule(ns3::Seconds(monitorStartSeconds),
+                               &EmitMemWatchSample,
+                               memWatchState,
+                               true);
+    }
   }
   // ns3::Simulator::Schedule(ns3::Seconds(190), [nodes_num,systems](){
   //     printlearnstate();
@@ -832,7 +1605,43 @@ int main(int argc, char *argv[]) {
   Simulator::Run(); 
 
   if (memWatchState != nullptr && memWatchState->cfg.enable) {
-    EmitMemWatchSample(memWatchState, false);
+    if (memWatchState->cfg.useWallClock) {
+      StopMemWatchWallSampler(memWatchState);
+#ifdef NS3_MTP
+      std::ostringstream endOss;
+      endOss << "[MemWatch] wall sampler stopped after Run; skip direct final sample on main thread in MTP mode";
+      MemWatchLog(endOss.str());
+#else
+      EmitMemWatchWallSample(memWatchState);
+      const sendflowclient::RuntimeTableStats finalAggStats =
+          CollectAggregateRuntimeTableStats();
+      const QueueMemStats finalQueueStats = CollectAggregateQueueMemStats();
+      sendflowclient::RuntimeTableStats prevAggStats;
+      const sendflowclient::RuntimeTableStats* lastAggStatsPtr = nullptr;
+      if (memWatchState->hasLastAggStats) {
+        prevAggStats = memWatchState->lastAggStats;
+        lastAggStatsPtr = &prevAggStats;
+      }
+      QueueMemStats prevQueueStats;
+      const QueueMemStats* lastQueueStatsPtr = nullptr;
+      if (memWatchState->hasLastQueueStats) {
+        prevQueueStats = memWatchState->lastQueueStats;
+        lastQueueStatsPtr = &prevQueueStats;
+      }
+      memWatchState->lastTrackedEntries = finalAggStats.totalTrackedEntries;
+      LogAggregateRuntimeTableStats(finalAggStats,
+                                    lastAggStatsPtr,
+                                    finalQueueStats,
+                                    lastQueueStatsPtr);
+      memWatchState->lastAggStats = finalAggStats;
+      memWatchState->hasLastAggStats = true;
+      memWatchState->lastQueueStats = finalQueueStats;
+      memWatchState->hasLastQueueStats = true;
+      EmitMemWatchNodeDetails(memWatchState, "final");
+#endif
+    } else {
+      EmitMemWatchSample(memWatchState, false);
+    }
   }
 
   uint64_t eventCount = Simulator::GetEventCount();
