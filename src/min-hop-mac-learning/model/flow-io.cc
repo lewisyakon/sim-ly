@@ -2,6 +2,8 @@
 
 #include "PppRoundRobinQueue.h"
 #include "3PHeader.h"
+#include "rdma-dispatch-tag.h"
+#include "rdma-port-engine.h"
 #include "ns3/hop-count-header.h"
 #include "pause-header.h"
 #include "ns3/boolean.h"
@@ -412,6 +414,44 @@ FlowIo::SendOnDevice(uint32_t devIndex, const Address& dest, Ptr<Packet> pkt)
   // Keep caller packet immutable across retries (NetDevice may mutate headers).
   int ret = sock->SendTo(pkt->Copy(), 0, ps);
   return (ret >= 0);
+}
+
+bool
+FlowIo::TrySubmitViaRdmaPortEngine(uint32_t devIndex, const Address& dest, Ptr<Packet> pkt)
+{
+  if (!m_node || !pkt || devIndex >= m_node->GetNDevices())
+  {
+    return false;
+  }
+
+  RdmaDispatchTag tag;
+  if (!pkt->PeekPacketTag(tag))
+  {
+    return false;
+  }
+
+  Ptr<PointToPointNetDevice> p2p = DynamicCast<PointToPointNetDevice>(m_node->GetDevice(devIndex));
+  if (!p2p)
+  {
+    return false;
+  }
+
+  Ptr<RdmaPortEngine> engine = p2p->GetObject<RdmaPortEngine>();
+  if (!engine)
+  {
+    return false;
+  }
+
+  if (!PacketSocketAddress::IsMatchingType(dest))
+  {
+    return false;
+  }
+
+  PacketSocketAddress ps = PacketSocketAddress::ConvertFrom(dest);
+  return engine->SubmitFromFlowIo(p2p->GetAddress(),
+                                  ps.GetPhysicalAddress(),
+                                  m_proto,
+                                  pkt);
 }
 
 bool
@@ -945,6 +985,11 @@ FlowIo::Send(const Address& dest,
 
   EnsureQueueState();
   uint32_t qid = ClassifyQueueId(dest);
+
+  if (TrySubmitViaRdmaPortEngine(dev, dest, pkt))
+  {
+    return;
+  }
 
   if (mode == FlowSendMode::External && m_bindMode != RxBindMode::BridgeOnly)
   {

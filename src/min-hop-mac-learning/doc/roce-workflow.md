@@ -1,255 +1,320 @@
 # RoCE 工作流说明
 
-这一份文档只讲一件事：一条普通 P2P 流从 Astra-Sim 下放之后，当前项目里的 RoCE 旁路是如何参与处理的。
+这份文档只讲一件事：在当前版本里，一条普通 P2P 流从 Astra-Sim 下发之后，最终是怎样经过 `sendflowclient`、`RoceTransportEngine`、`FlowIo / bridge`、`RdmaPortEngine`，再从物理 port 发出去的。
 
-可以把主链条概括成：
+## 1. 当前主链条
 
-`Astra-Sim workload -> ASTRASimNetwork(sim_send/sim_recv) -> my_entry::SendFlow -> sendflowclient -> RoCE(QP/FSM/Header) -> ns-3 网络 -> 对端 sendflowclient -> 回调 Astra-Sim`
+当前链路可以概括成：
 
-## 1. Astra-Sim 下放阶段
+```text
+Astra-Sim
+  -> my_entry / my_AstraSimNetwork
+  -> sendflowclient
+  -> RoceTransportEngine
+  -> packet + RdmaDispatchTag
+  -> FlowIo
+  -> external p2p OR bridge
+  -> selected outPort's RdmaPortEngine
+  -> PointToPointNetDevice::SendFrom
+  -> network
+  -> peer bridge/local ingress
+  -> sendflowclient::HandleRead
+  -> ingress RdmaPortEngine HandleAck (ACK only)
+  -> RoceTransportEngine::OnRxPacket
+  -> 3P business callback
+```
+
+这里最重要的变化是：
+
+- 发送语义和接收语义仍然主要在 `RoceTransportEngine`
+- 但“某个包到底能不能从某个物理口发出去”，现在已经开始由 `RdmaPortEngine` 决定
+
+## 2. Astra-Sim 到 `sendflowclient`
+
+### 2.1 Astra-Sim 下发发送请求
 
 1. Astra-Sim 在 workload/stream 层决定发起一个 P2P 通信。
 2. 发送侧调用 `sim_send`，接收侧调用 `sim_recv`。
-3. 当前分支里，这个网络后端实现在 `scratch/my_AstraSimNetwork.cc`。
+3. 当前分支里，网络后端实现在 `scratch/my_AstraSimNetwork.cc`。
+4. 发送请求最终通过 `my_entry::SendFlow(...)` 交给源节点上的 `sendflowclient`。
 
-发送侧关键动作：
-
-- 计算当前仿真使用的 `src/dst`
-- 从 `request->flowTag` 里取出 `tag_id`
-- 调用 `my_entry.h` 里的 `SendFlow(...)`
-
-接收侧关键动作：
-
-- 先在本节点登记接收回调
-- 如果数据其实已经在本地 `recvHash` 中就绪，就立即回调，不再等待网络
-
-## 2. `my_entry` 的桥接作用
-
-`SendFlow(...)` 是 Astra-Sim 与 `sendflowclient` 之间的桥。
+### 2.2 `sendflowclient` 仍然是最上层 facade
 
 发送侧：
 
-1. 找到源节点对应的 `sendflowclient`
-2. 把发送完成回调写进 `m_sendfunctable`
-3. 把 `sim_request` 写进 `m_request`
-4. 调用 `TriggerSendTo_now(...)`
+1. 登记 sender 完成回调
+2. 保存 `sim_request`
+3. 调 `TriggerSendTo_now(...)`
 
 接收侧：
 
-1. `sim_recv` 通过 `set_recvfunc(...)` 预注册回调
-2. 后续最后一个 DATA 到达、或 `recvHash` 满足条件时，触发回调
+1. `sim_recv` 预先登记回调
+2. 若数据已经在本地 `recvHash` 中准备好，就直接回调
 
-## 3. `sendflowclient` 发送侧 workflow
+## 3. `sendflowclient` 发送侧当前怎么工作
 
-### 3.1 决定发 REQUEST 还是 DATA
+### 3.1 先决定这是 `REQUEST`、`DATA` 还是 `ACT`
 
-当前规则很直接：
+当前 3P 语义还是由 `sendflowclient` 负责：
 
-- `datasize == 1023`：视为 REQUEST
-- 其他：视为 DATA
+- `REQUEST`
+- `DATA`
+- `ACT`
 
-然后统一进入发送路径。
+RoCE 没有替换掉 3P，只是在外层增加了一套 transport 语义和端口执行路径。
 
-### 3.2 RoCE 开启后，先入调度器而不是立即发包
+### 3.2 `RoCE=false` 与 `RoCE=true`
 
 当前发送路径已经分成两条：
 
-- `RoCE disable`
-  - 仍走 legacy `SendPacket(...)` 直发路径
+1. `RoCE=false`
+   - 仍然走传统 legacy 直发路径
 
-- `RoCE enable`
-  - `TriggerSendTo_now(...)` 不再直接发包
-  - 先调用 `EnqueueRoceWork_(...)`
-  - work item 进入 `RoceTxScheduler`
-  - 再由 scheduler 选择下一个 slice，调用 `DispatchOneRoceSlice_()`
+2. `RoCE=true`
+   - 先进入 `EnqueueRoceWork_(...)`
+   - 再通过 `RoceTransportEngine` 和 `RoceTxScheduler` 生成待发 slice
 
-因此当前版本已经不是“带 RoCE 头的 legacy 直发”，而是：
+### 3.3 `RoCE=true` 时，先过语义层
 
-- 业务仍由 3P 决定
-- 出网顺序开始由 RoCE scheduler 控制
+对每个待发 work：
 
-### 3.3 真正出网前，先构建 3P 头，再叠加 RoCE 头
+1. `sendflowclient` 先组织 `RoceTxWorkItem`
+2. 调 `RoceTransportEngine::Enqueue(...)`
+3. `RoceTransportEngine` 根据 `ThreePHeader::State` 选 lane：
+   - `REQUEST -> req_ctrl`
+   - `DATA -> data`
+   - `ACT -> act_ctrl`
+4. `RoceTransportEngine` 按 `flow + lane` 分配或复用 `QPN`
+5. `RoceTxScheduler` 把 work 切成 `RoceTxSlice`
+6. `sendflowclient` 再取 `TryGetNextDispatchAction(...)` 出来的 slice
 
-发送包时，无论是否启用 RoCE，都会先准备：
+这一步的作用是：
 
-- `HopCountHeader`
-- `ThreePHeader`
-- `FlowTagHeader`（仅 DATA）
+- 先把“RoCE 语义上该怎么发”决定出来
+- 但还没有决定“物理端口现在是否允许发”
 
-若 RoCE 启用，还会调用 `BuildRoceTxHeader_(...)`：
+### 3.4 组包顺序
 
-1. 根据 `tag/src/dst` 构造 `RoceQpKey`
-2. 调用 `EnsureQpReadyToSend(...)`
-3. 根据当前 3P 状态决定 opcode
-4. 让 `RoceQpEngine` 填好 `qpn/psn/opcode/user phase/length`
-5. 再补齐仿真使用的 `remoteAddr/rkey/immData`
+当前实际组包顺序是：
 
-因此当前实现不是“用 RoCE 替换 3P”，而是：
+1. `HopCountHeader`
+2. `ThreePHeader`
+3. `FlowTagHeader`
+   - 主要在 DATA 上出现
+4. `RoceSimHeader`
+   - 通过 `RoceTransportEngine::BuildTxHeader(...)` 或 `BuildAckHeader(...)`
 
-- 3P 仍然是主业务头
-- RoCE 头是附加的语义层
-- 当前 `SEND` 也还不是完整 verbs 语义，因为接收侧 `RQ` 资源模型尚未补齐
+然后 `sendflowclient` 会给 packet 额外挂一个本地 `RdmaDispatchTag`。
 
-### 3.4 三种报文的发送差异
+这个 tag 里带：
 
-说明：
+1. `flowKey(tag/src/dst)`
+2. `state`
+3. `qpn`
+4. `psn`
+5. `opcode`
+6. `txClass`
+7. `sliceBytes / packetIndex / totalPackets`
+8. `isLastSlice`
+9. `isRetransmission`
+10. `isTransportAck`
 
-- 下面描述的是当前 stage 1 实现的实际行为
-- 不等于会议后已经定下来的最终字节口径
-- 关于 `SEND/WRITE`、`SQ/RQ/CQ`、RoCE 可见头和 MTU 预算的目标设计，请同时参考：
-  - [roce-phase2-design.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-phase2-design.md)
+这一步非常关键：
 
-#### REQUEST
+- `RdmaDispatchTag` 是 `PacketTag`
+- 它不会进入线上字节流
+- 所以不会改变当前 MTU 分片逻辑
 
-- 只发一个小控制包
-- 在 RoCE 开启时，先以控制类 work 入队
-- 真正出网后再触发发送回调
+## 4. 从 `sendflowclient` 到物理 port
 
-#### DATA
+### 4.1 外部直发路径
 
-- 按 MTU 分片
-- 当前 stage 1 里，分片预算仍按原始 `MTU` 走
-- 下一阶段会改成：每包只扣可见 RoCE 头，其他仿真控制信息继续隐藏在业务区里
-- 每个分片都带 `ThreePHeader::DATA`
-- 每个分片都可携带 `RoceSimHeader`
-- 在 RoCE 开启时，以数据类 work 入队
-- 之后由 scheduler 逐 slice 放出
-- 当前调度规则是：
-  - 控制类优先
-  - 数据类按活跃 QP 轮询
-- 当前还额外受 transport 窗口约束：
-  - 每个 QP 最多只允许 `transportWindowPackets` 个 packet outstanding
-  - ACK 回来后窗口才会继续释放
+如果当前发送模式是 `External`：
 
-#### ACT
+1. `sendflowclient` 通过 `FlowIo` 选择外部设备
+2. `FlowIo` 检查 packet 是否带 `RdmaDispatchTag`
+3. 如果带 tag，且目标 `PointToPointNetDevice` 上 aggregate 了 `RdmaPortEngine`
+4. 则调用 `RdmaPortEngine::SubmitFromFlowIo(...)`
+5. 否则回退到原来的 `sock->SendTo(...)`
 
-- 由接收侧在“最后一个 DATA 包到齐”后反向发出
-- 当前 RoCE opcode 为 `Send`
-- 它是 3P 业务控制报文，不是 transport ACK
-- 在 RoCE 开启时，它也先进入控制类队列，再由 scheduler 放出
+### 4.2 内部经 bridge 的路径
 
-## 4. 报文进入网络前的绑定
+如果当前发送模式是 `Internal`：
 
-在 `scratch/my_common.h` 里，应用初始化时会：
+1. `sendflowclient` 仍然把包交给 `FlowIo`
+2. `FlowIo` 把包送到本节点的 bridge device
+3. `MinHopBridgeNetDevice` 仍然按原逻辑做：
+   - 学表
+   - 转发
+   - 选真实 `outPort`
+4. 当 bridge 知道具体 `outPort` 后：
+   - 如果这是本地注入流量
+   - 且 packet 带 `RdmaDispatchTag`
+   - 且该 `outPort` 上有 `RdmaPortEngine`
+   - 则调用 `RdmaPortEngine::SubmitFromBridgeEgress(...)`
+5. 否则还是直接 `outPort->SendFrom(...)`
 
-1. `App->SetRoceConfig(g_roce_cfg)`
-2. `App->initialization(proto, ...)`
+因此，当前实现保证了两件事：
 
-其中 `proto` 在 RoCE 开启时取 `g_roce_cfg.etherType`。
+1. bridge 仍然保留原来的选路职责
+2. `QP/重传/端口 credit` 不需要在 bridge 之前就猜出最终 port
 
-所以当前 RoCE 是一个二层协议号绑定：
+## 5. `RdmaPortEngine` 在发送时实际做什么
 
-- 收发 socket 监听的是这个 EtherType
-- 3P 头和 RoCE 头都走同一条二层路径
+一旦 packet 进入具体 `outPort` 上的 `RdmaPortEngine`，当前会发生下面这些事：
 
-## 5. `sendflowclient` 接收侧 workflow
+1. 从 `RdmaDispatchTag` 判断这是不是 control packet
+2. 根据目标地址分类 `qid`
+3. 检查这个 `qid` 当前是否 paused
+4. 检查这个 `qid` 的 inflight packet 数是否已经到上限
+5. 如果当前不能发：
+   - 把 packet 放进端口本地 pending queue
+6. 如果当前能发：
+   - 补写 `queueId` 到 `RdmaDispatchTag`
+   - 真正调用 `PointToPointNetDevice::SendFrom(...)`
+7. 发出成功后：
+   - 记录端口侧 outstanding packet
+   - 必要时 arm retransmission timer
+   - 通过 `TxNotifyCallback` 通知 `sendflowclient`
+8. 设备 `PhyTxEnd` 发生后：
+   - 归还端口 inflight credit
+   - 再尝试 drain pending queue
 
-### 5.1 先按 legacy 路径拆头，再探测 RoCE 头
+### 5.1 当前 retransmission 的新语义
 
-`HandleRead(...)` 的顺序是：
+当前版本最重要的变化之一是：
 
-1. 去掉 `HopCountHeader`
-2. 去掉 `ThreePHeader`
-3. 取出 `tag/src/dst`
-4. 若 RoCE 开启，先用 probe 包试探 `RoceSimHeader`
-5. 只有 `tag/src/dst` 匹配时，才真正消费 RoCE 头
+- timeout 不再等于“已经消耗了一次 retry”
 
-这样做的目的，是防止把 legacy 包误判成 RoCE 包。
+更准确的语义变成了：
 
-### 5.2 收到 RoCE 头后做什么
+1. timeout 到来后，先标记“这个最老 outstanding 需要重传”
+2. 把它放回端口 pending queue
+3. 只有当它真的再次通过 `SendFrom(...)` 发出去时
+4. 才 `retry++`
 
-`HandleRoceRxHeader_(...)` 做三类事：
+这样做的目的，是避免 packet 在 PFC/pause 期间尚未真正重新上链路，却在模拟器里已经把 retry 次数烧光。
 
-1. QP 接收校验
-   - 状态是否合法
-   - opcode 是否支持
-   - 长度是否合法
+## 6. 接收侧当前怎么工作
 
-2. 语义一致性检查
-   - `user phase` 是否与 `ThreePHeader::State` 一致
-   - `opcode` 是否与本地推导一致
+### 6.1 包先到 socket，再到 `sendflowclient::HandleRead`
 
-3. 轻量乱序接收跟踪
-   - future PSN 会先进入 `pendingRxPsns`
-   - 旧包/重复包不会再把 QP 直接打成 `Err`
-   - future packet 不会再直接上送业务层
-   - 当前会先进入 sendflowclient 的 reorder buffer，等前面的洞补齐后再按序释放
+接收时：
 
-4. ACT 到达时推进业务 FSM
-   - `ACT` 仅推进业务完成
-   - 不再承担 transport completion 语义
+1. packet 先从设备/bridge 上送到应用 socket
+2. `sendflowclient::HandleRead(...)` 收到 packet
+3. 先拆：
+   - `HopCountHeader`
+   - `ThreePHeader`
+4. 再探测是否存在 `RoceSimHeader`
 
-5. transport ACK
-   - 只要收到的不是 `RoceOpcode::Ack`，当前实现就会发一个协议 ACK
-   - ACK 是 transport 层报文，不是业务 `ACT`
-   - ACK 收到后会推进发送端的 outstanding 窗口
+### 6.2 bridge 现在会告诉应用：真实 ingress 口是谁
 
-### 5.3 接收侧三种 3P 状态如何收敛
+如果 packet 是经 bridge 本地上送应用的：
 
-#### REQUEST
+1. bridge 会在 copy 后的 packet 上加 `RdmaIngressPortTag`
+2. 这个 tag 里只存一个 `deviceIndex`
+3. `sendflowclient::HandleRead(...)` 用它恢复真实 ingress p2p 口
 
-- 若接收回调已登记，立即回调 Astra-Sim
+这样做的目的，是让 ACK 能回到正确的端口侧状态机。
 
-#### DATA
+### 6.3 ACK 当前怎样处理
 
-- 每到一个 DATA 分片就增加计数
-- 第一个 DATA 会带来 `FlowTagHeader`
-- 最后一个 DATA 到达时：
-  - 反向发送一个 ACT
-  - 写入 `recvHash`
-  - 若回调已登记，则立即回调上层
+如果收到的 RoCE packet 是 `Ack`：
 
-#### ACT
+1. `sendflowclient::HandleRead(...)` 先根据 `RdmaIngressPortTag` 找到 ingress `RdmaPortEngine`
+2. 先调用 `RdmaPortEngine::HandleAck(...)`
+   - retire 端口侧 outstanding
+   - cancel/re-arm retransmission timer
+   - 清理 recovery target
+3. 然后再调用 `RoceTransportEngine::OnRxPacket(...)`
+   - 让语义侧镜像状态也同步更新
 
-- 发送方收到 `ACT` 后
-- 触发最初登记的发送完成回调
+所以当前 ACK 路径是“双层更新”：
 
-## 6. completion / callback 的真实关系
+1. 端口执行层先处理
+2. 语义 transport 层再镜像处理
 
-当前版本里，完成关系已经收敛为下面这套：
+这也是当前版本仍然处于过渡态的一个重要标志。
 
-1. 接收方收齐 DATA
-2. 接收方显式发 ACT
-3. 发送方收到 ACT
-4. 发送方触发业务发送完成回调
+### 6.4 非 ACK 包怎样处理
 
-所以：
+如果收到的不是 `Ack`：
 
-- `ACT` 只是 3P 的业务控制报文
-- 它不是 RC 可靠传输里的 ACK/completion
+1. `RoceTransportEngine::OnRxPacket(...)` 负责：
+   - QP 合法性检查
+   - RX reorder
+   - `expectedRxPsn`
+   - 是否需要发 transport ACK
+   - 哪些 upper payload 已经 ready
+2. 如果 `needAck=true`
+   - `sendflowclient` 当前仍会构造 ACK packet
+   - 给 ACK 也挂 `RdmaDispatchTag`
+   - 再经 `FlowIo / bridge / RdmaPortEngine` 发出去
+3. 如果有 ready payload
+   - 才继续交给 `ProcessThreePhasePayload_(...)`
 
-与此同时，transport 层自己的可靠性闭环现在已经存在：
+## 7. 3P 业务语义在接收侧怎样收敛
 
-1. 每个非 ACK transport packet 都会进入 outstanding 集合
-2. 每个 QP 只维护一个 oldest-unacked timer
-3. timeout 后 QP 进入 recovery
-4. recovery 期间新的普通 packet 会被阻塞
-5. retransmission 会先于普通 slice 发送
+### 7.1 `REQUEST`
 
-## 7. 当前 workflow 与 UB workflow 的差异
+- 收到后按当前 3P 逻辑触发 receiver 回调
 
-当前项目：
+### 7.2 `DATA`
 
-1. Astra-Sim 发起 P2P 流
-2. `ASTRASimNetwork::sim_send/sim_recv`
-3. `my_entry::SendFlow`
-4. `sendflowclient`
-5. `RoceTxScheduler` 入队与出队
-6. 叠加 `RoceSimHeader`
-7. 网络发送
-8. 对端解析 3P + RoCE
-9. 通过 REQUEST / DATA / ACT 回调 Astra-Sim
+1. 每到一个 DATA 分片就增加计数
+2. 收齐后：
+   - 反向发送 ACT
+   - 写入 `recvHash`
+   - 触发 receiver 回调
 
-UB：
+### 7.3 `ACT`
 
-1. 应用发起 task / WQE
-2. `UbTransaction` 或 `UbLdstInstance`
-3. 切成 segment
-4. `UbTransportChannel` 或 `UbLdstApi` 构包
-5. 接收侧自动产生 ACK / response
-6. ACK 推进窗口并完成 WQE/task
+1. sender 收到 ACT
+2. 业务层触发最初登记的发送完成回调
+3. 打出 `TX_DONE`
 
-一句话概括：
+这说明当前 `ACT` 仍然只是业务控制报文，不是 transport ACK。
 
-- 当前项目：以 3P 业务流为中心，RoCE 是增强层
-- UB：以事务/传输协议为中心，应用任务是上层负载
+## 8. 当前工作流里最值得注意的“边界点”
+
+### 8.1 当前有两套“谁来控制发送”的逻辑
+
+1. `RoceTransportEngine`
+   - 决定语义上“下一片该发什么”
+2. `RdmaPortEngine`
+   - 决定物理上“这一片现在能不能从这个 port 发出去”
+
+这两个层次现在还没有完全合并。
+
+### 8.2 当前有两套 reliability state 视角
+
+1. `RoceTransportEngine`
+   - 保留镜像 outstanding / reorder / recovery 视角
+2. `RdmaPortEngine`
+   - 开始持有真实端口侧 outstanding / ack retire / retrans timer
+
+这就是当前实现最需要继续收敛的地方。
+
+### 8.3 当前本地元数据不会影响 MTU
+
+这一点已经是当前实现的重要前提：
+
+- `RdmaDispatchTag`
+- `RdmaIngressPortTag`
+
+都是 `PacketTag`，不是线上 header。
+
+因此在当前版本里：
+
+- bridge/port 需要的本地控制信息已经能随 packet 走
+- 同时不会改变当前 `RoCESimHeader + 3P header` 的线上长度口径
+
+## 9. 用一句话概括当前 workflow
+
+当前版本里，一条流的真实流程是：
+
+- `sendflowclient` 决定业务语义，
+- `RoceTransportEngine` 决定 RoCE 语义和 slice，
+- `RdmaPortEngine` 决定这个 slice 何时能从某个物理 port 真正发出去，
+- 接收时再由 bridge 把真实 ingress port 信息带回应用层，使 ACK 能回到正确的端口状态机。

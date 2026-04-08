@@ -22,6 +22,7 @@
 10. ACK sideband cumulative feedback
 11. 自动 ACK timeout 基线推导
 12. 主程序级 `network drained / last FLOW_TX_DONE` 时间观测
+13. Astra-Sim 当前活跃路径上 `PacketSentFinshed` 回调对象泄漏修复
 
 这意味着当前版本已经不是“无窗口、无 ACK、无重传”的 stage 1 状态了。
 
@@ -53,6 +54,17 @@
 
 - `ComputeAutoRoceAckTimeoutBaseNs()`
 - `RefreshRoceAckTimeoutFromNetworkConfig()`
+
+最近的大规模实验还补了一个重要经验结论：
+
+1. 当前自动公式更接近理论下界，不是大规模网络上的安全值。
+2. 常见配置里：
+   - `ack_timeout_factor=2` 会出现大量首包 `psn=0` timeout，并伴随 `RTX_DROP`
+   - `ack_timeout_factor=4` 可以明显缓解，但仍有较多 timeout
+   - `ack_timeout_factor=8` 时，最近一次大规模实验已经能稳定收满全部 flow，并把 `RTX_DROP` 压到 `0`
+3. 因此当前更稳妥的口径是：
+   - 自动公式先给出一个理论 RTT 基线
+   - 大规模实验再用 `ack_timeout_factor` 做经验放大
 
 ### 2.2 分片口径改动
 
@@ -242,6 +254,44 @@
 3. 网络活动结束
 
 这三种时间口径拆开。
+
+### 2.5C `PacketSentFinshed` 内存泄漏修复
+
+文件：
+
+- `src/applications/astra-sim/system/Sys.cc`
+
+这一步不是 RoCE transport 语义本身，但它和大规模 RoCE 实验能否长时间稳定跑完直接相关，因此也记在这里。
+
+最近为了追查“仿真时间越长 RSS 越大”的问题，临时给 `SendPacketEventHandlerData` 加过一次 alloc/free 计数。小模型直接确认：
+
+- `alloc=336`
+- `free=0`
+- 并且全部来自 `PacketSentFinshed`
+
+这说明：
+
+- 当前活跃路径上，`PacketSentFinshed` 对应的 `SendPacketEventHandlerData` 在回调返回后没有释放
+
+修复方式很小，只是在：
+
+- `Sys::handleEvent(EventType::PacketSentFinshed)`
+
+这条分支里，在：
+
+- `owner->sendcallback(ehd)`
+
+返回后补上：
+
+- `delete ehd`
+
+修复后同样的小模型会变成：
+
+- `alloc=336`
+- `free=336`
+- `live=0`
+
+因此，这条泄漏现在已经是**确认存在且已修复**的历史问题。
 
 ### 2.6 定时器与重传
 
@@ -493,6 +543,29 @@
 这不说明网络队列配置完全不重要，而是说明：
 
 - 在你当前这组 workload 和参数下，**发送端注入强度与回压耦合更主导**。
+
+## 4.1 最近大规模 timeout 的当前解释
+
+最近一次较大规模网络实验里，虽然队列、窗口和乱序窗口配置都不算激进，但仍然出现了较多 timeout。现在更合理的解释已经比较明确：
+
+1. 主因不是 ACK/reorder 结构性 bug 回来了
+2. 也不是队列真实 drop 主导
+3. 更像是：
+   - 自动 timeout 基线在大规模拓扑上偏小
+   - 第一批 ACK 返回时间略高于理论基线
+   - 于是出现一批首包 `psn=0` 的误判 timeout
+
+最近的经验 sweep 已经验证：
+
+- 把 `ack_timeout_factor` 从 `2 -> 4 -> 8` 拉大后
+- `RTX_TIMEOUT` 会持续下降
+- `RTX_DROP` 会从非零压到 `0`
+- 总完成时间也会继续改善
+
+因此当前对这部分最稳妥的判断是：
+
+- **自动公式仍需继续改进**
+- 但在进一步改公式之前，`ack_timeout_factor` 已经是当前大规模实验中有效的稳定性旋钮
 
 ## 5. bounded reorder window 设计收敛
 

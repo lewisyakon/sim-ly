@@ -27,7 +27,7 @@
   },
 
   "pfc": {
-    "drop_tail_queue_size": "200",
+    "drop_tail_queue_size": "500",
     "drop_tail_queue_num": "16",
     "high_watermark": 0.8,
     "low_watermark": 0.2,
@@ -37,7 +37,7 @@
   "topology": {
     "model": "fattree",
     "k": 4,
-    "subnet_model": 2,              
+    "subnet_model": 0,              
     "subnet_k": 4,                             
     "hostperleaf": 2,                            
     "switch_delay_ns_override": 100 
@@ -50,10 +50,10 @@
     "sq_depth": 1024,
     "rq_depth": 1024,
     "transport_ack_enable": true,
-    "transport_window_packets": 32,
+    "transport_window_packets": 200,
     "reorder_window_packets": 4,
     "ack_timeout_mode": "auto",
-    "ack_timeout_factor": 2.0,
+    "ack_timeout_factor": 8.0,
     "ack_timeout_ns": 50000,
     "max_retransmissions": 8,
     "ether_type": "0x9999",

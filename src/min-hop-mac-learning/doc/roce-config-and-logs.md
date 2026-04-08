@@ -62,6 +62,7 @@
 - `ack_timeout_factor`（double）
   - 含义：自动 timeout 模式下，乘在理论 RTT 基线上的放大系数。
   - 影响：最终 `ack_timeout_ns = ceil(ackTimeoutBaseNs * ack_timeout_factor)`。
+  - 当前经验：小规模配置里 `2.0` 通常可用；较大规模网络最近一次稳定实验使用的是 `8.0`。这说明当前自动公式更像理论下界，实际大规模运行通常还需要额外安全系数。
 
 - `ack_timeout_ns`（uint64）
   - 含义：手工指定的 ACK timeout，单位 ns。
@@ -132,6 +133,26 @@ all passes finished at time: ...
 - `[main] network drained`
   - 网络活动口径
 
+### 3.0A 当前不再打印的临时内存观测
+
+最近为了确认大规模内存增长问题，曾经临时加过一条：
+
+```text
+[main] SendPacketEventHandlerData ...
+```
+
+这条日志现在已经删除，不再出现在仓库默认输出里。
+
+它对应的问题已经确认是：
+
+- `PacketSentFinshed` 路径上的 `SendPacketEventHandlerData` 未释放
+
+并且已经在：
+
+- [Sys.cc](/home/lja/sim-ly/sim-ly/src/applications/astra-sim/system/Sys.cc)
+
+修复。因此如果后面再看到大规模 RSS 持续增长，不要再把这条历史调试日志当作当前标准输出的一部分。
+
 ### 3.1 配置与激活日志
 
 示例：
@@ -195,7 +216,7 @@ all passes finished at time: ...
 示例：
 
 ```text
-[ROCE][SCHED][ENQ] workId=5 state=1 tag=1 src=0 dst=1 qpn=5 totalBytes=16384 totalPackets=4 class=1
+[ROCE][SCHED][ENQ] workId=5 state=1 lane=data tag=1 src=0 dst=1 qpn=5 totalBytes=16384 totalPackets=4 class=1
 ```
 
 含义：
@@ -205,10 +226,14 @@ all passes finished at time: ...
   - `0`：REQUEST
   - `1`：DATA
   - `2`：ACT
+- `lane`
+  - `req_ctrl`：REQUEST 控制 lane
+  - `data`：DATA lane
+  - `act_ctrl`：ACT 控制 lane
 - `src/dst`
   - 本条流的发送端和接收端。
 - `qpn`
-  - 该 flow 当前绑定的 QP 编号。
+  - 该 flow 在当前 lane 上绑定的 QP 编号。
 - `totalPackets`
   - 该工作最终会被拆成多少个 slice。
 - `class`
@@ -219,14 +244,14 @@ all passes finished at time: ...
 
 - 流方向
 - 三阶段顺序
-- 哪些 flow 挂在哪个 QP 上
+- 哪些 flow 在哪个 lane / QP 上
 
 #### `[ROCE][SCHED][TX]`
 
 示例：
 
 ```text
-[ROCE][SCHED][TX] workId=5 state=1 tag=1 src=0 dst=1 qpn=5 packetIndex=2 sliceBytes=4096 totalPackets=4 last=false class=1
+[ROCE][SCHED][TX] workId=5 state=1 lane=data tag=1 src=0 dst=1 qpn=5 packetIndex=2 sliceBytes=4096 totalPackets=4 last=false class=1
 ```
 
 含义：
@@ -409,6 +434,24 @@ TriggerSendTo_now declared now time = 500000000123456789 src=0 dst=1 tag=5 size=
 
 但需要注意：
 
+### 5.0 `RoCE disable` 时的基线现象
+
+当：
+
+- `roce.enable = false`
+
+时，当前 `simulation.log` 的正常现象是：
+
+- 会有 `[ROCE][CFG] enable=false`
+- 不会有 `[ROCE][ACTIVE]`
+- 不会有 `[ROCE][SCHED][ENQ] / [ROCE][SCHED][TX]`
+- 业务侧仍然应该能看到 `[FLOW][REQ_DONE] / [FLOW][RX_DONE] / [FLOW][TX_DONE]`
+
+也就是说：
+
+- `enable=false` 时“只有 `[ROCE][CFG]`”并不代表异常
+- 它只说明 RoCE 配置已广播，但发送/接收实际仍走 legacy 3P 路径
+
 ### 5.1 第一次失败现象
 
 在一次早期测试中，这个 workload 使用了：
@@ -431,7 +474,8 @@ mock_nccl_comms_init: DP_size=8 is not divisible by EP_size=16. Disabling EP (se
 
 这说明：
 
-- 不是 RoCE scheduler 出队有问题
+- 不是 `enable=false` 那种正常 legacy 基线
+- 也不是 RoCE scheduler 出队有问题
 - 而是 workload 的 `EP` 设置本身不合法，导致通信路径根本没有被下发
 
 ### 5.2 修正为 `ep: 4` 后的新现象

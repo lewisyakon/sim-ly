@@ -2,6 +2,9 @@
 #include "flow-io.h"
 #include "hop-count-header.h"
 #include "pause-header.h"
+#include "rdma-dispatch-tag.h"
+#include "rdma-ingress-port-tag.h"
+#include "rdma-port-engine.h"
 
 #include "ns3/boolean.h"
 #include "ns3/bridge-channel.h"
@@ -839,7 +842,14 @@ MinHopBridgeNetDevice::ScheduleReceive(Ptr<NetDevice> incomingPort,
         // Packet is for us. Pass up to local applications.
         if (dst48 == m_address)
         {
-            m_rxCallback(this, p, protocol, src);
+            Ptr<Packet> rxPacket = p->Copy();
+            if (incomingPort)
+            {
+                RdmaIngressPortTag ingressTag;
+                ingressTag.SetDeviceIndex(incomingPort->GetIfIndex());
+                rxPacket->AddPacketTag(ingressTag);
+            }
+            m_rxCallback(this, rxPacket, protocol, src);
         }
         break;
 
@@ -885,7 +895,14 @@ MinHopBridgeNetDevice::ScheduleReceive(Ptr<NetDevice> incomingPort,
         }
         else // It's for us but was misidentified? Pass up.
         {
-            m_rxCallback(this, p, protocol, src);
+            Ptr<Packet> rxPacket = p->Copy();
+            if (incomingPort)
+            {
+                RdmaIngressPortTag ingressTag;
+                ingressTag.SetDeviceIndex(incomingPort->GetIfIndex());
+                rxPacket->AddPacketTag(ingressTag);
+            }
+            m_rxCallback(this, rxPacket, protocol, src);
         }
         break;
     default:
@@ -1576,6 +1593,22 @@ MinHopBridgeNetDevice::sendFromWithDropStats(Ptr<NetDevice> outPort,
     if (!outPort || !packet)
     {
         return false;
+    }
+
+    if (localInjection)
+    {
+        RdmaDispatchTag dispatchTag;
+        if (packet->PeekPacketTag(dispatchTag))
+        {
+            Ptr<PointToPointNetDevice> p2pOutPort = DynamicCast<PointToPointNetDevice>(outPort);
+            Ptr<RdmaPortEngine> portEngine =
+                p2pOutPort ? p2pOutPort->GetObject<RdmaPortEngine>() : nullptr;
+            if (portEngine &&
+                portEngine->SubmitFromBridgeEgress(src, dst, protocol, packet->Copy()))
+            {
+                return true;
+            }
+        }
     }
 
     bool ok = outPort->SendFrom(packet->Copy(), src, dst, protocol);

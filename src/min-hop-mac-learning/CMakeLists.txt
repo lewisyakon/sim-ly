@@ -13,8 +13,12 @@ set(source_files
     model/PppRoundRobinQueue.cc
     model/FlowTagHeader.cc
     model/flow-io.cc
+    model/rdma-dispatch-tag.cc
+    model/rdma-ingress-port-tag.cc
+    model/rdma-port-engine.cc
     model/roce-sim-header.cc
     model/roce-qp-engine.cc
+    model/roce-transport-engine.cc
     model/roce-three-phase-fsm.cc
     model/roce-tx-scheduler.cc
 )
@@ -29,9 +33,13 @@ set(header_files
     model/PppRoundRobinQueue.h
     model/FlowTagHeader.h
     model/flow-io.h
+    model/rdma-dispatch-tag.h
+    model/rdma-ingress-port-tag.h
+    model/rdma-port-engine.h
     model/roce-sim-types.h
     model/roce-sim-header.h
     model/roce-qp-engine.h
+    model/roce-transport-engine.h
     model/roce-three-phase-fsm.h
     model/roce-tx-scheduler.h
 )

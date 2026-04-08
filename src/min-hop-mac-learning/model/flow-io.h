@@ -88,6 +88,7 @@ private:
   uint32_t ClassifyQueueId(const Address& dest) const;
   bool IsTxQueuePaused(uint32_t queueId) const;
   bool SendOnDevice(uint32_t devIndex, const Address& dest, Ptr<Packet> pkt);
+  bool TrySubmitViaRdmaPortEngine(uint32_t devIndex, const Address& dest, Ptr<Packet> pkt);
   bool IsHighPriorityControlPacket(Ptr<Packet> pkt) const;
   void EnqueueBuffered(uint32_t devIndex, uint32_t queueId, const Address& dest, Ptr<Packet> pkt);
   void DrainBuffered();
