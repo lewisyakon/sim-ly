@@ -1331,6 +1331,96 @@ MinHopBridgeNetDevice::GetLearnedState(Mac48Address source)
     return resultPorts;
 }
 
+std::vector<Ptr<NetDevice>>
+MinHopBridgeNetDevice::GetLocalInjectionEgressCandidates(const Address& dst)
+{
+    std::vector<Ptr<NetDevice>> candidates;
+    if (!Mac48Address::IsMatchingType(dst))
+    {
+        return candidates;
+    }
+
+    Mac48Address dst48 = Mac48Address::ConvertFrom(dst);
+    if (dst48 == Mac48Address::GetBroadcast() || dst48.IsGroup())
+    {
+        candidates.reserve(m_ports.size());
+        for (auto const& port : m_ports)
+        {
+            if (!port)
+            {
+                continue;
+            }
+            if (IsEgressQueueCongested(port, dst48, true))
+            {
+                continue;
+            }
+            candidates.push_back(port);
+        }
+        return candidates;
+    }
+
+    std::vector<Ptr<NetDevice>> learnedPorts = GetLearnedState(dst48);
+    if (!learnedPorts.empty())
+    {
+        candidates.reserve(learnedPorts.size());
+        for (auto const& port : learnedPorts)
+        {
+            if (!port)
+            {
+                continue;
+            }
+            if (IsEgressQueueCongested(port, dst48, true))
+            {
+                continue;
+            }
+            candidates.push_back(port);
+        }
+        return candidates;
+    }
+
+    candidates.reserve(m_ports.size());
+    for (auto const& port : m_ports)
+    {
+        if (!port)
+        {
+            continue;
+        }
+        if (IsEgressQueueCongested(port, dst48, true))
+        {
+            continue;
+        }
+        candidates.push_back(port);
+    }
+    return candidates;
+}
+
+Ptr<NetDevice>
+MinHopBridgeNetDevice::ResolveLocalInjectionEgressPort(const Address& src,
+                                                       const Address& dst,
+                                                       uint64_t uidHint)
+{
+    std::vector<Ptr<NetDevice>> candidates = GetLocalInjectionEgressCandidates(dst);
+    if (candidates.empty())
+    {
+        return nullptr;
+    }
+    if (candidates.size() == 1)
+    {
+        return candidates.front();
+    }
+
+    if (!Mac48Address::IsMatchingType(dst))
+    {
+        return candidates.front();
+    }
+
+    const Mac48Address src48 =
+        Mac48Address::IsMatchingType(src) ? Mac48Address::ConvertFrom(src)
+                                          : Mac48Address::ConvertFrom(m_address);
+    const Mac48Address dst48 = Mac48Address::ConvertFrom(dst);
+    return ecmp(candidates, src48, dst48, uidHint);
+}
+
 uint32_t
 MinHopBridgeNetDevice::GetNBridgePorts() const
 {

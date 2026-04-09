@@ -100,6 +100,10 @@ class MinHopBridgeNetDevice : public NetDevice
         std::vector<uint64_t> subQueueDropPackets;
     };
     std::vector<IngressQueueSnapshot> GetIngressQueueSnapshots() const;
+    std::vector<Ptr<NetDevice>> GetLocalInjectionEgressCandidates(const Address& dst);
+    Ptr<NetDevice> ResolveLocalInjectionEgressPort(const Address& src,
+                                                   const Address& dst,
+                                                   uint64_t uidHint = 0);
     
   protected:
     void DoDispose() override;

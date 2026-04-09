@@ -34,6 +34,7 @@ class RoceTransportEngine;
 struct RoceTxSlice;
 class RdmaDispatchTag;
 class RdmaPortEngine;
+class MinHopBridgeNetDevice;
 
 uint64_t GetLastNetworkActivityTimeFs();
 uint64_t GetLastFlowTxDoneTimeFs();
@@ -85,14 +86,6 @@ private:
   void SendPacket(ThreePHeader::State state, const Address& dest,uint64_t datasize,
     uint32_t tag,uint32_t src,uint32_t dst,FlowSendMode sendmodel,int mindex=0);
   void realsend(Ptr<Packet> packet,const Address& dest,FlowSendMode sendmodel,int mindex=0);
-  // 发送侧：根据当前 3P 状态构建 RoCE 头（含 opcode / phase / psn 等）。
-  bool BuildRoceTxHeader_(ThreePHeader::State state,
-                          uint64_t totalDataSize,
-                          uint32_t payloadBytes,
-                          uint32_t tag,
-                          uint32_t src,
-                          uint32_t dst,
-                          RoceSimHeader* headerOut);
   void EnqueueRoceWork_(ThreePHeader::State state,
                         const Address& dest,
                         uint64_t datasize,
@@ -101,25 +94,7 @@ private:
                         uint32_t dst,
                         FlowSendMode sendmodel,
                         int mindex = 0);
-  void ScheduleRoceDispatch_();
-  void DispatchOneRoceSlice_();
-  bool BuildPacketForRoceSlice_(const RoceTxSlice& slice,
-                                Ptr<Packet>* packetOut,
-                                RoceSimHeader* headerOut = nullptr);
   void FinalizeRoceSliceDispatch_(const RoceTxSlice& slice);
-  bool BuildRoceAckPacket_(uint32_t tag,
-                           uint32_t src,
-                           uint32_t dst,
-                           uint32_t qpn,
-                           Ptr<Packet>* packetOut,
-                           RoceSimHeader* headerOut = nullptr);
-  void MaybeSendRoceAck_(const Address& dest,
-                         uint32_t tag,
-                         uint32_t src,
-                         uint32_t dst,
-                         uint32_t qpn,
-                         uint32_t rxInDevIndexForLoopback,
-                         RoceOpcode rxOpcode);
   void ProcessThreePhasePayload_(Ptr<Packet> payload,
                                  const ThreePHeader& TPheader,
                                  const Address& from,
@@ -128,19 +103,15 @@ private:
                                  uint32_t transportFragmentId = 0);
   void InitializeRdmaPortEngines_();
   void HandleRdmaPortPacketSent_(Ptr<Packet> packet);
-  void AttachRdmaDispatchTag_(Ptr<Packet> packet,
-                              const RoceTxSlice& slice,
-                              const RoceSimHeader& header);
-  void AttachRdmaAckDispatchTag_(Ptr<Packet> packet,
-                                 uint32_t tag,
-                                 uint32_t src,
-                                 uint32_t dst,
-                                 const RoceSimHeader& header);
-  void MarkRdmaDispatchTagRetransmission_(Ptr<Packet> packet);
   void FinalizeRdmaTaggedDispatch_(const RdmaDispatchTag& tag);
   uint32_t ResolveRoceIngressDeviceIndex_(const Ptr<Packet>& packet,
                                           uint32_t fallbackIndex) const;
   Ptr<RdmaPortEngine> GetRdmaPortEngineByDeviceIndex_(uint32_t deviceIndex) const;
+  Ptr<RdmaPortEngine> ResolveRoceTxPortEngine_(const Address& dest,
+                                               FlowSendMode sendmodel,
+                                               int mindex,
+                                               uint64_t uidHint = 0) const;
+  Address ExtractRoceWireDestination_(const Address& dest) const;
 
 
   std::map<RoceFlowKey, ns3::fuc_and_par> m_sendfunctable;  // key: flowid
@@ -169,11 +140,13 @@ private:
   int reqlen,acklen;
   uint32_t localbridgeindex;
   ns3::Ptr<ns3::FlowIo> m_io;
+  uint32_t m_outDeviceIndex = 1;
+  uint32_t m_innerDeviceIndex = 0;
+  Ptr<NetDevice> m_bridgeDevice;
 
   RoceConfig m_roceCfg; // 当前节点 RoCE 配置（来自 json）
   RoceMode m_roceMode = RoceMode::Legacy;
   std::unique_ptr<RoceTransportEngine> m_roceTransport;
-  EventId m_roceDispatchEvent;
   bool m_roceActiveLogged = false;
 };
 

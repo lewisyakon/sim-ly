@@ -53,6 +53,12 @@ enum class RoceLogLevel : uint8_t {
   Full = 2,
 };
 
+enum class RoceCompletionKind : uint8_t {
+  Any = 0,
+  Send = 1,
+  Recv = 2,
+};
+
 struct RoceConfig {
   bool enable = false;                 // 总开关
   bool dataUseWrite = true;            // DATA 阶段默认使用 WRITE 语义
@@ -133,6 +139,7 @@ struct RoceCompletion {
   uint32_t psn = 0;
   uint32_t wrId = 0;
   bool success = true;
+  RoceCompletionKind kind = RoceCompletionKind::Send;
 };
 
 } // namespace ns3

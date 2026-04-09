@@ -64,6 +64,15 @@ RoceTxScheduler::GetPendingWorkCount() const {
   return m_pendingWorkCount;
 }
 
+uint64_t
+RoceTxScheduler::GetPendingWorkCount(const RoceQpKey& qpKey) const {
+  auto it = m_workQueues.find(qpKey);
+  if (it == m_workQueues.end()) {
+    return 0;
+  }
+  return static_cast<uint64_t>(it->second.size());
+}
+
 bool
 RoceTxScheduler::PickNextSlice(uint32_t maxSliceBytes,
                                const std::set<RoceQpKey>* blockedQps,
@@ -121,10 +130,15 @@ RoceTxScheduler::PickFromClass_(RoceTxClass txClass,
     out->dest = work.dest;
     out->sendMode = work.sendMode;
     out->mindex = work.mindex;
+    out->opcode = work.opcode;
+    out->userPhase = work.userPhase;
     out->totalBytes = work.totalBytes;
     out->sliceBytes = sliceBytes;
     out->packetIndex = work.packetIndex;
     out->totalPackets = work.totalPackets;
+    out->controlPacketBytes = work.controlPacketBytes;
+    out->hasFlowTagHeader = work.hasFlowTagHeader;
+    out->flowTagHeader = work.flowTagHeader;
     out->txClass = work.txClass;
 
     work.remainingBytes -= sliceBytes;
