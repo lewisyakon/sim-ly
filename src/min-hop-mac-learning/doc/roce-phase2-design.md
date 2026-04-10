@@ -1,270 +1,83 @@
-# RoCE Phase 2 设计说明
+# RoCE Phase 2 设计归档
 
-这份文档记录最近一次讨论后已经明确下来的设计边界。
+记录时间：2026-04-10
 
-它不描述“当前代码已经做到什么”，而描述：
+这份文档是历史设计归档，不再描述“下一阶段尚未实现的计划”。旧版 Phase 2 里列出的多项能力已经在当前代码中落到 `RdmaPortEngine`，因此继续保留旧的 TODO 口径会误导后续读者。
 
-1. 下一阶段要把 RoCE 做成什么样
-2. 哪些概念已经定死
-3. 当前代码和目标之间还差什么
+当前实现状态请优先看：
 
-## 1. 目标
+- [roce-current-status.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-current-status.md)
+- [roce-workflow.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-workflow.md)
+- [roce-qp-and-transport.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-qp-and-transport.md)
 
-下一阶段的目标不是做完整 RNIC，也不是做真实内存系统，而是把当前版本从“RoCE 语义旁路”推进到“更像 RC transport 的网络仿真”。
+## 1. 旧 Phase 2 的原始目标
 
-边界如下：
+旧 Phase 2 的核心目标是把 RoCE 从“语义旁路”推进到“更像 RC transport 的网络仿真”。
 
-- 继续服务 `Astra-Sim + 3P`
-- 只公开对外宣讲 `SEND + WRITE`
-- `READ` 可以保留代码入口，但不再作为对外能力
-- `ACT` 继续是业务控制报文，不是 transport ACK
-- 重传和有限乱序处理由 RoCE 层负责，而不是底层以太网层
+当时确定的方向包括：
 
-## 2. 已确定的设计口径
+1. `SEND / WRITE` 作为主要对外语义。
+2. `ACT` 继续是 3P 业务控制报文，不混同 transport ACK。
+3. QP 显式包含最小 `SQ / RQ / CQ`。
+4. 按标准可见 RoCE 头开销修正 packetization。
+5. ACK、timeout、retransmission 回到 RoCE 层。
+6. 接收侧从“简单记录 future PSN”升级为 bounded reorder buffer。
 
-## 2.1 发送语义
+这些目标在当时是设计计划；现在不能再当成未实现的路线图来读。
 
-当前对外只保留两种主语义：
+## 2. 当前已经落地的部分
 
-1. `SEND`
-2. `WRITE`
+当前代码已经落地：
 
-其中：
+1. `REQUEST / ACT` 默认走控制类 `SEND` 口径。
+2. `DATA` 默认走数据类 `WRITE` 口径。
+3. `RoceTransportEngine` 负责 `flow/lane -> qpn` 和 opcode/txClass 决策。
+4. `RdmaPortEngine::PostSend(...)` 负责显式写入 port-side `SQ`。
+5. `QpRuntime` 包含最小 `sqEntries / rqInflight / completions`。
+6. `RoceSimHeader::GetVisibleWireBytes(...)` 已经按 opcode 返回可见 RoCE transport 头大小。
+7. `RdmaPortEngine::BuildPacketForSlice_(...)` 已经把可见 RoCE 头开销纳入分片预算。
+8. `RdmaPortEngine` 维护 `m_outstandingPackets`、`m_retransTimers`、`m_pendingRetransmissions` 和 `m_recoveryTargetPsns`。
+9. ACK 进入 `RdmaPortEngine::HandleAck(...)`，按累计确认 retire outstanding。
+10. future packet 进入 `m_bufferedUpperPackets`，连续后再释放给 3P 业务层。
 
-- `REQUEST`
-  - 作为控制报文，默认走 `SEND`
-- `DATA`
-  - 作为数据报文，默认走 `WRITE`
-- `ACT`
-  - 作为控制报文，默认走 `SEND`
+这说明旧 Phase 2 的主干能力已经不是“下一阶段计划”，而是当前实现的一部分。
 
-`READ` 相关 opcode 可以暂时保留在代码和枚举中，但不再作为对外能力描述。
+## 3. 当前仍未落地或仍简化的部分
 
-## 2.2 `post` 的定义
+还有一些旧 Phase 2 中没有完全解决、或者只做了最小模型的内容：
 
-`post_send` / `post_recv` 是本地动作，不是网络中的控制报文。
+1. `RQ` 仍是最小 receive slot 模型，不是完整 posted receive/RNR。
+2. `CQ` 仍是内部 completion 队列，不是上层唯一完成语义。
+3. QP bringup 仍由代码自动推进，不是显式 verbs 参数配置。
+4. `SRQ / MR / PD` 没有建模。
+5. 主路径仍不是 `RoCEv2 over UDP/IP`。
+6. `ECN / CNP / DCQCN` 没有形成完整闭环。
+7. 多出端口绑定与多 port QP 运行时还没有成为主路径。
 
-因此：
+这些才是后续如果继续追现实 RoCE 行为时更值得讨论的内容。
 
-1. `post_send`
-   - 只修改本地 `SQ`
-2. `post_recv`
-   - 只修改本地 `RQ`
+## 4. 旧实施顺序的当前状态
 
-但 `SEND` 的成立前提是：
+旧文档里曾经把 Phase 2 拆成：
 
-- 发送端本地有 `SQ` entry
-- 接收端本地也已经有可消费的 `RQ` entry
+1. 修字节模型。
+2. 补最小 `SQ/RQ/CQ`。
+3. 补 ACK / 重传 / 有限乱序窗口。
 
-这不意味着发送端要通过网络“发一个 post 包”去改对端状态。
+现在对应状态是：
 
-更合理的仿真口径是：
+1. 字节模型：已落地最小版本。
+2. `SQ/RQ/CQ`：已落地最小版本。
+3. ACK / 重传 / reorder：已落地最小闭环。
 
-- 控制接收路径长期具备 `RQ` credit
-- 或由更上层协议在更早阶段协调好接收端 `RQ`
+因此这个文件只保留设计脉络，不再作为当前开发 TODO 使用。
 
-## 2.3 QP 结构
+## 5. 后续更准确的方向
 
-QP 在目标设计中不再只是状态和 PSN 容器，而应显式包含：
+如果后面继续增强 RoCE，建议不要再重复旧 Phase 2 的 TODO，而是围绕这些新问题讨论：
 
-1. `SQ`
-2. `RQ`
-3. `CQ`
-
-当前讨论口径中：
-
-- `SQ`
-  - 保存本地待发的 `SEND/WRITE` 请求
-- `RQ`
-  - 保存本地已贴好的接收项，供 `SEND` 消耗
-- `CQ`
-  - 保存发送/接收完成项，供上层轮询或回调
-
-## 2.4 MTU 与字节口径
-
-这里已经确定两套不同的字节模型。
-
-### legacy 模式
-
-`datasize` 的含义是：
-
-- `以太网 payload 总预算`
-
-当前 `FlowTagHeader / ThreePHeader / HopCountHeader` 这类仿真控制内容，允许继续隐藏在业务区里。
-
-### RoCE 模式
-
-RoCE 头是真实存在的，不再允许像 legacy 那样完全隐藏。
-
-因此，对每一个 RoCE 包：
-
-- `payloadBudgetPerPacket = MTU - visibleRoceBytes`
-
-其中：
-
-- `visibleRoceBytes`
-  - 只统计真实可见的 RoCE transport 头
-- `FlowTagHeader / ThreePHeader / HopCountHeader`
-  - 仍然属于业务区内部的隐藏仿真控制内容
-
-也就是说：
-
-1. 分片预算时
-   - 只把 `visibleRoceBytes` 当成额外开销
-2. 真正构造 ns-3 `Packet` 时
-   - 如果这些隐藏控制内容仍用 `Header` 写入包体
-   - 它们依然要从业务区预算里扣出
-
-因此高层公式应固定为：
-
-```text
-rocePayloadBudget = MTU - visibleRoceBytes
-zeroFillBytes = rocePayloadBudget - hiddenSimBytesThisPacket
-```
-
-## 2.5 RoCE 可见头
-
-当前讨论中，RoCE 头按下面三类看待：
-
-1. `BTH`
-   - 所有 RoCE transport 包的基础头
-2. `RETH`
-   - `WRITE/READ` 请求使用
-3. `AETH`
-   - `ACK` 使用
-
-因此下一阶段不能再把 `RoceSimHeader::GetSerializedSize()` 直接当作标准 RoCE 线长。
-
-需要单独引入：
-
-- `GetVisibleRoceWireBytes(opcode)`
-
-按包型返回标准等效大小。
-
-## 2.6 重传与 ACK
-
-重传责任已经重新划回 RoCE 层。
-
-目标机制是：
-
-1. 每包 ACK
-2. 基于 ACK 的超时重传
-3. 按 QP 维护未确认包状态
-
-下一阶段至少要有：
-
-1. `snd_nxt`
-2. `snd_una`
-3. outstanding packet table
-4. retransmission timer
-5. ACK 处理路径
-
-## 2.7 有限乱序缓冲
-
-当前目标不再是“接受所有乱序包并记账”，而是：
-
-1. QP 维护有限大小的乱序窗口
-2. future PSN 包先进入重排缓冲
-3. 只有连续追平后才按序释放给业务层
-4. 超出缓冲窗口时触发重传机制
-
-因此乱序处理后面必须与 ACK / retransmission 闭环连起来。
-
-## 3. 当前代码和目标设计的差距
-
-## 3.1 `SEND` 还不完整
-
-当前代码里：
-
-- 发送端已经有类似 `post_send` 的雏形
-  - `EnqueueRoceWork_(...)`
-- 但接收端还没有真正的 `RQ`
-
-因此当前 `SEND` 还只是 opcode 语义，不是完整 verbs 行为。
-
-## 3.2 `SQ/RQ/CQ` 只有壳
-
-当前项目里：
-
-- `sqDepth/rqDepth` 只是数字
-- `RoceTxScheduler` 更像外置的发送队列
-- `CQ` 只有简化 completion 队列壳子，尚未接入主流程
-
-## 3.3 RoCE 分片预算仍按原始 MTU
-
-当前 RoCE 路径里：
-
-- `totalPackets`
-  - 仍按原始 `MTU` 计算
-- `sliceBytes`
-  - 也仍按原始 `MTU` 切
-
-这与新的 RoCE 字节口径不一致。
-
-下一阶段应改为：
-
-- 先求 `rocePayloadBudget = MTU - visibleRoceBytes`
-- 再按 `rocePayloadBudget` 分片
-
-## 3.4 当前乱序处理还不是真正的重排缓冲
-
-当前 `RoceQpEngine` 虽然已有：
-
-- `pendingRxPsns`
-
-但它现在做的是：
-
-1. 记录 future PSN
-2. 不再把简单乱序直接判错
-
-它还没有做到：
-
-1. 有限大小窗口
-2. 延迟向业务层交付
-3. 超窗重传
-
-## 4. 推荐的实施顺序
-
-## 4.1 Phase 2A：先修字节模型
-
-先做下面三件事：
-
-1. 固化 legacy / RoCE 两套 `datasize` 语义
-2. 新增 `GetVisibleRoceWireBytes(opcode)`
-3. 把 RoCE 分片从 `MTU` 改成 `MTU - visibleRoceBytes`
-
-这是所有后续改动的前提。
-
-## 4.2 Phase 2B：补最小 `SQ/RQ/CQ`
-
-目标：
-
-1. `SQ`
-   - 与当前 scheduler 绑定
-2. `RQ`
-   - 为 `SEND` 提供真实资源约束
-3. `CQ`
-   - 为 ACK / 完成 / 上层回调提供落点
-
-## 4.3 Phase 2C：补 ACK / 重传 / 有限乱序窗口
-
-最后再把这些接上：
-
-1. per-packet ACK
-2. timeout retransmission
-3. bounded reorder buffer
-4. overflow / gap-driven retransmission
-
-## 5. 当前阶段的推荐表述
-
-如果现在对外介绍当前分支，建议表述为：
-
-- 已实现 RoCE 语义接入与轻量 QP/PSN
-- 已实现发送入口调度和最小乱序容忍
-- 下一阶段将补 `SQ/RQ/CQ`、标准 RoCE 可见头开销、每包 ACK 和超时重传
-
-不要表述为：
-
-- 已完成完整 RC
-- 已完成真实 SEND/WRITE verbs 行为
-- 已完成标准 RoCE 头与完整重排闭环
+1. 是否需要补更真实的 `RQ/RNR` 行为。
+2. `CQ` 是否要变成上层完成语义的主接口。
+3. 是否引入 `RoCEv2 / UDP/IP / ECN / CNP / DCQCN`。
+4. 多出端口场景下 `LogicalQp` 和 `PortQpRuntime` 怎么绑定。
+5. 大规模仿真里 `transportWindowPackets`、PFC、per-qid inflight 是否会共同造成过强 admission control。

@@ -90,7 +90,8 @@ Astra-Sim
 发送时：
 
 1. `External` 直接取外部口
-2. `Internal/Loopback` 通过 bridge 的 egress 解析拿到真实 `outPort`
+2. `Loopback` 且 `mindex == m_outDeviceIndex` 时，也直接取外部口
+3. 其他 `Internal/Loopback` 场景，通过 bridge 的 `ResolveLocalInjectionEgressPort(...)` 解析真实 `outPort`
 
 然后 `sendflowclient` 找到这个 `outPort` 上 aggregate 的 `RdmaPortEngine`。
 
@@ -163,14 +164,17 @@ port engine 内部用 `RoceTxScheduler`：
 
 真正的 packet 组装在 port engine 内完成：
 
-1. `HopCountHeader`
-2. `ThreePHeader`
-3. `FlowTagHeader`
-4. `RoceSimHeader`
+1. `FlowTagHeader`
+   - 只在 `DATA` 包里进入 packet payload
+2. `RoceSimHeader`
+3. `ThreePHeader`
+4. `HopCountHeader`
 5. `RdmaDispatchTag`
 
 关键点：
 
+- ns-3 `AddHeader(...)` 是后加的头先被接收侧 `RemoveHeader(...)` 读到，所以线上解析顺序是 `HopCountHeader -> ThreePHeader -> RoceSimHeader -> FlowTagHeader`
+- `REQUEST/ACT` 没有 `FlowTagHeader`
 - `RdmaDispatchTag` 是 `PacketTag`
 - 它不进入线上字节流
 - 所以不影响 MTU
@@ -189,13 +193,16 @@ packet 在真的 `SendFrom(...)` 前，还要经过端口准入：
 
 发出成功后：
 
-1. 记录 outstanding packet
-2. 必要时 arm retransmission timer
-3. 如果是某个 work 的最后一个非重传 slice
-   - 触发 send completion
-   - retire 对应 `SqEntry`
-4. 通过 `TxNotifyCallback` 通知 `sendflowclient`
-   - 上层用它收尾 `REQ_DONE`
+1. 如果 `transport_ack_enable=true`，且该包不是 transport ACK
+   - 记录 outstanding packet
+   - arm retransmission timer
+   - 如果是某个 work 的最后一个非重传 slice，则触发 send completion 并 retire 对应 `SqEntry`
+2. 如果是 transport ACK
+   - 不进入 outstanding
+   - 不触发 transport completion
+3. 通过 `TxNotifyCallback` 通知 `sendflowclient`
+   - `sendflowclient` 会忽略 transport ACK 和重传包
+   - 上层主要用最后一个非重传 `REQUEST` slice 收尾 `REQ_DONE`
 
 ### 4.5 `PhyTxEnd`
 
@@ -335,4 +342,3 @@ reorder 现在在 port engine 里：
    - 真正上链路
 
 如果你想判断“这次解耦是不是已经成型”，最值得看的就是这一条边界链。
-

@@ -1,104 +1,104 @@
 # RoCE 后续调度方案备忘
 
-这份文档只记录两类后续候选方案，以及为什么当前决定暂不实现。
+记录时间：2026-04-10
 
-## 1. 当前决定
+这份文档只记录“如果以后继续提高调度真实性，可以考虑什么”。它不再描述早期 stage 1 调度状态。
 
-当前决定是：
+当前主路径请先看：
 
-- 先不继续深入改调度层
-- 当前版本停在“发送入口已进入 QP / scheduler 层，但尚未下沉到真实设备发送机会”这个状态
+- [roce-workflow.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-workflow.md)
+- [roce-current-status.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-current-status.md)
+- [roce-qp-and-transport.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-qp-and-transport.md)
 
-原因：
+如果需要了解旧阶段背景，再看：
 
-1. 接收侧乱序问题已经修到可接受
-2. 再往下做调度需要动到底层设备或引入额外 pacing 近似
-3. 当前收益抵不过改动和维护代价
+- [roce-scheduler-stage1.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-scheduler-stage1.md)
 
-## 2. 方案 A：基于真实发送完成事件的 Pull 调度
+## 1. 当前调度状态
 
-### 2.1 思想
+当前 RoCE packet runtime 已经下沉到 `RdmaPortEngine`。
 
-把 RoCE scheduler 的触发时机，从：
+当前发送大致是：
 
-- `sendflowclient` 自己反复 `Schedule(0)` 推包
+```text
+RdmaPortEngine::PostSend
+  -> QpRuntime::sqEntries
+  -> RoceTxScheduler
+  -> RdmaPortEngine::DispatchFromScheduler_
+  -> RdmaPortEngine::TrySendNow_
+  -> PointToPointNetDevice::SendFrom
+```
 
-改成：
+`DispatchFromScheduler_()` 会尽量 drain scheduler，直到遇到下面任一限制：
 
-- 只有当下层设备真正完成一次发送、再次 ready 时
-- 才由下层回调触发 RoCE scheduler 选择下一个 slice
+1. QP outstanding 达到 `transportWindowPackets`。
+2. QP 正在 recovery。
+3. 目标 qid pause 或 per-qid inflight 达到上限。
+4. 设备发送入口暂时不能准入。
 
-### 2.2 需要改哪些层
+这比旧 stage 1 更接近 port runtime，但仍不等于真实 RNIC 基于 wire-time completion 的 dequeue。
+
+## 2. 方案 A：基于真实发送完成事件的 pull 调度
+
+思路：
+
+- 只有当下层设备真正完成一次发送、再次 ready 时，才触发 RoCE scheduler 选择下一个 slice。
+
+可能需要改：
 
 1. `PointToPointNetDevice`
-   - 在 `TransmitComplete()` 时提供向上的 callback 或 trace source
+   - 在发送完成时提供更明确的向上 callback 或 trace source。
 
-2. `FlowIo`
-   - 变成 RoCE producer 和设备之间的 broker
-   - 在设备 ready 时向上拉一个 slice
+2. `RdmaPortEngine`
+   - 从“尽量 drain”改成更接近“设备 ready 时 pull 一个或一小批 slice”。
 
-3. `sendflowclient`
-   - 不再自驱动 `Schedule(0)` dispatch
-   - 改成提供“取下一个 slice”的接口
+3. `FlowIo / bridge` 边界
+   - 如果未来 external path 也要统一纳入该节拍，需要重新梳理职责。
 
-### 2.3 优点
+优点：
 
-1. 最接近真实 NIC / port dequeue 语义
-2. 链路速率和包长会自然反映到调度节拍
-3. 更容易对客户解释“QP scheduler 真正在控制发送机会”
+1. 最接近真实 NIC/port dequeue 语义。
+2. 链路速率和包长自然反映到调度节拍。
+3. 更容易解释“QP scheduler 真正在控制发送机会”。
 
-### 2.4 代价
+代价：
 
-1. 改动会深入到底层设备
-2. `FlowIo` 职责会明显变复杂
-3. 需要重新梳理与 `PppRoundRobinQueue` 的职责边界
+1. 改动会深入到底层设备。
+2. 需要小心不要和现有 `PppRoundRobinQueue`、PFC、per-qid inflight 形成重复调度。
+3. 验证成本比文档级或上层 pacing 改动高。
 
-## 3. 方案 B：上层 per-slice pacing 的折中方案
+## 3. 方案 B：port 层 per-slice pacing 近似
 
-### 3.1 思想
+思路：
 
-不改底层设备，只在当前 `sendflowclient -> RoceTxScheduler` 这一层做人为节流。
-
-也就是：
-
-- 每次调度只放出有限个 slice
-- 下一轮调度不再是 `0ns`
-- 而是等待一个估算出的发送时间后再继续
-
-### 3.2 更合理的 pacing 方式
-
-如果真做这个方案，不应使用随意常数等待时间。
+- 不改真实设备 ready 回调。
+- 在 `RdmaPortEngine` 层估算 slice wire time。
+- 每次只放出有限 slice，下一轮按估算发送时间延迟调度。
 
 更合理的近似是：
 
-- `dispatch_gap = 该 slice 的实际包长 / 链路速率 (+ IFG)`
+```text
+dispatch_gap = slice_wire_bytes / link_rate (+ IFG)
+```
 
-这样至少不会平白引入过多空泡。
+优点：
 
-### 3.3 优点
+1. 改动面小于方案 A。
+2. 不一定需要改 `PointToPointNetDevice`。
+3. 可以更快观察多 QP RR 在时间线上是否符合预期。
 
-1. 改动面比方案 A 小很多
-2. 不需要改 `PointToPointNetDevice`
-3. 很快就能让多 QP RR 在日志里变得可见
+缺点：
 
-### 3.4 缺点
+1. 仍然不是基于真实设备 completion。
+2. 容易和下层设备队列形成双重调度。
+3. 如果估算不准，可能引入额外空泡或过强限速。
 
-1. 仍然不是基于真实设备 ready
-2. 只是软件估算，不是实际 wire-time completion
-3. 容易和下层设备队列形成双重调度
-4. 解释力度弱于方案 A
+## 4. 当前建议
 
-## 4. 为什么当前不实现方案 B
+短期内先不继续改调度层。
 
-用户这轮的判断是合理的：
+理由是：
 
-- 当前再改动的收益，抵不过继续改底层或引入 pacing 近似的代价
-
-我同意这个判断。
-
-因此当前分支只保留：
-
-- 已有的 stage 1 scheduler
-- 已修正的接收侧乱序容忍
-
-而把两种后续调度方案都记录下来，留待以后重新评估。
+1. 当前 RoCE 主路径、ACK、重传、reorder 和内存问题刚收敛，继续深入设备节拍会扩大验证面。
+2. 当前最需要先做的是用一致配置跑更大 workload，确认 `transportWindowPackets / PFC / per-qid inflight` 组合是否稳定。
+3. 如果后面发现多 QP 公平性或时间行为明显不合理，再回头在方案 A 和方案 B 之间选。

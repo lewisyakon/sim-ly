@@ -6,10 +6,11 @@
 
 说明：
 
-- 这份文档讲的是当前代码已经支持的配置和日志
-- 不负责定义会议后刚收敛下来的下一阶段协议目标
-- 如果你想看 `SEND/WRITE`、`SQ/RQ/CQ`、RoCE 可见头、ACK/重传、有限乱序窗口的目标设计，请看：
-  - [roce-phase2-design.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-phase2-design.md)
+- 这份文档讲的是当前代码已经支持的配置和日志。
+- 如果你想看当前 `SEND/WRITE`、`SQ/RQ/CQ`、RoCE 可见头、ACK/重传、有限乱序窗口落在哪里，请看：
+  - [roce-current-status.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-current-status.md)
+  - [roce-workflow.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-workflow.md)
+  - [roce-transport-reliability.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-transport-reliability.md)
 
 - `enable`（bool）
   - 含义：是否启用 RoCE 旁路逻辑。
@@ -135,23 +136,20 @@ all passes finished at time: ...
 
 ### 3.0A 当前不再打印的临时内存观测
 
-最近为了确认大规模内存增长问题，曾经临时加过一条：
+为了确认大规模内存增长问题，历史上曾经临时加过若干内存观测日志。当前默认输出里不再包含这些探针：
 
 ```text
 [main] SendPacketEventHandlerData ...
+[MEM][PROBE] ...
+[ASTRA][MEM] ...
 ```
 
-这条日志现在已经删除，不再出现在仓库默认输出里。
+因此，如果后面分析 `simulation.log`，不要把这些历史调试日志当作当前标准输出的一部分。
 
-它对应的问题已经确认是：
+已知历史结论分两类：
 
-- `PacketSentFinshed` 路径上的 `SendPacketEventHandlerData` 未释放
-
-并且已经在：
-
-- [Sys.cc](/home/lja/sim-ly/sim-ly/src/applications/astra-sim/system/Sys.cc)
-
-修复。因此如果后面再看到大规模 RSS 持续增长，不要再把这条历史调试日志当作当前标准输出的一部分。
+1. 早期曾确认 `PacketSentFinshed` 路径上的 `SendPacketEventHandlerData` 未释放，并已在 [Sys.cc](/home/lja/sim-ly/sim-ly/src/applications/astra-sim/system/Sys.cc) 修复。
+2. 本轮确认主要内存峰值来自 AstraSim 收尾阶段的 `dimension_utilization` CSV 统计路径，而不是 RoCE packet runtime 本身。详见 [memory-leak-investigation.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/memory-leak-investigation.md)。
 
 ### 3.1 配置与激活日志
 
@@ -421,141 +419,24 @@ TriggerSendTo_now declared now time = 500000000123456789 src=0 dst=1 tag=5 size=
 - `off`
   - 用于大规模跑 workload，不看 RoCE 信息日志时使用。
 
-## 5. 一个候选的多活跃 QP 观察 workload
+## 5. 多活跃 QP 观察 workload 的历史备注
 
-文件：
+历史上曾用 `simworkload/roceMultiQpRR.txt` 观察多目的端 QP 和数据类 RR。
 
-- `simworkload/roceMultiQpRR.txt`
+这组记录现在只作为历史排障参考：
 
-设计目的：
+1. `ep: 16` 且 `DP_size` 不能整除时，EP 会被禁用，表现为只有 `[ROCE][CFG]`、没有 `[ROCE][ACTIVE] / [ROCE][SCHED][ENQ] / [ROCE][SCHED][TX]`，并且 `total send count=0`。
+2. 改成 `ep: 4` 后曾经能触发实际发送，并验证过多目的端 QP 创建。
+3. 早期出现过大量 `[ROCE][RX] QP rejected packet ...`，当时原因是接收侧乱序处理过严；当前主路径已经有 bounded reorder 和 ACK/retransmission，不应再把这段旧现象当成当前 RoCE 的状态。
 
-- 用 `ALLTOALL_EP` 在同一个 sender 上制造多目的端发送。
-- 更容易让同一 sender 同时挂多个活跃 QP，从而观察数据类 RR。
+如果以后重新使用这个 workload，建议重新按当前代码和当前 `simulation.log` 做结论，不要直接沿用旧的 `total send count=48` 或旧的 RR 观察结论。
 
-但需要注意：
+排查时仍可先看：
 
-### 5.0 `RoCE disable` 时的基线现象
-
-当：
-
-- `roce.enable = false`
-
-时，当前 `simulation.log` 的正常现象是：
-
-- 会有 `[ROCE][CFG] enable=false`
-- 不会有 `[ROCE][ACTIVE]`
-- 不会有 `[ROCE][SCHED][ENQ] / [ROCE][SCHED][TX]`
-- 业务侧仍然应该能看到 `[FLOW][REQ_DONE] / [FLOW][RX_DONE] / [FLOW][TX_DONE]`
-
-也就是说：
-
-- `enable=false` 时“只有 `[ROCE][CFG]`”并不代表异常
-- 它只说明 RoCE 配置已广播，但发送/接收实际仍走 legacy 3P 路径
-
-### 5.1 第一次失败现象
-
-在一次早期测试中，这个 workload 使用了：
-
-- `model_parallel_NPU_group: 2`
-- `ep: 16`
-
-终端会提示：
-
-```text
-mock_nccl_grobal_group_init: DP_size=8 is not divisible by EP_size=16. Disabling EP (setting EP_size=1).
-mock_nccl_comms_init: DP_size=8 is not divisible by EP_size=16. Disabling EP (setting EP_size=1).
-```
-
-对应现象是：
-
-- `simulation.log` 只有 `[ROCE][CFG]`
-- 没有 `[ROCE][ACTIVE] / [ROCE][SCHED][ENQ] / [ROCE][SCHED][TX]`
-- `[main] total send count=0`
-
-这说明：
-
-- 不是 `enable=false` 那种正常 legacy 基线
-- 也不是 RoCE scheduler 出队有问题
-- 而是 workload 的 `EP` 设置本身不合法，导致通信路径根本没有被下发
-
-### 5.2 修正为 `ep: 4` 后的新现象
-
-把 `ep` 改成 `4` 之后，这个 workload 能正常触发实际发送：
-
-- 有大量 `TriggerSendTo_now`
-- 有 `[ROCE][ACTIVE]`
-- 有 `[ROCE][SCHED][ENQ]`
-- 有 `[ROCE][SCHED][TX]`
-- `[main] total send count=48`
-
-但当前日志同时说明两件事：
-
-1. **多目的端 QP 的创建是成功的**
-   - 同一个 `src` 会先建多个 `REQUEST` QP
-   - 后续也会出现多个 `DATA` QP
-
-2. **数据类 RR 仍未被真正打出来**
-   - 以 `src=0` 为例：
-     - 先完整发完 `qpn=4` 的 64 个 slice
-     - 再发 `qpn=5`
-     - 再发 `qpn=6`
-   - 这说明当前这次运行里，虽然同一 sender 最终确实产生了多个数据 QP，但这些 data work 不是同时活跃进入 scheduler 的
-
-此外还有一个明显问题：
-
-- 日志里出现了大量：
-  - `[ROCE][RX] QP rejected packet ...`
-
-这在旧版代码里通常说明轻量 `RoceQpEngine` 的严格按序接收检查被频繁触发了。
-当前版本已经把这部分收敛成更稳妥的行为：
-
-- `future PSN` 会先进入 `pendingRxPsns`
-- 旧包/重复包只计数，不再直接把 QP 置 `Err`
-- 只有真正的协议错误（非法状态、非法 opcode、非法长度）才继续触发 `QP rejected`
-
-因此当前对这个 workload 的最新结论应当是：
-
-- 它已经能用于验证“RoCE 路径真实激活、多 QP 被创建”
-- 但它还**没有**成功验证“多活跃 QP 的数据 RR”
-- 同时它提示接收侧后续仍需要补 ACK/重传一类更完整的 RC 语义
-
-### 5.3 修正接收侧乱序后的复测结果
-
-在接收侧加入最小乱序容忍后，再次运行同一组：
-
-- `simworkload/roceMultiQpRR.txt`
-- `ep: 4`
-
-本次复测的关键信号是：
-
-- `[main] total send count = 48`
-- `[main] total events = 54439`
-- `QP rejected = 0`
-
-这说明：
-
-1. workload 仍然真实下发了发送
-2. 之前大量 `QP rejected` 的问题已经收敛
-3. 当前剩下的主要问题不再是“接收侧把乱序误判成错误”，而是“多活跃 DATA QP 的 RR 仍没有被打出来”
-
-排查时可以先看：
-
-1. `simulation.log` 里是否出现 `TriggerSendTo_now`
-2. 是否出现 `[ROCE][ACTIVE]`
-3. `[main] total send count` 是否大于 `0`
-
-只有这些条件满足后，才有意义进一步看 `[ROCE][SCHED][TX]` 的 RR 行为。
-
-配套建议：
-
-- `simconfig/config.json` 里把 `workloadpath` 切到 `simworkload/roceMultiQpRR.txt`
-- `roce.log_level` 设为 `"full"`
-
-如果该 workload 真正生效，`[ROCE][SCHED][TX]` 里应该能看到：
-
-- 同一个 `src`
-- 不同 `qpn/workId`
-- `packetIndex` 交替出现
+1. `simulation.log` 里是否出现 `TriggerSendTo_now`。
+2. 是否出现 `[ROCE][ACTIVE]`。
+3. `[main] total send count` 是否大于 `0`。
+4. `roce.log_level=full` 时是否出现 `[ROCE][SCHED][ENQ] / [ROCE][SCHED][TX]`。
 
 ## 6. 配置是如何进入代码的
 
@@ -567,12 +448,13 @@ mock_nccl_comms_init: DP_size=8 is not divisible by EP_size=16. Disabling EP (se
 
 2. `src/min-hop-mac-learning/model/my_sendflowclient.cc`
    - `sendflowclient::SetRoceConfig(...)`
-   - 把配置灌入 `RoceQpEngine`、`RoceThreePhaseFsm` 和 `RoceTxScheduler`
+   - 配置 `RoceTransportEngine`
+   - 调用 `InitializeRdmaPortEngines_()`，把配置灌入每个 `PointToPointNetDevice` 上的 `RdmaPortEngine`
 
 ## 7. 当前语义边界
 
 这几点仍然很重要：
 
 1. `ACT` 是业务控制报文，不是 RC 传输 ACK。
-2. `RoCE enable` 不等于“已经完成了完整 RC 可靠传输”。
-3. 当前版本已经让 RoCE 开始接管发送入口和调度顺序，但还不是完整 RC transport。
+2. `RoCE enable` 不等于“已经完成完整 RNIC/verbs/RoCEv2/DCQCN 模型”。
+3. 当前 ACK、重传、reorder 和 port admission 已经在 `RdmaPortEngine` 里形成最小闭环，但仍是服务网络仿真的 `RC-like` 近似模型。

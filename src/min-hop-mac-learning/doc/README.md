@@ -14,24 +14,28 @@
 
 ## 最新验证
 
-当前仓里最新一次 `ROCE=true` 实测来自：
+当前仓里最近一次小模型 `ROCE=true` 实测来自：
 
 - [config.json](/home/lja/sim-ly/sim-ly/simconfig/config.json)
 - [microAllReduce.txt](/home/lja/sim-ly/sim-ly/simworkload/microAllReduce.txt)
 - [simulation.log](/home/lja/sim-ly/sim-ly/simulation.log)
 
+本次日志降级后，不再打印完整 `FLOW_TX_DONE / FLOW_RX_DONE` 明细；因此这里不再沿用旧文档里的 `TX_DONE=48 / RX_DONE=48` 口径。
+
 本次实测可直接确认：
 
-- `REQ_DONE = 48`
-- `RX_DONE = 48`
-- `TX_DONE = 48`
-- `last FLOW_TX_DONE since_workload_start(us) = 291.923`
-- `network drained since_workload_start(us) = 292.251`
+- `REQ_DONE = 144`
+- `total send count = 144`
+- `total events = 1171473`
+- `last FLOW_TX_DONE since_workload_start(us) = 15562.8`
+- `network drained since_workload_start(us) = 15563.1`
 
 对应日志：
 
-- [simulation.log:418](/home/lja/sim-ly/sim-ly/simulation.log#L418)
-- [simulation.log:419](/home/lja/sim-ly/sim-ly/simulation.log#L419)
+- [simulation.log:1186](/home/lja/sim-ly/sim-ly/simulation.log#L1186)
+- [simulation.log:1187](/home/lja/sim-ly/sim-ly/simulation.log#L1187)
+- [simulation.log:1189](/home/lja/sim-ly/sim-ly/simulation.log#L1189)
+- [simulation.log:1190](/home/lja/sim-ly/sim-ly/simulation.log#L1190)
 
 同时没有搜到这些异常项：
 
@@ -58,29 +62,41 @@
    - 哪些差距会影响大规模网络行为
    - 哪些是必须补、建议补、可以暂缓
 
-3. [roce-class-architecture.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-class-architecture.md)
+3. [memory-leak-investigation.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/memory-leak-investigation.md)
+   - 本轮内存增长问题的根因
+   - CSV dimension utilization 为什么会制造超大中间结构
+   - 当前关闭 CSV 和清理临时内存探针后的验证口径
+
+4. [roce-class-architecture.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-class-architecture.md)
    - 每个 RoCE 类分别负责什么
    - 类之间怎样耦合、怎样传参
    - 从外部调用时暴露什么接口
    - 整体已经支持什么功能
 
-4. [roce-workflow.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-workflow.md)
+5. [roce-workflow.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-workflow.md)
    - 一条流从 Astra-Sim 下发后，怎样经过 transport、bridge、port、QP，最终从物理口发出去
    - 接收时怎样回到 ingress `RdmaPortEngine`
    - ACK、reorder、completion 分别在哪里发生
 
-5. [roce-config-and-logs.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-config-and-logs.md)
+6. [roce-transport-reliability.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-transport-reliability.md)
+   - ACK、重传、窗口、reorder 当前落在哪里
+   - 哪些可靠性能力已经从 `sendflowclient` 下沉到 `RdmaPortEngine`
+
+7. [roce-config-and-logs.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-config-and-logs.md)
    - 配置项解释
    - 日志口径解释
 
-6. [roce-qp-and-transport.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-qp-and-transport.md)
+8. [roce-qp-and-transport.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-qp-and-transport.md)
    - 现实中的 `QP / port / CQ / SRQ`
    - 它们在当前仿真里的映射
+
+9. [roce-future-scheduling-options.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-future-scheduling-options.md)
+   - 如果后续继续提高 port 调度真实性，可以考虑哪些方案
+   - 为什么当前暂时不继续改调度层
 
 ## 历史文档
 
 下面这些文档还保留，但应主要按“演化过程参考”来看，而不是“当前实现说明”：
 
 - [roce-phase2-design.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-phase2-design.md)
-- [roce-transport-reliability.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-transport-reliability.md)
 - [roce-scheduler-stage1.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-scheduler-stage1.md)
