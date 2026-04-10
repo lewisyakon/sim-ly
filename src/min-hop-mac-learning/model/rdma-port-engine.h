@@ -47,6 +47,7 @@ public:
     bool hasTransportFragmentId = false;
     uint32_t transportFragmentId = 0;
     uint32_t rqPsn = 0;
+    RoceQpKey qpKey;
   };
 
   struct RxResult {
@@ -71,6 +72,7 @@ public:
                                 uint32_t formIndex);
   bool HandleAck(const RoceSimHeader& roceHeader,
                  const ThreePHeader& tpHeader);
+  void ReleaseQpState(const RoceQpKey& qpKey);
   uint32_t GetCompletionCount(const RoceQpKey& qpKey,
                               RoceCompletionKind kind = RoceCompletionKind::Any) const;
   bool PopCompletion(const RoceQpKey& qpKey,
@@ -191,6 +193,8 @@ private:
                        uint32_t psn);
   void CollectReadyBufferedPackets_(const RoceQpKey& qpKey,
                                     std::vector<BufferedUpperPacket>* out);
+  void ReleaseQpState_(const RoceQpKey& qpKey, bool dropCompletions);
+  void MaybeReleaseIdleTxQp_(const RoceQpKey& qpKey);
 
 private:
   Ptr<PointToPointNetDevice> m_device;

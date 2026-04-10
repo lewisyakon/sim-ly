@@ -243,12 +243,16 @@ void sendflowclient::HandleRead(Ptr<Socket> socket)
             readyPacket.from,
             readyPacket.formIndex,
             readyPacket.hasTransportFragmentId,
-            readyPacket.transportFragmentId);
+            readyPacket.transportFragmentId,
+            true,
+            readyPacket.qpKey,
+            roceIngressDeviceIndex);
       }
       continue;
     }
 
-    ProcessThreePhasePayload_(p, TPheader, from, formIndex, false, 0);
+    ProcessThreePhasePayload_(
+        p, TPheader, from, formIndex, false, 0, false, RoceQpKey{}, UINT32_MAX);
   }
 }
 
@@ -258,7 +262,10 @@ sendflowclient::ProcessThreePhasePayload_(Ptr<Packet> p,
                                           const Address& from,
                                           uint32_t formIndex,
                                           bool hasTransportFragmentId,
-                                          uint32_t transportFragmentId)
+                                          uint32_t transportFragmentId,
+                                          bool hasTransportQpKey,
+                                          RoceQpKey transportQpKey,
+                                          uint32_t roceIngressDeviceIndex)
 {
   const uint32_t tag = TPheader.GetTag();
   const uint32_t src = TPheader.GetSrc();
@@ -272,12 +279,14 @@ sendflowclient::ProcessThreePhasePayload_(Ptr<Packet> p,
   {
     if(check_recvfunc(tag,src,dst) == false){
       m_recvfuncflag[flowKey] = 1;
+      MaybeReleaseRoceRxQp_(hasTransportQpKey, transportQpKey, roceIngressDeviceIndex);
       return ;
     }
     fuc_and_par fp = m_recvfunctable[flowKey];
     fp.msg_handler(fp.fun_arg);
     m_recvfunctable.erase(flowKey);
     m_recvfuncflag.erase(flowKey);
+    MaybeReleaseRoceRxQp_(hasTransportQpKey, transportQpKey, roceIngressDeviceIndex);
   }
   break;
 
@@ -340,6 +349,7 @@ sendflowclient::ProcessThreePhasePayload_(Ptr<Packet> p,
                         << "/" << m_dataPacketsExpected[flowKey]
                         << " dataBytes=" << m_alldatasize[flowKey]
                         << " TIME=" << Simulator::Now().GetFemtoSeconds());
+            bool deliveredToRegisteredReceiver = false;
             if (check_recvfunc(tag,src,dst)){
               fuc_and_par fp = m_recvfunctable[flowKey];
 
@@ -348,20 +358,21 @@ sendflowclient::ProcessThreePhasePayload_(Ptr<Packet> p,
 
               fp.msg_handler(fp.fun_arg);
               m_recvfunctable.erase(flowKey);
+              deliveredToRegisteredReceiver = true;
             }
 
-            // 这几张表只是 3P 收包过程中的临时 scratch 状态：
-            // - m_recvfuncflag: REQUEST 先到、回调后注册时的占位
-            // - m_alldatasize: DATA 聚合过程中的累计字节
-            // - m_request / m_recvHash: 传给上层回调或旧轮询路径的临时结果
-            // RX_DONE 之后无论是否存在回调，这些 flow 级状态都不该继续滞留。
-            m_recvHash.erase(flowKey);
-            m_request.erase(flowKey);
+            // DATA 聚合 scratch 到此已经结束；若回调是“晚注册”的，
+            // 则仍需保留 flowTag/recvHash 供 sim_recv 路径消费后再删。
+            if (deliveredToRegisteredReceiver) {
+              m_recvHash.erase(flowKey);
+              m_request.erase(flowKey);
+            }
             m_alldatasize.erase(flowKey);
             m_recvfuncflag.erase(flowKey);
             m_dataPacketsExpected.erase(flowKey);
             m_dataPacketsReceived.erase(flowKey);
             m_deliveredDataFragmentIds.erase(flowKey);
+            MaybeReleaseRoceRxQp_(hasTransportQpKey, transportQpKey, roceIngressDeviceIndex);
         }
     } else {
         NS_LOG_WARN("{tag,src,dst}= " << tag<<"  "<<src<<" "<<dst << ": Received DATA packet without expected count setup.");
@@ -400,6 +411,10 @@ sendflowclient::ProcessThreePhasePayload_(Ptr<Packet> p,
     } else {
         NS_LOG_WARN("{tag,src,dst}= " << tag<<"  "<<src<<" "<<dst << ": Received ACT packet without expected count setup.");
     }
+    if (m_roceTransport != nullptr) {
+        m_roceTransport->ReleaseFlow(flowKey);
+    }
+    MaybeReleaseRoceRxQp_(hasTransportQpKey, transportQpKey, roceIngressDeviceIndex);
   }
   break;
 
@@ -570,17 +585,22 @@ sendflowclient::FinalizeRoceSliceDispatch_(const RoceTxSlice& slice) {
                   << " tag=" << slice.flowKey.tag
                   << " src=" << slice.flowKey.src
                   << " dst=" << slice.flowKey.dst);
-      return;
+    } else {
+      fuc_and_par fp = it->second;
+      NS_LOG_INFO("[FLOW][REQ_DONE] {tag,src,dst}= "
+                  << slice.flowKey.tag << " "
+                  << slice.flowKey.src << " "
+                  << slice.flowKey.dst
+                  << " workId=" << slice.workId
+                  << " TIME=" << Simulator::Now().GetFemtoSeconds());
+      fp.msg_handler(fp.fun_arg);
+      m_sendfunctable.erase(it);
     }
-    fuc_and_par fp = it->second;
-    NS_LOG_INFO("[FLOW][REQ_DONE] {tag,src,dst}= "
-                << slice.flowKey.tag << " "
-                << slice.flowKey.src << " "
-                << slice.flowKey.dst
-                << " workId=" << slice.workId
-                << " TIME=" << Simulator::Now().GetFemtoSeconds());
-    fp.msg_handler(fp.fun_arg);
-    m_sendfunctable.erase(it);
+  }
+
+  if (m_roceTransport != nullptr &&
+      (slice.state == ThreePHeader::REQUEST || slice.state == ThreePHeader::ACT)) {
+    m_roceTransport->ReleaseLane(slice.flowKey, slice.state);
   }
 }
 
@@ -769,6 +789,10 @@ void
 sendflowclient::erase_recvhash(int tag,int src,int dst){
     m_recvHash.erase(RoceFlowKey{static_cast<uint32_t>(tag), static_cast<uint32_t>(src), static_cast<uint32_t>(dst)});
 }
+void
+sendflowclient::erase_flowtag(int tag,int src,int dst){
+    m_request.erase(RoceFlowKey{static_cast<uint32_t>(tag), static_cast<uint32_t>(src), static_cast<uint32_t>(dst)});
+}
 bool
 sendflowclient::check_recvhash(int tag,int src,int dst){
     if (m_recvHash.find(RoceFlowKey{static_cast<uint32_t>(tag), static_cast<uint32_t>(src), static_cast<uint32_t>(dst)})!=m_recvHash.end()) return true;
@@ -937,6 +961,22 @@ sendflowclient::ExtractRoceWireDestination_(const Address& dest) const {
     return PacketSocketAddress::ConvertFrom(dest).GetPhysicalAddress();
   }
   return dest;
+}
+
+void
+sendflowclient::MaybeReleaseRoceRxQp_(bool hasTransportQpKey,
+                                      const RoceQpKey& transportQpKey,
+                                      uint32_t roceIngressDeviceIndex) {
+  if (!hasTransportQpKey || !IsRoceEnabled()) {
+    return;
+  }
+
+  Ptr<RdmaPortEngine> ingressPortEngine =
+      GetRdmaPortEngineByDeviceIndex_(roceIngressDeviceIndex);
+  if (ingressPortEngine == nullptr) {
+    return;
+  }
+  ingressPortEngine->ReleaseQpState(transportQpKey);
 }
 
 Ptr<RdmaPortEngine>

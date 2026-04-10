@@ -23,6 +23,9 @@ public:
 
   void Configure(const RoceConfig& cfg);
   void Reset();
+  void ReleaseLane(const RoceFlowKey& flowKey, ThreePHeader::State state);
+  void ReleaseFlow(const RoceFlowKey& flowKey);
+  uint64_t GetLaneMappingCount() const;
 
   bool PrepareTxWork(RoceTxWorkItem* item);
   void OnActReceived(const RoceFlowKey& flowKey);

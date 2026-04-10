@@ -83,6 +83,25 @@ RoceTransportEngine::Reset() {
   m_fsm.Reset();
 }
 
+void
+RoceTransportEngine::ReleaseLane(const RoceFlowKey& flowKey,
+                                 ThreePHeader::State state) {
+  m_flowToQpn.erase(FlowLaneKey{flowKey, GetLaneRole_(state)});
+}
+
+void
+RoceTransportEngine::ReleaseFlow(const RoceFlowKey& flowKey) {
+  m_flowToQpn.erase(FlowLaneKey{flowKey, RoceLaneRole::ReqCtrl});
+  m_flowToQpn.erase(FlowLaneKey{flowKey, RoceLaneRole::Data});
+  m_flowToQpn.erase(FlowLaneKey{flowKey, RoceLaneRole::ActCtrl});
+  m_fsm.ResetFlow(flowKey);
+}
+
+uint64_t
+RoceTransportEngine::GetLaneMappingCount() const {
+  return static_cast<uint64_t>(m_flowToQpn.size());
+}
+
 RoceTransportEngine::RoceLaneRole
 RoceTransportEngine::GetLaneRole_(ThreePHeader::State state) {
   switch (state) {

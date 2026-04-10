@@ -10,6 +10,9 @@ LICENSE file in the root directory of this source tree.
 #include "astra-sim/system/AstraNetworkAPI.hh"
 #include "astra-sim/system/RecvPacketEventHadndlerData.hh"
 #include <cctype>
+#include <fstream>
+#include <sstream>
+#include <string>
 
 // ===== PP forward token (p2p) =====
 namespace {
@@ -238,6 +241,7 @@ Workload::Workload(
   this->registered_for_finished_streams = false;
   #ifndef PHY_MTP
   if (generator->id == 0 && seprate_log) {
+    // lja delete: CSV stats are disabled for this simulator path.
     /*ly delete*/
     /*
     std::cout << "stat path: " << path << " ,total rows: " << total_rows
@@ -374,6 +378,8 @@ void Workload::report() {
             << ", id of first layer: " << layers[0]->id << std::endl;
   generator->NI->pass_front_end_report(astraSimDataAPI);
   #ifdef NS3_MTP 
+  /* lja delete: dimension-utilization CSV is disabled. Building dims with
+   * report_percentage(10000) can allocate huge transient lists on long runs.
   if (this->seprate_log) {
     std::list<std::list<std::pair<uint64_t, double>>> dims;
     for (int i = 0; i < generator->scheduler_unit->usage.size(); i++) {
@@ -382,8 +388,11 @@ void Workload::report() {
     }
     dimension_utilization->finalize_csv(dims);
   }
+  */
   #endif
   #ifdef NS3_MPI 
+  /* lja delete: dimension-utilization CSV is disabled. Building dims with
+   * report_percentage(10000) can allocate huge transient lists on long runs.
   if (this->seprate_log) {
     std::list<std::list<std::pair<uint64_t, double>>> dims;
     for (int i = 0; i < generator->scheduler_unit->usage.size(); i++) {
@@ -392,6 +401,7 @@ void Workload::report() {
     }
     dimension_utilization->finalize_csv(dims);
   }
+  */
   #endif
 }
 void Workload::check_for_sim_end() {

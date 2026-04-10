@@ -56,3 +56,6 @@ vcpkg/
 /ncclFlowModel*.csv
 /mactable/
 /mactable_test*/
+
+# Local AI skill worktrees
+/qiushi-skill/

@@ -20,6 +20,7 @@
 #include "ns3/mac48-address.h"           // MAC 地址
 #include "ns3/hop-count-header.h"
 #include "3PHeader.h"
+#include <cstdint>
 #include<map>
 #include <memory>
 #include <set>
@@ -47,7 +48,6 @@ struct fuc_and_par{
   void *fun_arg;//参数
 };
 
-
 // ---------- 客户端（请求方） ----------
 class sendflowclient : public Application
 {
@@ -63,6 +63,7 @@ public:
   void set_sendfunc(int tag,int src,int dst,fuc_and_par fp); 
   void set_recvfunc(int tag,int src,int dst,fuc_and_par fp); 
   void erase_recvhash(int tag,int src,int dst);
+  void erase_flowtag(int tag,int src,int dst);
 
   void write_flowtag(int tag,int src,int dst,AstraSim::sim_request request);
   AstraSim::sim_request get_flowtag(int tag,int src,int dst);
@@ -100,7 +101,10 @@ private:
                                  const Address& from,
                                  uint32_t formIndex,
                                  bool hasTransportFragmentId = false,
-                                 uint32_t transportFragmentId = 0);
+                                 uint32_t transportFragmentId = 0,
+                                 bool hasTransportQpKey = false,
+                                 RoceQpKey transportQpKey = RoceQpKey{},
+                                 uint32_t roceIngressDeviceIndex = UINT32_MAX);
   void InitializeRdmaPortEngines_();
   void HandleRdmaPortPacketSent_(Ptr<Packet> packet);
   void FinalizeRdmaTaggedDispatch_(const RdmaDispatchTag& tag);
@@ -112,6 +116,9 @@ private:
                                                int mindex,
                                                uint64_t uidHint = 0) const;
   Address ExtractRoceWireDestination_(const Address& dest) const;
+  void MaybeReleaseRoceRxQp_(bool hasTransportQpKey,
+                             const RoceQpKey& transportQpKey,
+                             uint32_t roceIngressDeviceIndex);
 
 
   std::map<RoceFlowKey, ns3::fuc_and_par> m_sendfunctable;  // key: flowid

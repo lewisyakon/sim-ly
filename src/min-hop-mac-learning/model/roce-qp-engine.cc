@@ -299,6 +299,11 @@ RoceQpEngine::PopCompletion(RoceCompletion* completion) {
   return true;
 }
 
+void
+RoceQpEngine::ReleaseQp(const RoceQpKey& key) {
+  m_qps.erase(key);
+}
+
 bool
 RoceQpEngine::IsStateTransitionAllowed(RoceQpState from, RoceQpState to) const {
   if (from == to) {

@@ -53,22 +53,27 @@
    - 最新运行验证了什么
    - 现在还保留了哪些简化
 
-2. [roce-class-architecture.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-class-architecture.md)
+2. [roce-reality-gap-review.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-reality-gap-review.md)
+   - 当前实现和现实 RoCE 的差距到底在哪里
+   - 哪些差距会影响大规模网络行为
+   - 哪些是必须补、建议补、可以暂缓
+
+3. [roce-class-architecture.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-class-architecture.md)
    - 每个 RoCE 类分别负责什么
    - 类之间怎样耦合、怎样传参
    - 从外部调用时暴露什么接口
    - 整体已经支持什么功能
 
-3. [roce-workflow.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-workflow.md)
+4. [roce-workflow.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-workflow.md)
    - 一条流从 Astra-Sim 下发后，怎样经过 transport、bridge、port、QP，最终从物理口发出去
    - 接收时怎样回到 ingress `RdmaPortEngine`
    - ACK、reorder、completion 分别在哪里发生
 
-4. [roce-config-and-logs.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-config-and-logs.md)
+5. [roce-config-and-logs.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-config-and-logs.md)
    - 配置项解释
    - 日志口径解释
 
-5. [roce-qp-and-transport.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-qp-and-transport.md)
+6. [roce-qp-and-transport.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-qp-and-transport.md)
    - 现实中的 `QP / port / CQ / SRQ`
    - 它们在当前仿真里的映射
 
@@ -79,4 +84,3 @@
 - [roce-phase2-design.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-phase2-design.md)
 - [roce-transport-reliability.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-transport-reliability.md)
 - [roce-scheduler-stage1.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-scheduler-stage1.md)
-

@@ -31,7 +31,7 @@
     "drop_tail_queue_num": "16",
     "high_watermark": 0.8,
     "low_watermark": 0.2,
-    "log_level": "full"
+    "log_level": "basic"
   },
 
   "topology": {
@@ -57,7 +57,7 @@
     "ack_timeout_ns": 50000,
     "max_retransmissions": 8,
     "ether_type": "0x9999",
-    "log_level": "full"
+    "log_level": "basic"
   }
 
 }

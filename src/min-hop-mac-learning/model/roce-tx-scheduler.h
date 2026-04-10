@@ -75,6 +75,8 @@ public:
   bool HasPendingWork() const;
   uint64_t GetPendingWorkCount() const;
   uint64_t GetPendingWorkCount(const RoceQpKey& qpKey) const;
+  uint64_t GetWorkQueueCount() const;
+  uint64_t GetActiveQpCount(RoceTxClass txClass) const;
 
   bool PickNextSlice(uint32_t maxSliceBytes,
                      const std::set<RoceQpKey>* blockedQps,

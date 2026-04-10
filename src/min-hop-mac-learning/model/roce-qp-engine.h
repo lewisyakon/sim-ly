@@ -54,6 +54,7 @@ public:
   // Completion 队列接口。
   void NotifyTxCompletion(const RoceQpKey& key, uint32_t wrId, bool success);
   bool PopCompletion(RoceCompletion* completion);
+  void ReleaseQp(const RoceQpKey& key);
 
 private:
   // QP 状态转移合法性判定。

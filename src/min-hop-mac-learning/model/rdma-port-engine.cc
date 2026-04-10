@@ -281,6 +281,7 @@ RdmaPortEngine::HandleIncomingPacket(const RoceSimHeader& roceHeader,
     buffered.hasTransportFragmentId = (tpHeader.GetState() == ThreePHeader::DATA);
     buffered.transportFragmentId = roceHeader.GetPsn();
     buffered.rqPsn = roceHeader.GetPsn();
+    buffered.qpKey = qpKey;
     m_bufferedUpperPackets[qpKey][roceHeader.GetPsn()] = buffered;
 
     if (m_cfg.logLevel == RoceLogLevel::Full) {
@@ -319,6 +320,7 @@ RdmaPortEngine::HandleIncomingPacket(const RoceSimHeader& roceHeader,
   current.hasTransportFragmentId = (tpHeader.GetState() == ThreePHeader::DATA);
   current.transportFragmentId = roceHeader.GetPsn();
   current.rqPsn = roceHeader.GetPsn();
+  current.qpKey = qpKey;
   result.readyPackets.push_back(current);
   PushCompletion_(qpKey,
                   roceHeader.GetPsn(),
@@ -368,8 +370,14 @@ RdmaPortEngine::HandleAck(const RoceSimHeader& roceHeader,
     m_pendingRetransmissions.erase(qpKey);
   }
 
+  MaybeReleaseIdleTxQp_(qpKey);
   ScheduleDrain_(false);
   return true;
+}
+
+void
+RdmaPortEngine::ReleaseQpState(const RoceQpKey& qpKey) {
+  ReleaseQpState_(qpKey, true);
 }
 
 uint32_t
@@ -1030,6 +1038,56 @@ RdmaPortEngine::ReleaseRqEntry_(const RoceQpKey& qpKey,
 }
 
 void
+RdmaPortEngine::ReleaseQpState_(const RoceQpKey& qpKey, bool dropCompletions) {
+  CancelRetransTimer_(qpKey);
+  m_bufferedUpperPackets.erase(qpKey);
+  m_outstandingPackets.erase(qpKey);
+  m_pendingRetransmissions.erase(qpKey);
+  m_recoveryTargetPsns.erase(qpKey);
+
+  auto runtimeIt = m_qpRuntimes.find(qpKey);
+  if (runtimeIt != m_qpRuntimes.end()) {
+    runtimeIt->second.sqEntries.clear();
+    runtimeIt->second.rqInflight.clear();
+    if (dropCompletions) {
+      runtimeIt->second.completions.clear();
+      runtimeIt->second.sendCompletionCount = 0;
+      runtimeIt->second.recvCompletionCount = 0;
+    }
+    m_qpRuntimes.erase(runtimeIt);
+  }
+
+  m_qpEngine.ReleaseQp(qpKey);
+}
+
+void
+RdmaPortEngine::MaybeReleaseIdleTxQp_(const RoceQpKey& qpKey) {
+  auto runtimeIt = m_qpRuntimes.find(qpKey);
+  if (runtimeIt == m_qpRuntimes.end()) {
+    return;
+  }
+  if (!runtimeIt->second.sqEntries.empty() || !runtimeIt->second.rqInflight.empty()) {
+    return;
+  }
+
+  auto bufferedIt = m_bufferedUpperPackets.find(qpKey);
+  if (bufferedIt != m_bufferedUpperPackets.end() && !bufferedIt->second.empty()) {
+    return;
+  }
+  auto outstandingIt = m_outstandingPackets.find(qpKey);
+  if (outstandingIt != m_outstandingPackets.end() && !outstandingIt->second.empty()) {
+    return;
+  }
+  if (m_pendingRetransmissions.find(qpKey) != m_pendingRetransmissions.end() ||
+      m_recoveryTargetPsns.find(qpKey) != m_recoveryTargetPsns.end() ||
+      m_retransTimers.find(qpKey) != m_retransTimers.end()) {
+    return;
+  }
+
+  ReleaseQpState_(qpKey, true);
+}
+
+void
 RdmaPortEngine::CollectReadyBufferedPackets_(
     const RoceQpKey& qpKey,
     std::vector<BufferedUpperPacket>* out) {
@@ -1166,6 +1224,9 @@ RdmaPortEngine::TrackSuccessfulSend_(const PortTxItem& item) {
   }
   if (tag.IsLastSlice() && !tag.IsRetransmission()) {
     CompleteSqEntry_(qpKey, tag.GetWorkId(), tag.GetPsn());
+    if (!m_cfg.enableTransportAck) {
+      MaybeReleaseIdleTxQp_(qpKey);
+    }
   }
   ArmRetransTimer_(qpKey);
 }
@@ -1189,6 +1250,7 @@ RdmaPortEngine::HandleRetransTimeout_(const RoceQpKey& qpKey) {
     }
     m_pendingRetransmissions.erase(qpKey);
     m_recoveryTargetPsns.erase(qpKey);
+    MaybeReleaseIdleTxQp_(qpKey);
     return;
   }
 

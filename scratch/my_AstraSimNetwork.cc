@@ -52,7 +52,7 @@
 using namespace std;
 using namespace ns3;
 
-extern std::map<std::pair<std::pair<int, int>,int>, AstraSim::ncclFlowTag> receiver_pending_queue;
+std::map<std::pair<std::pair<int, int>,int>, AstraSim::ncclFlowTag> receiver_pending_queue;
 extern uint32_t node_num, switch_num, link_num, trace_num, nvswitch_num, gpus_per_server;
 extern GPUType gpu_type;
 extern std::vector<int>NVswitchs;
@@ -226,12 +226,14 @@ public:
     if (clientHelper->check_recvhash(tag,src,rank)) {
       uint64_t count = clientHelper->get_recvhash(tag,src,rank);
       if (count == t.count) {
+        AstraSim::sim_request doneRequest = clientHelper->get_flowtag(tag,src,rank);
         clientHelper->erase_recvhash(tag,src,rank);
+        clientHelper->erase_flowtag(tag,src,rank);
         // #ifdef NS3_MTP
         // lock.unlock();
         // // cs.ExitSection();
         // #endif
-        ehd->flowTag=clientHelper->get_flowtag(tag,src,rank).flowTag;
+        ehd->flowTag=doneRequest.flowTag;
         t.msg_handler(t.fun_arg);
         // NS_LOG_INFO("flowid= " << flow_id << " 接收确认 ");
         goto sim_recv_end_section;
