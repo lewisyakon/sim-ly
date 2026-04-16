@@ -373,6 +373,7 @@ void Workload::report() {
   std::cout << "all passes finished at time: " << Sys::boostedTick()
             << ", id of first layer: " << layers[0]->id << std::endl;
   generator->NI->pass_front_end_report(astraSimDataAPI);
+  /*
   #ifdef NS3_MTP 
   if (this->seprate_log) {
     std::list<std::list<std::pair<uint64_t, double>>> dims;
@@ -393,6 +394,7 @@ void Workload::report() {
     dimension_utilization->finalize_csv(dims);
   }
   #endif
+  */
 }
 void Workload::check_for_sim_end() {
   if (pass_counter == TOTAL_PASS) {

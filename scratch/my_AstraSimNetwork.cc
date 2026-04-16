@@ -47,6 +47,7 @@
 #include <cctype>
 #include <cstdint>
 #include <nlohmann/json.hpp>
+#include <malloc.h>
 #ifdef NS3_MTP
 #include "ns3/mtp-module.h"
 #endif
@@ -76,7 +77,7 @@ namespace conf
 {
   uint32_t system = 0;
   uint32_t rank = 0;
-  uint32_t thread = 1;
+  uint32_t thread = 32;
   bool nullmsg = false;
 }; 
 
@@ -104,13 +105,13 @@ public:
     for (auto it = nodeHash.begin(); it != nodeHash.end(); it++) {
       pair<int, int> p = it->first;
       if (p.second == 0) {
-        std::cout << "sim_finish on sent, " << " Thread id: " << pthread_self() << std::endl;
-        cout << "All data sent from node " << p.first << " is " << it->second
-             << "\n";
+        // std::cout << "sim_finish on sent, " << " Thread id: " << pthread_self() << std::endl;
+        // cout << "All data sent from node " << p.first << " is " << it->second
+        //      << "\n";
       } else {
-        std::cout << "sim_finish on received, " << " Thread id: " << pthread_self() << std::endl;
-        cout << "All data received by node " << p.first << " is " << it->second
-             << "\n";
+        // std::cout << "sim_finish on received, " << " Thread id: " << pthread_self() << std::endl;
+        // cout << "All data received by node " << p.first << " is " << it->second
+        //      << "\n";
       }
     }
     // uint64_t eventCount = Simulator::GetEventCount();
@@ -213,7 +214,7 @@ public:
     // std::unique_lock<std::mutex> lock(g_recvHashMutex);
     // // MtpInterface::explicitCriticalSection cs;
     // #endif
-    MockNcclLog* NcclLog = MockNcclLog::getInstance();
+    // MockNcclLog* NcclLog = MockNcclLog::getInstance();
     AstraSim::ncclFlowTag flowTag = request->flowTag;
     src += npu_offset;
     task1 t;
@@ -333,8 +334,10 @@ static std::string ResolvePpScheduleFromConfig(const std::string& config_path) {
   return "gpipe";
 }
 
+/* Disable memory/log monitoring implementation for pure simulation runs.
 struct ProcessMemSnapshot {
   uint64_t vmRssKb = 0;
+  uint64_t vmPeakKb = 0;
   uint64_t vmSizeKb = 0;
   uint64_t vmHwmKb = 0;
   uint64_t vmDataKb = 0;
@@ -342,6 +345,16 @@ struct ProcessMemSnapshot {
   uint64_t rssAnonKb = 0;
   uint64_t rssFileKb = 0;
   uint64_t rssShmemKb = 0;
+  uint64_t threads = 0;
+  bool valid = false;
+};
+
+struct AllocatorMemSnapshot {
+  uint64_t arenaBytes = 0;
+  uint64_t mmapBytes = 0;
+  uint64_t inUseBytes = 0;
+  uint64_t freeBytes = 0;
+  uint64_t releasableBytes = 0;
   bool valid = false;
 };
 
@@ -353,6 +366,10 @@ struct MemWatchConfig {
   uint32_t topNodes = 0;
   uint32_t nodeDetailEverySamples = 6;
   std::vector<int> watchNodes;
+  bool wallPeakEnable = true;
+  double wallPeakIntervalSeconds = 1.0;
+  bool wallPeakLogOnNewPeak = true;
+  uint32_t wallPeakPeriodicEverySamples = 60;
 };
 
 struct QueueMemStats {
@@ -393,6 +410,22 @@ struct MemWatchState {
   uint32_t wallEventContext = ns3::Simulator::NO_CONTEXT;
   std::thread wallSamplerThread;
   std::chrono::steady_clock::time_point wallStartTime;
+  std::atomic<bool> wallPeakStopRequested{false};
+  std::thread wallPeakSamplerThread;
+  std::chrono::steady_clock::time_point wallPeakStartTime;
+  std::mutex wallPeakMutex;
+  uint64_t wallPeakSampleIndex = 0;
+  uint64_t wallPeakAtMs = 0;
+  uint64_t wallPeakVmRssKb = 0;
+  uint64_t wallPeakVmHwmKb = 0;
+  uint64_t wallPeakVmSizeKb = 0;
+  uint64_t wallPeakRssAnonKb = 0;
+  uint64_t wallPeakThreads = 0;
+  uint64_t wallPeakHeapArenaKb = 0;
+  uint64_t wallPeakHeapMmapKb = 0;
+  uint64_t wallPeakHeapInUseKb = 0;
+  uint64_t wallPeakHeapFreeKb = 0;
+  bool hasWallPeak = false;
 };
 
 static bool ParseStatusValueKb(const std::string& line,
@@ -423,6 +456,7 @@ static ProcessMemSnapshot ReadProcessMemSnapshot() {
   std::string line;
   while (std::getline(in, line)) {
     ParseStatusValueKb(line, "VmRSS:", &snapshot.vmRssKb);
+    ParseStatusValueKb(line, "VmPeak:", &snapshot.vmPeakKb);
     ParseStatusValueKb(line, "VmSize:", &snapshot.vmSizeKb);
     ParseStatusValueKb(line, "VmHWM:", &snapshot.vmHwmKb);
     ParseStatusValueKb(line, "VmData:", &snapshot.vmDataKb);
@@ -430,12 +464,39 @@ static ProcessMemSnapshot ReadProcessMemSnapshot() {
     ParseStatusValueKb(line, "RssAnon:", &snapshot.rssAnonKb);
     ParseStatusValueKb(line, "RssFile:", &snapshot.rssFileKb);
     ParseStatusValueKb(line, "RssShmem:", &snapshot.rssShmemKb);
+    ParseStatusValueKb(line, "Threads:", &snapshot.threads);
   }
   snapshot.valid = true;
   return snapshot;
 }
 
+static AllocatorMemSnapshot ReadAllocatorMemSnapshot() {
+  AllocatorMemSnapshot snapshot;
+#if defined(__GLIBC__) && defined(__GLIBC_PREREQ)
+#if __GLIBC_PREREQ(2, 33)
+  const struct mallinfo2 info = mallinfo2();
+  snapshot.arenaBytes = static_cast<uint64_t>(info.arena);
+  snapshot.mmapBytes = static_cast<uint64_t>(info.hblkhd);
+  snapshot.inUseBytes = static_cast<uint64_t>(info.uordblks);
+  snapshot.freeBytes = static_cast<uint64_t>(info.fordblks);
+  snapshot.releasableBytes = static_cast<uint64_t>(info.keepcost);
+  snapshot.valid = true;
+#else
+  const struct mallinfo info = mallinfo();
+  snapshot.arenaBytes = static_cast<uint64_t>(std::max(0, info.arena));
+  snapshot.mmapBytes = static_cast<uint64_t>(std::max(0, info.hblkhd));
+  snapshot.inUseBytes = static_cast<uint64_t>(std::max(0, info.uordblks));
+  snapshot.freeBytes = static_cast<uint64_t>(std::max(0, info.fordblks));
+  snapshot.releasableBytes = static_cast<uint64_t>(std::max(0, info.keepcost));
+  snapshot.valid = true;
+#endif
+#endif
+  return snapshot;
+}
+
 static void MemWatchLog(const std::string& line) {
+  static std::mutex sMemWatchLogMutex;
+  std::lock_guard<std::mutex> guard(sMemWatchLogMutex);
   NS_LOG_UNCOND(line);
 }
 
@@ -491,7 +552,8 @@ static MemWatchConfig ResolveMemWatchConfigFromConfig(const std::string& config_
   }
   if (debug.contains("mem_log_max_samples") && debug["mem_log_max_samples"].is_number_integer()) {
     const int samples = debug["mem_log_max_samples"].get<int>();
-    if (samples > 0) {
+    // 0 means unlimited sampling; negative values keep default.
+    if (samples >= 0) {
       cfg.maxSamples = static_cast<uint32_t>(samples);
     }
   }
@@ -522,6 +584,35 @@ static MemWatchConfig ResolveMemWatchConfigFromConfig(const std::string& config_
     std::sort(cfg.watchNodes.begin(), cfg.watchNodes.end());
     cfg.watchNodes.erase(std::unique(cfg.watchNodes.begin(), cfg.watchNodes.end()),
                          cfg.watchNodes.end());
+  }
+  if (debug.contains("mem_log_wall_peak_enable") &&
+      debug["mem_log_wall_peak_enable"].is_boolean()) {
+    cfg.wallPeakEnable = debug["mem_log_wall_peak_enable"].get<bool>();
+  }
+  if (debug.contains("mem_log_wall_peak_interval_ms") &&
+      debug["mem_log_wall_peak_interval_ms"].is_number()) {
+    const double intervalMs = debug["mem_log_wall_peak_interval_ms"].get<double>();
+    if (intervalMs > 0) {
+      cfg.wallPeakIntervalSeconds = intervalMs * 1e-3;
+    }
+  }
+  if (debug.contains("mem_log_wall_peak_interval_s") &&
+      debug["mem_log_wall_peak_interval_s"].is_number()) {
+    const double intervalS = debug["mem_log_wall_peak_interval_s"].get<double>();
+    if (intervalS > 0) {
+      cfg.wallPeakIntervalSeconds = intervalS;
+    }
+  }
+  if (debug.contains("mem_log_wall_peak_log_on_new_peak") &&
+      debug["mem_log_wall_peak_log_on_new_peak"].is_boolean()) {
+    cfg.wallPeakLogOnNewPeak = debug["mem_log_wall_peak_log_on_new_peak"].get<bool>();
+  }
+  if (debug.contains("mem_log_wall_peak_periodic_every_samples") &&
+      debug["mem_log_wall_peak_periodic_every_samples"].is_number_integer()) {
+    const int every = debug["mem_log_wall_peak_periodic_every_samples"].get<int>();
+    if (every >= 0) {
+      cfg.wallPeakPeriodicEverySamples = static_cast<uint32_t>(every);
+    }
   }
   return cfg;
 }
@@ -1039,6 +1130,7 @@ static void EmitMemWatchSample(const std::shared_ptr<MemWatchState>& state,
   state->sampleIndex++;
   const uint64_t eventCount = Simulator::GetEventCount();
   const ProcessMemSnapshot mem = ReadProcessMemSnapshot();
+  const AllocatorMemSnapshot heap = ReadAllocatorMemSnapshot();
 
   const bool hadLast = state->hasLast;
   int64_t deltaEvents = 0;
@@ -1067,12 +1159,20 @@ static void EmitMemWatchSample(const std::shared_ptr<MemWatchState>& state,
       << " dRSS=" << (deltaRssKb >= 0 ? "+" : "") << deltaRssKb << "kB"
       << " VmSwap=" << mem.vmSwapKb << "kB"
       << " dSwap=" << (deltaSwapKb >= 0 ? "+" : "") << deltaSwapKb << "kB"
+      << " VmPeak=" << mem.vmPeakKb << "kB"
       << " VmSize=" << mem.vmSizeKb << "kB"
       << " VmData=" << mem.vmDataKb << "kB"
       << " RssAnon=" << mem.rssAnonKb << "kB"
       << " RssFile=" << mem.rssFileKb << "kB"
       << " RssShmem=" << mem.rssShmemKb << "kB"
       << " VmHWM=" << mem.vmHwmKb << "kB"
+      << " Threads=" << mem.threads
+      << " heapOK=" << heap.valid
+      << " heapArenaKB=" << BytesToKb(heap.arenaBytes)
+      << " heapMmapKB=" << BytesToKb(heap.mmapBytes)
+      << " heapInUseKB=" << BytesToKb(heap.inUseBytes)
+      << " heapFreeKB=" << BytesToKb(heap.freeBytes)
+      << " heapKeepKB=" << BytesToKb(heap.releasableBytes)
       << " procStatusOK=" << mem.valid;
   MemWatchLog(oss.str());
 
@@ -1103,7 +1203,7 @@ static void EmitMemWatchSample(const std::shared_ptr<MemWatchState>& state,
   if (!scheduleNext) {
     return;
   }
-  if (state->sampleIndex >= state->cfg.maxSamples) {
+  if (state->cfg.maxSamples > 0 && state->sampleIndex >= state->cfg.maxSamples) {
     std::ostringstream stopOss;
     stopOss << "[MemWatch] stop sampling: reached max samples="
             << state->cfg.maxSamples;
@@ -1121,7 +1221,7 @@ static void EmitMemWatchSample(const std::shared_ptr<MemWatchState>& state,
   if (state == nullptr || !state->cfg.enable) {
     return;
   }
-  if (state->sampleIndex >= state->cfg.maxSamples) {
+  if (state->cfg.maxSamples > 0 && state->sampleIndex >= state->cfg.maxSamples) {
     if (!state->maxSamplesLogged.exchange(true, std::memory_order_relaxed)) {
       std::ostringstream stopOss;
       stopOss << "[MemWatch] stop sampling: reached max samples="
@@ -1134,6 +1234,7 @@ static void EmitMemWatchSample(const std::shared_ptr<MemWatchState>& state,
 
   state->sampleIndex++;
   const ProcessMemSnapshot mem = ReadProcessMemSnapshot();
+  const AllocatorMemSnapshot heap = ReadAllocatorMemSnapshot();
   const bool hadLast = state->hasLast;
   int64_t deltaRssKb = 0;
   int64_t deltaSwapKb = 0;
@@ -1159,12 +1260,20 @@ static void EmitMemWatchSample(const std::shared_ptr<MemWatchState>& state,
       << " dRSS=" << (deltaRssKb >= 0 ? "+" : "") << deltaRssKb << "kB"
       << " VmSwap=" << mem.vmSwapKb << "kB"
       << " dSwap=" << (deltaSwapKb >= 0 ? "+" : "") << deltaSwapKb << "kB"
+      << " VmPeak=" << mem.vmPeakKb << "kB"
       << " VmSize=" << mem.vmSizeKb << "kB"
       << " VmData=" << mem.vmDataKb << "kB"
       << " RssAnon=" << mem.rssAnonKb << "kB"
       << " RssFile=" << mem.rssFileKb << "kB"
       << " RssShmem=" << mem.rssShmemKb << "kB"
       << " VmHWM=" << mem.vmHwmKb << "kB"
+      << " Threads=" << mem.threads
+      << " heapOK=" << heap.valid
+      << " heapArenaKB=" << BytesToKb(heap.arenaBytes)
+      << " heapMmapKB=" << BytesToKb(heap.mmapBytes)
+      << " heapInUseKB=" << BytesToKb(heap.inUseBytes)
+      << " heapFreeKB=" << BytesToKb(heap.freeBytes)
+      << " heapKeepKB=" << BytesToKb(heap.releasableBytes)
       << " procStatusOK=" << mem.valid;
   MemWatchLog(oss.str());
 
@@ -1197,7 +1306,7 @@ static void EmitMemWatchWallMemOnlySample(const std::shared_ptr<MemWatchState>& 
   if (state == nullptr || !state->cfg.enable) {
     return;
   }
-  if (state->sampleIndex >= state->cfg.maxSamples) {
+  if (state->cfg.maxSamples > 0 && state->sampleIndex >= state->cfg.maxSamples) {
     if (!state->maxSamplesLogged.exchange(true, std::memory_order_relaxed)) {
       std::ostringstream stopOss;
       stopOss << "[MemWatch] stop sampling: reached max samples="
@@ -1210,6 +1319,7 @@ static void EmitMemWatchWallMemOnlySample(const std::shared_ptr<MemWatchState>& 
 
   state->sampleIndex++;
   const ProcessMemSnapshot mem = ReadProcessMemSnapshot();
+  const AllocatorMemSnapshot heap = ReadAllocatorMemSnapshot();
   const bool hadLast = state->hasLast;
   int64_t deltaRssKb = 0;
   int64_t deltaSwapKb = 0;
@@ -1235,12 +1345,20 @@ static void EmitMemWatchWallMemOnlySample(const std::shared_ptr<MemWatchState>& 
       << " dRSS=" << (deltaRssKb >= 0 ? "+" : "") << deltaRssKb << "kB"
       << " VmSwap=" << mem.vmSwapKb << "kB"
       << " dSwap=" << (deltaSwapKb >= 0 ? "+" : "") << deltaSwapKb << "kB"
+      << " VmPeak=" << mem.vmPeakKb << "kB"
       << " VmSize=" << mem.vmSizeKb << "kB"
       << " VmData=" << mem.vmDataKb << "kB"
       << " RssAnon=" << mem.rssAnonKb << "kB"
       << " RssFile=" << mem.rssFileKb << "kB"
       << " RssShmem=" << mem.rssShmemKb << "kB"
       << " VmHWM=" << mem.vmHwmKb << "kB"
+      << " Threads=" << mem.threads
+      << " heapOK=" << heap.valid
+      << " heapArenaKB=" << BytesToKb(heap.arenaBytes)
+      << " heapMmapKB=" << BytesToKb(heap.mmapBytes)
+      << " heapInUseKB=" << BytesToKb(heap.inUseBytes)
+      << " heapFreeKB=" << BytesToKb(heap.freeBytes)
+      << " heapKeepKB=" << BytesToKb(heap.releasableBytes)
       << " procStatusOK=" << mem.valid
       << " runtimeTables=skipped_mtp_wall";
   MemWatchLog(oss.str());
@@ -1287,6 +1405,112 @@ static void RequestMemWatchWallSample(const std::shared_ptr<MemWatchState>& stat
 }
 #endif
 
+static void StartMemWatchWallPeakSampler(const std::shared_ptr<MemWatchState>& state) {
+  if (state == nullptr || !state->cfg.enable || !state->cfg.wallPeakEnable) {
+    return;
+  }
+  state->wallPeakStopRequested.store(false, std::memory_order_relaxed);
+  state->wallPeakStartTime = std::chrono::steady_clock::now();
+  const auto interval = std::chrono::milliseconds(
+      static_cast<int64_t>(std::max(1.0, state->cfg.wallPeakIntervalSeconds * 1000.0)));
+  state->wallPeakSamplerThread = std::thread([state, interval]() {
+    while (!state->wallPeakStopRequested.load(std::memory_order_relaxed)) {
+      const ProcessMemSnapshot mem = ReadProcessMemSnapshot();
+      const AllocatorMemSnapshot heap = ReadAllocatorMemSnapshot();
+      const uint64_t wallElapsedMs = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now() - state->wallPeakStartTime)
+              .count());
+
+      bool shouldLog = false;
+      bool isNewPeak = false;
+      uint64_t sampleIndex = 0;
+      uint64_t peakRssKb = 0;
+      uint64_t peakAtMs = 0;
+      {
+        std::lock_guard<std::mutex> guard(state->wallPeakMutex);
+        state->wallPeakSampleIndex++;
+        sampleIndex = state->wallPeakSampleIndex;
+        if (!state->hasWallPeak || mem.vmRssKb > state->wallPeakVmRssKb) {
+          state->hasWallPeak = true;
+          state->wallPeakAtMs = wallElapsedMs;
+          state->wallPeakVmRssKb = mem.vmRssKb;
+          state->wallPeakVmHwmKb = mem.vmHwmKb;
+          state->wallPeakVmSizeKb = mem.vmSizeKb;
+          state->wallPeakRssAnonKb = mem.rssAnonKb;
+          state->wallPeakThreads = mem.threads;
+          state->wallPeakHeapArenaKb = BytesToKb(heap.arenaBytes);
+          state->wallPeakHeapMmapKb = BytesToKb(heap.mmapBytes);
+          state->wallPeakHeapInUseKb = BytesToKb(heap.inUseBytes);
+          state->wallPeakHeapFreeKb = BytesToKb(heap.freeBytes);
+          isNewPeak = true;
+          shouldLog = state->cfg.wallPeakLogOnNewPeak;
+        } else if (state->cfg.wallPeakPeriodicEverySamples > 0 &&
+                   (sampleIndex % state->cfg.wallPeakPeriodicEverySamples) == 0) {
+          shouldLog = true;
+        }
+        peakRssKb = state->wallPeakVmRssKb;
+        peakAtMs = state->wallPeakAtMs;
+      }
+
+      if (shouldLog) {
+        std::ostringstream oss;
+        oss << "[MemWatch][wall-peak]"
+            << " rank=" << conf::rank
+            << " sample=" << sampleIndex
+            << " wallTimeMs=" << wallElapsedMs
+            << " VmRSS=" << mem.vmRssKb << "kB"
+            << " VmHWM=" << mem.vmHwmKb << "kB"
+            << " VmPeak=" << mem.vmPeakKb << "kB"
+            << " VmSize=" << mem.vmSizeKb << "kB"
+            << " RssAnon=" << mem.rssAnonKb << "kB"
+            << " Threads=" << mem.threads
+            << " heapOK=" << heap.valid
+            << " heapArenaKB=" << BytesToKb(heap.arenaBytes)
+            << " heapMmapKB=" << BytesToKb(heap.mmapBytes)
+            << " heapInUseKB=" << BytesToKb(heap.inUseBytes)
+            << " heapFreeKB=" << BytesToKb(heap.freeBytes)
+            << " peakVmRSS=" << peakRssKb << "kB"
+            << " peakAtMs=" << peakAtMs
+            << " reason=" << (isNewPeak ? "new_peak" : "periodic");
+        MemWatchLog(oss.str());
+      }
+
+      std::this_thread::sleep_for(interval);
+    }
+  });
+}
+
+static void StopMemWatchWallPeakSampler(const std::shared_ptr<MemWatchState>& state) {
+  if (state == nullptr || !state->cfg.wallPeakEnable) {
+    return;
+  }
+  state->wallPeakStopRequested.store(true, std::memory_order_relaxed);
+  if (state->wallPeakSamplerThread.joinable()) {
+    state->wallPeakSamplerThread.join();
+  }
+  std::lock_guard<std::mutex> guard(state->wallPeakMutex);
+  if (!state->hasWallPeak) {
+    MemWatchLog("[MemWatch][wall-peak][summary] status=no_data");
+    return;
+  }
+  std::ostringstream oss;
+  oss << "[MemWatch][wall-peak][summary]"
+      << " rank=" << conf::rank
+      << " samples=" << state->wallPeakSampleIndex
+      << " peakAtMs=" << state->wallPeakAtMs
+      << " peakVmRSS=" << state->wallPeakVmRssKb << "kB"
+      << " peakVmHWM=" << state->wallPeakVmHwmKb << "kB"
+      << " peakVmSize=" << state->wallPeakVmSizeKb << "kB"
+      << " peakRssAnon=" << state->wallPeakRssAnonKb << "kB"
+      << " peakThreads=" << state->wallPeakThreads
+      << " peakHeapArenaKB=" << state->wallPeakHeapArenaKb
+      << " peakHeapMmapKB=" << state->wallPeakHeapMmapKb
+      << " peakHeapInUseKB=" << state->wallPeakHeapInUseKb
+      << " peakHeapFreeKB=" << state->wallPeakHeapFreeKb;
+  MemWatchLog(oss.str());
+}
+
 static void StartMemWatchWallSampler(const std::shared_ptr<MemWatchState>& state) {
   if (state == nullptr || !state->cfg.enable) {
     return;
@@ -1329,6 +1553,7 @@ static void StopMemWatchWallSampler(const std::shared_ptr<MemWatchState>& state)
     state->wallSamplerThread.join();
   }
 }
+*/
 
 static int user_param_prase(int argc,char * argv[],struct user_param* user_param){
   int opt;
@@ -1395,30 +1620,30 @@ int main(int argc, char *argv[]) {
   #endif
 
   struct user_param user_param;
-  MockNcclLog::set_log_name("SimAI.log");
-  MockNcclLog* NcclLog = MockNcclLog::getInstance();
-  NcclLog->writeLog(NcclLogLevel::INFO," init SimAI.log ");
+  // MockNcclLog::set_log_name("SimAI.log");
+  // MockNcclLog* NcclLog = MockNcclLog::getInstance();
+  // NcclLog->writeLog(NcclLogLevel::INFO," init SimAI.log ");
   if(user_param_prase(argc,argv,&user_param)){
     return 0;
   }
   
   network_config = user_param.network_conf.empty() ? "simconfig/config.json"
                                                    : user_param.network_conf;
-  const MemWatchConfig memWatchCfg = ResolveMemWatchConfigFromConfig(network_config);
+  // const MemWatchConfig memWatchCfg = ResolveMemWatchConfigFromConfig(network_config);
   // Enable SendFlowClient logs before network/app construction so [ROCE][CFG]
   // emitted during SetRoceConfig is visible in simulation.log.
   // LogComponentEnable("SendFlowClient",LOG_LEVEL_INFO);
-  AsciiTraceHelper ascii;
-  std::string simulationLogPath = "simulation.log";
-#ifdef NS3_MPI
-  if (conf::rank != 0) {
-    simulationLogPath = "simulation.rank" + std::to_string(conf::rank) + ".log";
-  }
-#endif
-  Ptr<OutputStreamWrapper> stream = ascii.CreateFileStream(simulationLogPath);
-  std::streambuf* oldbuf = std::clog.rdbuf(stream->GetStream()->rdbuf());
-  const std::ios_base::fmtflags oldClogFlags = std::clog.flags();
-  std::clog << std::unitbuf;
+  // AsciiTraceHelper ascii;
+  // std::string simulationLogPath = "simulation.log";
+  // #ifdef NS3_MPI
+  // if (conf::rank != 0) {
+  //   simulationLogPath = "simulation.rank" + std::to_string(conf::rank) + ".log";
+  // }
+  // #endif
+  // Ptr<OutputStreamWrapper> stream = ascii.CreateFileStream(simulationLogPath);
+  // std::streambuf* oldbuf = std::clog.rdbuf(stream->GetStream()->rdbuf());
+  // const std::ios_base::fmtflags oldClogFlags = std::clog.flags();
+  // std::clog << std::unitbuf;
 
   AstraSim::Workload::SetDefaultPPScheduleByString(
       ResolvePpScheduleFromConfig(network_config));
@@ -1456,7 +1681,7 @@ int main(int argc, char *argv[]) {
 
   // LogComponentEnable("OnOffApplication", LOG_LEVEL_INFO);
   // LogComponentEnable("PacketSink", LOG_LEVEL_INFO);
-  LogComponentEnable("GENERIC_SIMULATION", LOG_LEVEL_ERROR);
+  // LogComponentEnable("GENERIC_SIMULATION", LOG_LEVEL_ERROR);
   // LogComponentEnable("MinHopBridgeNetDevice", LOG_LEVEL_INFO);
   // LogComponentEnable("PointToPointNetDevice", LOG_LEVEL_INFO);
   // LogComponentEnable("PppRoundRobinQueue", LOG_LEVEL_INFO);
@@ -1561,95 +1786,107 @@ int main(int argc, char *argv[]) {
   });  
   #endif
 
-  std::shared_ptr<MemWatchState> memWatchState;
-  if (memWatchCfg.enable) {
-    memWatchState = std::make_shared<MemWatchState>();
-    memWatchState->cfg = memWatchCfg;
-    memWatchState->wallEventContext = ResolveMemWatchEventContext(memWatchState->cfg);
-    const double monitorStartSeconds =
-        std::max(0.0, static_cast<double>(warmupSeconds) - 1.0);
-    std::ostringstream oss;
-    oss << "[MemWatch] enabled=1"
-        << " rank=" << conf::rank
-        << " timeMode=" << (memWatchState->cfg.useWallClock ? "wall" : "sim")
-        << " startTime=" << monitorStartSeconds << "s"
-        << " interval=" << memWatchState->cfg.intervalSeconds << "s"
-        << " maxSamples=" << memWatchState->cfg.maxSamples
-        << " nodeDetailEverySamples=" << memWatchState->cfg.nodeDetailEverySamples
-        << " wallEventContext=" << memWatchState->wallEventContext
-        << " watchNodeCount=" << memWatchState->cfg.watchNodes.size()
-        << " topNodes=" << memWatchState->cfg.topNodes;
-    MemWatchLog(oss.str());
-#ifdef NS3_MTP
-    if (memWatchState->cfg.useWallClock) {
-      MemWatchLog("[MemWatch] NS3_MTP + wall mode: runtime table/node details are disabled for thread safety; use sim mode for detailed queue/event analysis.");
-    }
-#endif
-    if (memWatchState->cfg.useWallClock) {
-      ns3::Simulator::Schedule(ns3::Seconds(monitorStartSeconds),
-                               &StartMemWatchWallSampler,
-                               memWatchState);
-    } else {
-      ns3::Simulator::Schedule(ns3::Seconds(monitorStartSeconds),
-                               &EmitMemWatchSample,
-                               memWatchState,
-                               true);
-    }
-  }
+  // std::shared_ptr<MemWatchState> memWatchState;
+  // if (memWatchCfg.enable) {
+  //   memWatchState = std::make_shared<MemWatchState>();
+  //   memWatchState->cfg = memWatchCfg;
+  //   memWatchState->wallEventContext = ResolveMemWatchEventContext(memWatchState->cfg);
+  //   const double monitorStartSeconds =
+  //       std::max(0.0, static_cast<double>(warmupSeconds) - 1.0);
+  //   std::ostringstream oss;
+  //   oss << "[MemWatch] enabled=1"
+  //       << " rank=" << conf::rank
+  //       << " timeMode=" << (memWatchState->cfg.useWallClock ? "wall" : "sim")
+  //       << " startTime=" << monitorStartSeconds << "s"
+  //       << " interval=" << memWatchState->cfg.intervalSeconds << "s"
+  //       << " maxSamples=" << memWatchState->cfg.maxSamples
+  //       << " nodeDetailEverySamples=" << memWatchState->cfg.nodeDetailEverySamples
+  //       << " wallEventContext=" << memWatchState->wallEventContext
+  //       << " watchNodeCount=" << memWatchState->cfg.watchNodes.size()
+  //       << " topNodes=" << memWatchState->cfg.topNodes
+  //       << " wallPeakEnable=" << memWatchState->cfg.wallPeakEnable
+  //       << " wallPeakInterval=" << memWatchState->cfg.wallPeakIntervalSeconds << "s"
+  //       << " wallPeakPeriodicEverySamples="
+  //       << memWatchState->cfg.wallPeakPeriodicEverySamples;
+  //   MemWatchLog(oss.str());
+  // #ifdef NS3_MTP
+  //   if (memWatchState->cfg.useWallClock) {
+  //     MemWatchLog("[MemWatch] NS3_MTP + wall mode: runtime table/node details are disabled for thread safety; use sim mode for detailed queue/event analysis.");
+  //   }
+  // #endif
+  //   if (memWatchState->cfg.useWallClock) {
+  //     ns3::Simulator::Schedule(ns3::Seconds(monitorStartSeconds),
+  //                              &StartMemWatchWallSampler,
+  //                              memWatchState);
+  //   } else {
+  //     ns3::Simulator::Schedule(ns3::Seconds(monitorStartSeconds),
+  //                              &EmitMemWatchSample,
+  //                              memWatchState,
+  //                              true);
+  //   }
+  //   if (memWatchState->cfg.wallPeakEnable) {
+  //     ns3::Simulator::Schedule(ns3::Seconds(monitorStartSeconds),
+  //                              &StartMemWatchWallPeakSampler,
+  //                              memWatchState);
+  //   }
+  // }
   // ns3::Simulator::Schedule(ns3::Seconds(190), [nodes_num,systems](){
   //     printlearnstate();
   // });
 
-  std::cout << "simulator run " << std::endl;
+  // std::cout << "simulator run " << std::endl;
   Simulator::Stop(Seconds(2000000000));
   Simulator::Run(); 
 
-  if (memWatchState != nullptr && memWatchState->cfg.enable) {
-    if (memWatchState->cfg.useWallClock) {
-      StopMemWatchWallSampler(memWatchState);
-#ifdef NS3_MTP
-      std::ostringstream endOss;
-      endOss << "[MemWatch] wall sampler stopped after Run; skip direct final sample on main thread in MTP mode";
-      MemWatchLog(endOss.str());
-#else
-      EmitMemWatchWallSample(memWatchState);
-      const sendflowclient::RuntimeTableStats finalAggStats =
-          CollectAggregateRuntimeTableStats();
-      const QueueMemStats finalQueueStats = CollectAggregateQueueMemStats();
-      sendflowclient::RuntimeTableStats prevAggStats;
-      const sendflowclient::RuntimeTableStats* lastAggStatsPtr = nullptr;
-      if (memWatchState->hasLastAggStats) {
-        prevAggStats = memWatchState->lastAggStats;
-        lastAggStatsPtr = &prevAggStats;
-      }
-      QueueMemStats prevQueueStats;
-      const QueueMemStats* lastQueueStatsPtr = nullptr;
-      if (memWatchState->hasLastQueueStats) {
-        prevQueueStats = memWatchState->lastQueueStats;
-        lastQueueStatsPtr = &prevQueueStats;
-      }
-      memWatchState->lastTrackedEntries = finalAggStats.totalTrackedEntries;
-      LogAggregateRuntimeTableStats(finalAggStats,
-                                    lastAggStatsPtr,
-                                    finalQueueStats,
-                                    lastQueueStatsPtr);
-      memWatchState->lastAggStats = finalAggStats;
-      memWatchState->hasLastAggStats = true;
-      memWatchState->lastQueueStats = finalQueueStats;
-      memWatchState->hasLastQueueStats = true;
-      EmitMemWatchNodeDetails(memWatchState, "final");
-#endif
-    } else {
-      EmitMemWatchSample(memWatchState, false);
-    }
-  }
+  // if (memWatchState != nullptr && memWatchState->cfg.enable) {
+  //   if (memWatchState->cfg.wallPeakEnable) {
+  //     StopMemWatchWallPeakSampler(memWatchState);
+  //   }
+  //   if (memWatchState->cfg.useWallClock) {
+  //     StopMemWatchWallSampler(memWatchState);
+  // #ifdef NS3_MTP
+  //     std::ostringstream endOss;
+  //     endOss << "[MemWatch] wall sampler stopped after Run; skip direct final sample on main thread in MTP mode";
+  //     MemWatchLog(endOss.str());
+  // #else
+  //     EmitMemWatchWallSample(memWatchState);
+  //     const sendflowclient::RuntimeTableStats finalAggStats =
+  //         CollectAggregateRuntimeTableStats();
+  //     const QueueMemStats finalQueueStats = CollectAggregateQueueMemStats();
+  //     sendflowclient::RuntimeTableStats prevAggStats;
+  //     const sendflowclient::RuntimeTableStats* lastAggStatsPtr = nullptr;
+  //     if (memWatchState->hasLastAggStats) {
+  //       prevAggStats = memWatchState->lastAggStats;
+  //       lastAggStatsPtr = &prevAggStats;
+  //     }
+  //     QueueMemStats prevQueueStats;
+  //     const QueueMemStats* lastQueueStatsPtr = nullptr;
+  //     if (memWatchState->hasLastQueueStats) {
+  //       prevQueueStats = memWatchState->lastQueueStats;
+  //       lastQueueStatsPtr = &prevQueueStats;
+  //     }
+  //     memWatchState->lastTrackedEntries = finalAggStats.totalTrackedEntries;
+  //     LogAggregateRuntimeTableStats(finalAggStats,
+  //                                   lastAggStatsPtr,
+  //                                   finalQueueStats,
+  //                                   lastQueueStatsPtr);
+  //     memWatchState->lastAggStats = finalAggStats;
+  //     memWatchState->hasLastAggStats = true;
+  //     memWatchState->lastQueueStats = finalQueueStats;
+  //     memWatchState->hasLastQueueStats = true;
+  //     EmitMemWatchNodeDetails(memWatchState, "final");
+  // #endif
+  //   } else {
+  //     EmitMemWatchSample(memWatchState, false);
+  //   }
+  // }
 
   uint64_t eventCount = Simulator::GetEventCount();
   // NS_LOG_INFO(" * * * total events : " << eventCount );
   // NS_LOG_INFO("[Rendezvous]: recv="<<totRendezvousRecv<<" send="<<totRendezvousSend);
 
-  uint64_t eventCounts[mx_sys], sendCounts[mx_sys];
   #ifdef NS3_MPI
+  uint64_t eventCounts[mx_sys], sendCounts[mx_sys];
   MPI_Gather(&eventCount,
           1,
           MPI_UNSIGNED_LONG_LONG,
@@ -1668,20 +1905,22 @@ int main(int argc, char *argv[]) {
           MpiInterface::GetCommunicator());
 
   if(MpiInterface::GetSystemId() == 0){
-    NS_LOG_INFO("[main] total send count="<<std::accumulate(sendCounts, sendCounts + conf::system, 0ULL));
-    NS_LOG_INFO("[main] total events="<<std::accumulate(eventCounts, eventCounts + conf::system, 0ULL));
+    // NS_LOG_INFO("[main] total send count="<<std::accumulate(sendCounts, sendCounts + conf::system, 0ULL));
+    // NS_LOG_INFO("[main] total events="<<std::accumulate(eventCounts, eventCounts + conf::system, 0ULL));
   }
   #endif
+  (void)eventCount;
 
   global_end = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(global_end - global_start);
+  (void)duration;
   #ifdef NS3_MPI
-  if(MpiInterface::GetSystemId() == 0)
-  {
-    std::cout<<"total runtime="<<duration.count()<<"ms"<<"\n";
-  }
+  // if(MpiInterface::GetSystemId() == 0)
+  // {
+  //   std::cout<<"total runtime="<<duration.count()<<"ms"<<"\n";
+  // }
   #elif NS3_MTP
-  std::cout<<"total runtime="<<duration.count()<<"ms"<<"\n";
+  // std::cout<<"total runtime="<<duration.count()<<"ms"<<"\n";
   #endif
 
   Simulator::Destroy();
@@ -1694,14 +1933,14 @@ int main(int argc, char *argv[]) {
   #ifdef NS3_MPI
   MpiInterface::Disable();
   #elif NS3_MTP
-  NS_LOG_INFO("[main] total send count="<<totRendezvousSend);
-  NS_LOG_INFO("[main] total events="<<eventCount);
+  // NS_LOG_INFO("[main] total send count="<<totRendezvousSend);
+  // NS_LOG_INFO("[main] total events="<<eventCount);
   #endif
   
-  std::clog.flush();
-  std::clog.flags(oldClogFlags);
-  std::clog.rdbuf(oldbuf);   // 恢复到原始 buffer（非常关键）
-  stream = nullptr;          // 释放 OutputStreamWrapper（可选，确保先恢复再销毁）
+  // std::clog.flush();
+  // std::clog.flags(oldClogFlags);
+  // std::clog.rdbuf(oldbuf);   // 恢复到原始 buffer（非常关键）
+  // stream = nullptr;          // 释放 OutputStreamWrapper（可选，确保先恢复再销毁）
   
   return 0;
 }

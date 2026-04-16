@@ -1,6 +1,6 @@
 {
-  "workloadpath": "simworkload/8192_workload.txt",
-  "thread": 1,
+  "workloadpath": "simworkload/16384_workload.txt",
+  "thread": 32,
   "gpu_type": "A100",                
   "gpus_per_server": 4,
   "nvswitch_per_server": 1,
@@ -22,7 +22,7 @@
 
   "mactable": {
     "load_enable": true,
-    "dir": "mactable/topo-fattree_k-16_subnet-2_subnetk-8_gpusper-8_nvsper-1"
+    "dir": "mactable/topo-fattree_k-16_subnet-2_subnetk-16_gpusper-16_nvsper-1"
   },
 
   "pfc": {
@@ -37,7 +37,7 @@
     "model": "fattree",
     "k": 16,
     "subnet_model": 2,              
-    "subnet_k": 8,                             
+    "subnet_k": 16,                             
     "hostperleaf": 2,                            
     "switch_delay_ns_override": 100 
   },
@@ -60,14 +60,18 @@
   },
 
   "debug": {
-    "mem_log_enable": true,
+    "mem_log_enable": false,
     "mem_log_time_mode": "sim",
-    "mem_log_interval_s": 0.0001,
-    "mem_log_interval_us": 500,
-    "mem_log_max_samples": 500000,
+    "mem_log_interval_s": 0.005,
+    "mem_log_interval_us": 5000,
+    "mem_log_max_samples": 2000000,
     "mem_log_node_detail_every_samples": 2,
     "mem_log_nodes": [],
-    "mem_log_top_nodes": 4
+    "mem_log_top_nodes": 4,
+    "mem_log_wall_peak_enable": false,
+    "mem_log_wall_peak_interval_ms": 1000,
+    "mem_log_wall_peak_log_on_new_peak": false,
+    "mem_log_wall_peak_periodic_every_samples": 1
   }
 
 }
