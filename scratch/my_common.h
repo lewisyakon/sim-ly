@@ -399,6 +399,17 @@ BasenameOnly(const std::string& path)
 }
 
 static inline std::string
+DirnameOnly(const std::string& path)
+{
+    if (path.empty())
+    {
+        return "";
+    }
+    const std::string::size_type pos = path.find_last_of("/\\");
+    return (pos == std::string::npos) ? "" : path.substr(0, pos);
+}
+
+static inline std::string
 SanitizeDirToken(std::string s)
 {
     for (char& c : s)
@@ -559,6 +570,85 @@ EnsureDirectoryRecursive(const std::string& dir)
         }
     }
     return true;
+}
+
+struct RuntimeLogConfig
+{
+    std::string dir;
+    std::string simulationLog = "simulation.log";
+    std::string ncclLog = "SimAI.log";
+};
+
+static inline RuntimeLogConfig
+LoadRuntimeLogConfig(const std::string& configPath)
+{
+    RuntimeLogConfig cfg;
+    if (configPath.empty())
+    {
+        return cfg;
+    }
+
+    std::ifstream in(configPath);
+    if (!in)
+    {
+        return cfg;
+    }
+
+    nlohmann::json j;
+    try
+    {
+        in >> j;
+    }
+    catch (...)
+    {
+        return cfg;
+    }
+
+    if (!j.contains("logging") || !j["logging"].is_object())
+    {
+        return cfg;
+    }
+
+    const auto& lg = j["logging"];
+    if (lg.contains("dir") && lg["dir"].is_string())
+    {
+        cfg.dir = lg["dir"].get<std::string>();
+    }
+    if (lg.contains("simulation_log") && lg["simulation_log"].is_string())
+    {
+        cfg.simulationLog = lg["simulation_log"].get<std::string>();
+    }
+    if (lg.contains("nccl_log") && lg["nccl_log"].is_string())
+    {
+        cfg.ncclLog = lg["nccl_log"].get<std::string>();
+    }
+    return cfg;
+}
+
+static inline std::string
+ResolveRuntimeLogPath(const std::string& dir, const std::string& configuredPath)
+{
+    if (configuredPath.empty())
+    {
+        return dir.empty() ? std::string() : dir;
+    }
+    if (configuredPath.find('/') != std::string::npos ||
+        configuredPath.find('\\') != std::string::npos)
+    {
+        return configuredPath;
+    }
+    return JoinPath(dir, configuredPath);
+}
+
+static inline bool
+EnsureParentDirectoryForFile(const std::string& filePath)
+{
+    const std::string parent = DirnameOnly(filePath);
+    if (parent.empty())
+    {
+        return true;
+    }
+    return EnsureDirectoryRecursive(parent);
 }
 
 static inline std::string
@@ -1062,6 +1152,37 @@ bool ReadConf(std::string network_conf)
         } catch (...) {
           // Keep current ether type on parse failure.
         }
+      }
+    }
+  }
+
+  // ---------- 3.2) logging overrides (new unified location) ----------
+  // New schema (recommended):
+  //   logging.log_levels.roce / logging.log_levels.pfc
+  // Compatibility aliases:
+  //   logging.roce_log_level / logging.pfc_log_level
+  // If both legacy and logging.* are provided, logging.* takes precedence.
+  if (j.contains("logging") && j["logging"].is_object())
+  {
+    const auto& lg = j["logging"];
+    if (JHas(lg, "roce_log_level"))
+    {
+      g_roce_cfg.logLevel = ParseRoceLogLevel(lg["roce_log_level"]);
+    }
+    if (JHas(lg, "pfc_log_level"))
+    {
+      g_pfcLogLevel = ParsePfcLogLevel(lg["pfc_log_level"]);
+    }
+    if (lg.contains("log_levels") && lg["log_levels"].is_object())
+    {
+      const auto& levels = lg["log_levels"];
+      if (JHas(levels, "roce"))
+      {
+        g_roce_cfg.logLevel = ParseRoceLogLevel(levels["roce"]);
+      }
+      if (JHas(levels, "pfc"))
+      {
+        g_pfcLogLevel = ParsePfcLogLevel(levels["pfc"]);
       }
     }
   }

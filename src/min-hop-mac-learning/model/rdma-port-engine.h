@@ -143,9 +143,10 @@ private:
   uint32_t GetNumQueues_() const;
   uint32_t ClassifyQueueId_(const Address& dst) const;
   bool IsQueuePaused_(uint32_t qid) const;
-  uint32_t GetInflightLimit_() const;
+  uint32_t GetSubQueueCapacity_() const;
+  uint32_t GetSubQueueOccupancy_(uint32_t qid) const;
   bool HasPendingWork_() const;
-  bool CanAdmit_(uint32_t qid) const;
+  bool CanAdmit_(uint32_t qid, bool controlClass) const;
   void EnqueuePending_(PortTxItem&& item);
   bool TrySendNow_(PortTxItem* item);
   void DrainPending_();
@@ -205,7 +206,6 @@ private:
 
   std::vector<std::deque<PortTxItem>> m_controlPending;
   std::vector<std::deque<PortTxItem>> m_dataPending;
-  std::vector<uint32_t> m_inflightPackets;
   std::vector<bool> m_knownPaused;
   std::map<RoceQpKey, QpRuntime> m_qpRuntimes;
   std::map<RoceQpKey, std::map<uint32_t, BufferedUpperPacket>> m_bufferedUpperPackets;

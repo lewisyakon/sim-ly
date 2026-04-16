@@ -24,6 +24,7 @@ NS_LOG_COMPONENT_DEFINE("SendFlowClient");
 namespace {
 
 constexpr uint16_t kRoceBthBytes = 12;
+constexpr uint32_t kRendezvousControlTagBase = 500000000;
 std::atomic<uint64_t> g_lastNetworkActivityTimeFs{0};
 std::atomic<uint64_t> g_lastFlowTxDoneTimeFs{0};
 
@@ -69,11 +70,6 @@ IsRoceBasicLogEnabled(const RoceConfig& cfg) {
   return cfg.logLevel != RoceLogLevel::Off;
 }
 
-bool
-IsRoceFullLogEnabled(const RoceConfig& cfg) {
-  return cfg.logLevel == RoceLogLevel::Full;
-}
-
 const char*
 ToString(RoceLogLevel level) {
   switch (level) {
@@ -96,6 +92,16 @@ ToStringAckTimeoutMode(const RoceConfig& cfg) {
 uint16_t
 GetVisibleRoceWireBytes(RoceOpcode opcode) {
   return static_cast<uint16_t>(RoceSimHeader::GetVisibleWireBytes(opcode));
+}
+
+bool
+TryMapRequestFlowToDataFlow(const RoceFlowKey& requestFlowKey, RoceFlowKey* dataFlowKey) {
+  if (dataFlowKey == nullptr || requestFlowKey.tag < kRendezvousControlTagBase) {
+    return false;
+  }
+  *dataFlowKey = requestFlowKey;
+  dataFlowKey->tag -= kRendezvousControlTagBase;
+  return true;
 }
 
 RoceOpcode
@@ -277,13 +283,28 @@ sendflowclient::ProcessThreePhasePayload_(Ptr<Packet> p,
   {
   case ThreePHeader::REQUEST:
   {
+    const uint64_t requestRxTimeFs =
+        static_cast<uint64_t>(Simulator::Now().GetFemtoSeconds());
+    RoceFlowKey dataFlowKey;
+    const bool mappedToDataFlow = TryMapRequestFlowToDataFlow(flowKey, &dataFlowKey);
+    if (mappedToDataFlow) {
+      m_lastRequestArrivalTimeFs[dataFlowKey] = requestRxTimeFs;
+    }
     if(check_recvfunc(tag,src,dst) == false){
       m_recvfuncflag[flowKey] = 1;
       MaybeReleaseRoceRxQp_(hasTransportQpKey, transportQpKey, roceIngressDeviceIndex);
       return ;
     }
+    if (mappedToDataFlow) {
+      m_lastRequestCallbackBeginTimeFs[dataFlowKey] = requestRxTimeFs;
+    }
     fuc_and_par fp = m_recvfunctable[flowKey];
     fp.msg_handler(fp.fun_arg);
+    const uint64_t requestCallbackEndFs =
+        static_cast<uint64_t>(Simulator::Now().GetFemtoSeconds());
+    if (mappedToDataFlow) {
+      m_lastRequestCallbackEndTimeFs[dataFlowKey] = requestCallbackEndFs;
+    }
     m_recvfunctable.erase(flowKey);
     m_recvfuncflag.erase(flowKey);
     MaybeReleaseRoceRxQp_(hasTransportQpKey, transportQpKey, roceIngressDeviceIndex);
@@ -307,16 +328,6 @@ sendflowclient::ProcessThreePhasePayload_(Ptr<Packet> p,
             const bool inserted =
                 m_deliveredDataFragmentIds[flowKey].insert(transportFragmentId).second;
             if (!inserted) {
-                if (IsRoceFullLogEnabled(m_roceCfg)) {
-                    NS_LOG_INFO("[ROCE][RX][DUPLICATE_DATA_IGNORED] node=" << GetNode()->GetId()
-                                << " tag=" << tag
-                                << " src=" << src
-                                << " dst=" << dst
-                                << " fragmentPsn=" << transportFragmentId
-                                << " deliveredCount=" << m_dataPacketsReceived[flowKey]
-                                << "/" << m_dataPacketsExpected[flowKey]
-                                << " TIME=" << Simulator::Now().GetFemtoSeconds());
-                }
                 break;
             }
         }
@@ -407,6 +418,9 @@ sendflowclient::ProcessThreePhasePayload_(Ptr<Packet> p,
             m_request.erase(flowKey);
             m_ackPacketsExpected.erase(flowKey);
             m_ackPacketsReceived.erase(flowKey);
+            m_lastRequestArrivalTimeFs.erase(flowKey);
+            m_lastRequestCallbackBeginTimeFs.erase(flowKey);
+            m_lastRequestCallbackEndTimeFs.erase(flowKey);
         }
     } else {
         NS_LOG_WARN("{tag,src,dst}= " << tag<<"  "<<src<<" "<<dst << ": Received ACT packet without expected count setup.");
@@ -427,12 +441,15 @@ sendflowclient::ProcessThreePhasePayload_(Ptr<Packet> p,
 void
 sendflowclient::TriggerSendTo_now(PacketSocketAddress dstadd,uint64_t datasize,uint32_t tag,uint32_t src,uint32_t dst,FlowSendMode sendmodel)
 {
+  const uint64_t issueTimeFs =
+      static_cast<uint64_t>(Simulator::Now().GetFemtoSeconds());
   NS_LOG_INFO("TriggerSendTo_now declared now time = "
-              << Simulator::Now().GetFemtoSeconds()
+              << issueTimeFs
               << " src=" << src
               << " dst=" << dst
               << " tag=" << tag
-              << " size=" << datasize);
+              << " size=" << datasize
+              << " sendMode=" << static_cast<uint32_t>(sendmodel));
   const ThreePHeader::State state =
       (datasize == 1023) ? ThreePHeader::REQUEST : ThreePHeader::DATA;
   if (IsRoceEnabled()) {
@@ -557,18 +574,6 @@ sendflowclient::EnqueueRoceWork_(ThreePHeader::State state,
                    << " dst=" << dst
                    << " qpn=" << item.qpKey.qpn
                    << " workId=" << item.workId);
-  }
-  if (IsRoceBasicLogEnabled(m_roceCfg)) {
-    NS_LOG_INFO("[ROCE][SQ][POST] workId=" << item.workId
-                << " state=" << static_cast<uint32_t>(state)
-                << " lane=" << GetRoceLaneLabel(state)
-                << " tag=" << tag
-                << " src=" << src
-                << " dst=" << dst
-                << " qpn=" << item.qpKey.qpn
-                << " totalBytes=" << item.totalBytes
-                << " totalPackets=" << item.totalPackets
-                << " class=" << static_cast<uint32_t>(item.txClass));
   }
 }
 
@@ -767,10 +772,22 @@ sendflowclient::set_recvfunc(int tag,int src,int dst,fuc_and_par fp){
     auto recvFlagIt = m_recvfuncflag.find(flowKey);
     if(recvFlagIt != m_recvfuncflag.end() && recvFlagIt->second){
       m_recvfuncflag.erase(recvFlagIt);
+      const uint64_t callbackBeginFs =
+          static_cast<uint64_t>(Simulator::Now().GetFemtoSeconds());
+      RoceFlowKey dataFlowKey;
+      const bool mappedToDataFlow = TryMapRequestFlowToDataFlow(flowKey, &dataFlowKey);
+      if (mappedToDataFlow) {
+        m_lastRequestCallbackBeginTimeFs[dataFlowKey] = callbackBeginFs;
+      }
 
       // NS_LOG_INFO("[RZV] CALLBACK fired tag="<<tag<<" src="<<src<<" dst="<<dst);
       
       fp.msg_handler(fp.fun_arg);
+      const uint64_t callbackEndFs =
+          static_cast<uint64_t>(Simulator::Now().GetFemtoSeconds());
+      if (mappedToDataFlow) {
+        m_lastRequestCallbackEndTimeFs[dataFlowKey] = callbackEndFs;
+      }
       return ;
     }
     m_recvfunctable[flowKey]=fp; 

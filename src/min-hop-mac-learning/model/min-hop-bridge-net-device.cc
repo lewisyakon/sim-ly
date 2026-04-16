@@ -704,6 +704,52 @@ MinHopBridgeNetDevice::DrainIngressQueue(Ptr<NetDevice> incomingPort)
 
         if (shouldCheckAvailability && !hasPath)
         {
+            static uint64_t sNoPathRetryLogCount = 0;
+            if (sNoPathRetryLogCount < 5000 || (sNoPathRetryLogCount % 10000) == 0)
+            {
+                HopCountHeader retryHopHeader;
+                ThreePHeader retryTpHeader;
+                Ptr<Packet> retryCopy = headCopy->Copy();
+                bool parsedThreePhase = false;
+                if (retryCopy->PeekHeader(retryHopHeader) > 0)
+                {
+                    retryCopy->RemoveHeader(retryHopHeader);
+                    parsedThreePhase = (retryCopy->PeekHeader(retryTpHeader) > 0);
+                }
+
+                std::ostringstream ingressDesc;
+                if (incomingPort)
+                {
+                    ingressDesc << Mac48Address::ConvertFrom(incomingPort->GetAddress());
+                }
+                else
+                {
+                    ingressDesc << "LOCAL";
+                }
+
+                NS_LOG_INFO("[BRIDGE][RETRY][NO_PATH] bridge="
+                            << Mac48Address::ConvertFrom(GetAddress())
+                            << " ingressPort=" << ingressDesc.str()
+                            << " dstMac=" << dst48
+                            << " packetType=" << static_cast<uint32_t>(headPacketType)
+                            << " isFlood=" << isFlood
+                            << " parsed3P=" << parsedThreePhase
+                            << " state="
+                            << (parsedThreePhase ? static_cast<uint32_t>(retryTpHeader.GetState())
+                                                 : 0xffffffffu)
+                            << " tag="
+                            << (parsedThreePhase ? retryTpHeader.GetTag() : 0xffffffffu)
+                            << " src="
+                            << (parsedThreePhase ? retryTpHeader.GetSrc() : 0xffffffffu)
+                            << " dst="
+                            << (parsedThreePhase ? retryTpHeader.GetDst() : 0xffffffffu)
+                            << " retryDelayNs="
+                            << (m_switchDelay.IsStrictlyPositive()
+                                    ? m_switchDelay.GetNanoSeconds()
+                                    : MicroSeconds(1).GetNanoSeconds())
+                            << " TIME=" << Simulator::Now().GetFemtoSeconds());
+            }
+            ++sNoPathRetryLogCount;
             ScheduleIngressDrainRetry(incomingPort);
             return;
         }

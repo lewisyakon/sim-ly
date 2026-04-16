@@ -94,7 +94,6 @@ RdmaPortEngine::Reset() {
   for (auto& q : m_dataPending) {
     q.clear();
   }
-  std::fill(m_inflightPackets.begin(), m_inflightPackets.end(), 0);
   m_knownPaused.assign(m_knownPaused.size(), false);
 
   m_qpRuntimes.clear();
@@ -452,9 +451,6 @@ RdmaPortEngine::EnsureQueueState_() {
   if (m_dataPending.size() != numQueues) {
     m_dataPending.assign(numQueues, {});
   }
-  if (m_inflightPackets.size() != numQueues) {
-    m_inflightPackets.assign(numQueues, 0);
-  }
   if (m_knownPaused.size() != numQueues) {
     m_knownPaused.assign(numQueues, false);
   }
@@ -507,8 +503,31 @@ RdmaPortEngine::IsQueuePaused_(uint32_t qid) const {
 }
 
 uint32_t
-RdmaPortEngine::GetInflightLimit_() const {
-  return std::max<uint32_t>(1, m_cfg.transportWindowPackets);
+RdmaPortEngine::GetSubQueueCapacity_() const {
+  if (!m_device) {
+    return 0;
+  }
+
+  Ptr<Queue<Packet>> queue = m_device->GetQueue();
+  Ptr<PppRoundRobinQueue<Packet>> rrQueue = DynamicCast<PppRoundRobinQueue<Packet>>(queue);
+  if (!rrQueue) {
+    return 0;
+  }
+  return rrQueue->GetMaxPacketsPerQueue();
+}
+
+uint32_t
+RdmaPortEngine::GetSubQueueOccupancy_(uint32_t qid) const {
+  if (!m_device) {
+    return 0;
+  }
+
+  Ptr<Queue<Packet>> queue = m_device->GetQueue();
+  Ptr<PppRoundRobinQueue<Packet>> rrQueue = DynamicCast<PppRoundRobinQueue<Packet>>(queue);
+  if (!rrQueue || rrQueue->GetNumQueues() == 0) {
+    return 0;
+  }
+  return rrQueue->GetSubQueueLength(qid % std::max<uint32_t>(1, rrQueue->GetNumQueues()));
 }
 
 bool
@@ -527,14 +546,18 @@ RdmaPortEngine::HasPendingWork_() const {
 }
 
 bool
-RdmaPortEngine::CanAdmit_(uint32_t qid) const {
+RdmaPortEngine::CanAdmit_(uint32_t qid, bool controlClass) const {
+  if (controlClass) {
+    return true;
+  }
   if (IsQueuePaused_(qid)) {
     return false;
   }
-  if (qid >= m_inflightPackets.size()) {
-    return false;
+  const uint32_t capacity = GetSubQueueCapacity_();
+  if (capacity == 0) {
+    return true;
   }
-  return m_inflightPackets[qid] < GetInflightLimit_();
+  return GetSubQueueOccupancy_(qid) < capacity;
 }
 
 RdmaPortEngine::QpRuntime&
@@ -601,8 +624,11 @@ RdmaPortEngine::CollectBlockedQps_() const {
     if (!runtime.hasDest) {
       continue;
     }
+    if (runtime.txClass == RoceTxClass::Control) {
+      continue;
+    }
     const uint32_t qid = ClassifyQueueId_(runtime.dest);
-    if (!CanAdmit_(qid)) {
+    if (!CanAdmit_(qid, false)) {
       blocked.insert(qpKey);
     }
   }
@@ -629,8 +655,8 @@ RdmaPortEngine::TrySendNow_(PortTxItem* item) {
 
   EnsureQueueState_();
   const uint32_t qid =
-      item->qid % std::max<uint32_t>(1, static_cast<uint32_t>(m_inflightPackets.size()));
-  if (!CanAdmit_(qid)) {
+      item->qid % std::max<uint32_t>(1, static_cast<uint32_t>(m_controlPending.size()));
+  if (!CanAdmit_(qid, item->controlClass)) {
     return false;
   }
 
@@ -656,7 +682,6 @@ RdmaPortEngine::TrySendNow_(PortTxItem* item) {
     return false;
   }
 
-  ++m_inflightPackets[qid];
   TrackSuccessfulSend_(*item);
   if (!m_txNotify.IsNull()) {
     m_txNotify(item->packet->Copy());
@@ -1142,10 +1167,6 @@ RdmaPortEngine::DrainPending_() {
     m_rrIndex = (m_rrIndex + 1) % numQueues;
     ++visited;
 
-    if (!CanAdmit_(qid)) {
-      continue;
-    }
-
     std::deque<PortTxItem>* queue = nullptr;
     if (!m_controlPending[qid].empty()) {
       queue = &m_controlPending[qid];
@@ -1156,6 +1177,9 @@ RdmaPortEngine::DrainPending_() {
     }
 
     NS_ASSERT(queue != nullptr);
+    if (!CanAdmit_(qid, queue->front().controlClass)) {
+      continue;
+    }
     const bool sent = TrySendNow_(&queue->front());
     if (!sent) {
       ScheduleDrain_(true);
@@ -1219,6 +1243,16 @@ RdmaPortEngine::TrackSuccessfulSend_(const PortTxItem& item) {
 
   OutstandingPacket& outstanding = packetIt->second;
   if (tag.IsRetransmission()) {
+    if (m_cfg.logLevel != RoceLogLevel::Off) {
+      NS_LOG_INFO("[ROCE][RTX][SEND] tag=" << flowKey.tag
+                  << " src=" << flowKey.src
+                  << " dst=" << flowKey.dst
+                  << " qpn=" << qpKey.qpn
+                  << " psn=" << tag.GetPsn()
+                  << " retryIndex=" << (outstanding.retries + 1)
+                  << " outstanding=" << packets.size()
+                  << " TIME=" << Simulator::Now().GetFemtoSeconds());
+    }
     outstanding.retries++;
     m_pendingRetransmissions.erase(qpKey);
   }
@@ -1240,6 +1274,17 @@ RdmaPortEngine::HandleRetransTimeout_(const RoceQpKey& qpKey) {
   }
 
   OutstandingPacket& outstanding = mapIt->second.begin()->second;
+  if (m_cfg.logLevel != RoceLogLevel::Off) {
+    NS_LOG_INFO("[ROCE][RTO] tag=" << outstanding.flowKey.tag
+                << " src=" << outstanding.flowKey.src
+                << " dst=" << outstanding.flowKey.dst
+                << " qpn=" << qpKey.qpn
+                << " psn=" << outstanding.psn
+                << " retries=" << outstanding.retries
+                << " outstanding=" << mapIt->second.size()
+                << " ackTimeoutNs=" << m_cfg.ackTimeoutNs
+                << " TIME=" << Simulator::Now().GetFemtoSeconds());
+  }
   if (outstanding.retries >= m_cfg.maxRetransmissions) {
     mapIt->second.erase(mapIt->second.begin());
     if (mapIt->second.empty()) {
@@ -1346,22 +1391,7 @@ RdmaPortEngine::OnQueuePauseState_(uint32_t qid, bool paused) {
 
 void
 RdmaPortEngine::OnPhyTxEnd_(Ptr<const Packet> packet) {
-  if (!packet) {
-    return;
-  }
-
-  RdmaDispatchTag tag;
-  Ptr<Packet> copy = packet->Copy();
-  if (!copy->PeekPacketTag(tag)) {
-    return;
-  }
-
-  EnsureQueueState_();
-  const uint32_t qid =
-      tag.GetQueueId() % std::max<uint32_t>(1, static_cast<uint32_t>(m_inflightPackets.size()));
-  if (qid < m_inflightPackets.size() && m_inflightPackets[qid] > 0) {
-    --m_inflightPackets[qid];
-  }
+  (void)packet;
   if (HasPendingWork_()) {
     ScheduleDrain_(false);
   }

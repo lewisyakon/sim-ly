@@ -20,18 +20,35 @@
     "floadtime_s": 500
   },
 
+  "logging": {
+    "dir": "simlog",
+    "simulation_log": "simulation2.log",
+    "nccl_log": "SimAI.log",
+    "log_levels": {
+      "roce": "off",
+      "pfc": "basic"
+    },
+    "ns3_components": {
+      "send_flow_client": true,
+      "rdma_port_engine": true,
+      "generic_simulation": true,
+      "min_hop_bridge_net_device": true,
+      "point_to_point_net_device": true,
+      "ppp_round_robin_queue": true
+    }
+  },
+
   "mactable": {
     "load_enable": false,
-    "dump_enable": false,
+    "dump_enable": true,
     "dir": "mactable"
   },
 
   "pfc": {
-    "drop_tail_queue_size": "500",
+    "drop_tail_queue_size": "100",
     "drop_tail_queue_num": "16",
     "high_watermark": 0.8,
-    "low_watermark": 0.2,
-    "log_level": "basic"
+    "low_watermark": 0.2
   },
 
   "topology": {
@@ -50,14 +67,13 @@
     "sq_depth": 1024,
     "rq_depth": 1024,
     "transport_ack_enable": true,
-    "transport_window_packets": 200,
-    "reorder_window_packets": 4,
+    "transport_window_packets": 32,
+    "reorder_window_packets": 16,
     "ack_timeout_mode": "auto",
     "ack_timeout_factor": 8.0,
     "ack_timeout_ns": 50000,
     "max_retransmissions": 8,
-    "ether_type": "0x9999",
-    "log_level": "basic"
+    "ether_type": "0x9999"
   }
 
 }

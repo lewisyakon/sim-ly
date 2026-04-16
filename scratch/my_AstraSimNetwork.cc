@@ -326,6 +326,86 @@ static std::string ResolvePpScheduleFromConfig(const std::string& config_path) {
   return "gpipe";
 }
 
+struct Ns3ComponentLogSwitches {
+  bool sendFlowClient = true;
+  bool rdmaPortEngine = true;
+  bool genericSimulation = true;
+  bool minHopBridgeNetDevice = true;
+  bool pointToPointNetDevice = true;
+  bool pppRoundRobinQueue = true;
+};
+
+static void SetBoolFromJsonIfPresent(const nlohmann::json& obj,
+                                     const char* key,
+                                     bool* target) {
+  if (target == nullptr || key == nullptr) {
+    return;
+  }
+  if (!obj.contains(key) || !obj[key].is_boolean()) {
+    return;
+  }
+  *target = obj[key].get<bool>();
+}
+
+static Ns3ComponentLogSwitches LoadNs3ComponentLogSwitches(const std::string& config_path) {
+  Ns3ComponentLogSwitches switches;
+  std::ifstream in(config_path);
+  if (!in.is_open()) {
+    return switches;
+  }
+
+  nlohmann::json j;
+  try {
+    in >> j;
+  } catch (...) {
+    return switches;
+  }
+
+  if (!j.contains("logging") || !j["logging"].is_object()) {
+    return switches;
+  }
+  const auto& logging = j["logging"];
+  if (!logging.contains("ns3_components") || !logging["ns3_components"].is_object()) {
+    return switches;
+  }
+  const auto& components = logging["ns3_components"];
+
+  SetBoolFromJsonIfPresent(components, "send_flow_client", &switches.sendFlowClient);
+  SetBoolFromJsonIfPresent(components, "rdma_port_engine", &switches.rdmaPortEngine);
+  SetBoolFromJsonIfPresent(components, "generic_simulation", &switches.genericSimulation);
+  SetBoolFromJsonIfPresent(components,
+                           "min_hop_bridge_net_device",
+                           &switches.minHopBridgeNetDevice);
+  SetBoolFromJsonIfPresent(components,
+                           "point_to_point_net_device",
+                           &switches.pointToPointNetDevice);
+  SetBoolFromJsonIfPresent(components,
+                           "ppp_round_robin_queue",
+                           &switches.pppRoundRobinQueue);
+  return switches;
+}
+
+static void EnableNs3ComponentLogs(const Ns3ComponentLogSwitches& switches) {
+  if (switches.sendFlowClient) {
+    LogComponentEnable("SendFlowClient", LOG_LEVEL_INFO);
+  }
+  if (switches.rdmaPortEngine) {
+    LogComponentEnable("RdmaPortEngine", LOG_LEVEL_INFO);
+  }
+  if (switches.genericSimulation) {
+    LogComponentEnable("GENERIC_SIMULATION", LOG_LEVEL_INFO);
+  }
+  if (switches.minHopBridgeNetDevice) {
+    LogComponentEnable("MinHopBridgeNetDevice", LOG_LEVEL_INFO);
+  }
+  if (switches.pointToPointNetDevice) {
+    LogComponentEnable("PointToPointNetDevice", LOG_LEVEL_INFO);
+  }
+  if (switches.pppRoundRobinQueue) {
+    LogComponentEnable("PppRoundRobinQueue", LOG_LEVEL_INFO);
+  }
+}
+
 static int user_param_prase(int argc,char * argv[],struct user_param* user_param){
   int opt;
   while ((opt = getopt(argc,argv,"ht:w:g:s:n:c:"))!=-1){
@@ -391,20 +471,39 @@ int main(int argc, char *argv[]) {
   #endif
 
   struct user_param user_param;
-  MockNcclLog::set_log_name("SimAI.log");
-  MockNcclLog* NcclLog = MockNcclLog::getInstance();
-  NcclLog->writeLog(NcclLogLevel::INFO," init SimAI.log ");
   if(user_param_prase(argc,argv,&user_param)){
     return 0;
   }
   
   network_config = user_param.network_conf.empty() ? "simconfig/config.json"
                                                    : user_param.network_conf;
-  // Enable SendFlowClient logs before network/app construction so [ROCE][CFG]
-  // emitted during SetRoceConfig is visible in simulation.log.
-  LogComponentEnable("SendFlowClient",LOG_LEVEL_INFO);
+  const RuntimeLogConfig runtimeLogCfg = LoadRuntimeLogConfig(network_config);
+  const Ns3ComponentLogSwitches ns3LogSwitches =
+      LoadNs3ComponentLogSwitches(network_config);
+  const std::string simulationLogPath =
+      ResolveRuntimeLogPath(runtimeLogCfg.dir, runtimeLogCfg.simulationLog);
+  const std::string ncclLogPath =
+      ResolveRuntimeLogPath(runtimeLogCfg.dir, runtimeLogCfg.ncclLog);
+  if (!simulationLogPath.empty() && !EnsureParentDirectoryForFile(simulationLogPath))
+  {
+    std::cerr << "[LOGGING] failed to create parent directory for simulation log: "
+              << simulationLogPath << "\n";
+    return 1;
+  }
+  if (!ncclLogPath.empty() && !EnsureParentDirectoryForFile(ncclLogPath))
+  {
+    std::cerr << "[LOGGING] failed to create parent directory for NCCL log: "
+              << ncclLogPath << "\n";
+    return 1;
+  }
+  MockNcclLog::set_log_name(ncclLogPath);
+  MockNcclLog* NcclLog = MockNcclLog::getInstance();
+  NcclLog->writeLog(NcclLogLevel::INFO," init %s ", ncclLogPath.c_str());
+  // Enable all configured ns-3 log components in one place before construction
+  // so early startup logs (e.g., [ROCE][CFG]) are visible in simulation.log.
+  EnableNs3ComponentLogs(ns3LogSwitches);
   AsciiTraceHelper ascii;
-  Ptr<OutputStreamWrapper> stream = ascii.CreateFileStream("simulation.log");
+  Ptr<OutputStreamWrapper> stream = ascii.CreateFileStream(simulationLogPath);
   std::streambuf* oldbuf = std::clog.rdbuf(stream->GetStream()->rdbuf());
 
   AstraSim::Workload::SetDefaultPPScheduleByString(
@@ -440,17 +539,6 @@ int main(int argc, char *argv[]) {
     node2nvswitch[i] = i;
     NVswitchs.push_back(i);
   }
-
-  // LogComponentEnable("OnOffApplication", LOG_LEVEL_INFO);
-  // LogComponentEnable("PacketSink", LOG_LEVEL_INFO);
-  LogComponentEnable("GENERIC_SIMULATION", LOG_LEVEL_INFO);
-  LogComponentEnable("MinHopBridgeNetDevice", LOG_LEVEL_INFO);
-  LogComponentEnable("PointToPointNetDevice", LOG_LEVEL_INFO);
-  LogComponentEnable("PppRoundRobinQueue", LOG_LEVEL_INFO);
-  // LogComponentEnable("HybridSimulatorImpl",LOG_LEVEL_INFO);
-  // LogComponentEnable("MtpInterface",LOG_LEVEL_INFO);
-  // LogComponentEnable("GrantedTimeWindowMpiInterface",LOG_LEVEL_INFO);
-  // LogComponentEnable("LogicalProcess", LOG_LEVEL_INFO);
 
   std::vector<ASTRASimNetwork *> networks(nodes_num, nullptr);
   std::vector<AstraSim::Sys *> systems(nodes_num, nullptr);

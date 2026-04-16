@@ -143,6 +143,9 @@ private:
   //当前已收到的 ACT 包数量
   std::map<RoceFlowKey, uint64_t> m_ackPacketsReceived;
   std::map<RoceFlowKey, uint64_t> m_alldatasize;
+  std::map<RoceFlowKey, uint64_t> m_lastRequestArrivalTimeFs;
+  std::map<RoceFlowKey, uint64_t> m_lastRequestCallbackBeginTimeFs;
+  std::map<RoceFlowKey, uint64_t> m_lastRequestCallbackEndTimeFs;
 
   int reqlen,acklen;
   uint32_t localbridgeindex;

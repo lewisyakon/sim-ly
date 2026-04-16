@@ -64,6 +64,12 @@ class MockNcclLog {
     return instance;
   }
   static void set_log_name(std::string log_name){
+    if (log_name.find('/') != std::string::npos ||
+        log_name.find('\\') != std::string::npos)
+    {
+      LogName = log_name;
+      return;
+    }
     LogName = LOG_PATH + log_name;
   }
   void writeLog(NcclLogLevel level, const char* format,...) {

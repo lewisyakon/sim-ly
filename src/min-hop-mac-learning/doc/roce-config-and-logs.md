@@ -78,8 +78,8 @@
   - 推荐写法：`"full"`、`"basic"`、`"off"`。
   - 兼容写法：`2/1/0`。
   - 影响：
-    - `full`：完整输出配置、激活、入队、逐 slice 发送等调试日志。
-    - `basic`：只输出配置、激活和入队日志，足够看流向与阶段。
+    - `full`：输出 `basic` 的全部内容，并额外输出 ACK / reorder 的细粒度调试日志。
+    - `basic`：输出配置激活与关键可靠性事件（如 `RTO` / `RTX_SEND`）。
     - `off`：关闭 RoCE 信息日志。
   - 注意：`WARN/FATAL` 级别的异常日志不受这个开关影响，仍然会打印。
 
@@ -207,119 +207,51 @@ all passes finished at time: ...
 - `maxRetrans`
   - 单包最大重传次数。
 
-### 3.2 调度器日志
+### 3.2 transport ACK / reorder / retransmission 日志（当前实现）
 
-#### `[ROCE][SCHED][ENQ]`
+当前代码中，和 transport 可靠性闭环直接相关的日志如下：
 
-示例：
-
-```text
-[ROCE][SCHED][ENQ] workId=5 state=1 lane=data tag=1 src=0 dst=1 qpn=5 totalBytes=16384 totalPackets=4 class=1
-```
+#### `[ROCE][ACK][TX]`（`full`）
 
 含义：
 
-- 说明一个发送工作已经进入 QP / RoCE 调度器。
-- `state`
-  - `0`：REQUEST
-  - `1`：DATA
-  - `2`：ACT
-- `lane`
-  - `req_ctrl`：REQUEST 控制 lane
-  - `data`：DATA lane
-  - `act_ctrl`：ACT 控制 lane
-- `src/dst`
-  - 本条流的发送端和接收端。
-- `qpn`
-  - 该 flow 在当前 lane 上绑定的 QP 编号。
-- `totalPackets`
-  - 该工作最终会被拆成多少个 slice。
-- `class`
-  - `0`：控制类
-  - `1`：数据类
+- 接收侧发出了一个 transport ACK（协议 ACK，不是业务 `ACT`）。
+- 可用于观察累计确认点推进（`ackPsn`）和接收侧状态（`expectedRxPsn`、`pendingRxCount`）。
 
-这是 `basic` 级别最核心的日志，主要用于看：
-
-- 流方向
-- 三阶段顺序
-- 哪些 flow 在哪个 lane / QP 上
-
-#### `[ROCE][SCHED][TX]`
-
-示例：
-
-```text
-[ROCE][SCHED][TX] workId=5 state=1 lane=data tag=1 src=0 dst=1 qpn=5 packetIndex=2 sliceBytes=4096 totalPackets=4 last=false class=1
-```
+#### `[ROCE][RX][REORDER_BUFFER]`（`full`）
 
 含义：
 
-- 说明调度器真正放出了一个 packet slice。
-- `packetIndex`
-  - 这是该 work 的第几个 slice。
-- `sliceBytes`
-  - 该次发送的 slice 字节数。
-- `last`
-  - 是否为该 work 的最后一个 slice。
+- 某个 future packet 进入了接收侧 reorder buffer。
+- 可用于观察有界乱序窗口内的缓存行为。
 
-这是 `full` 级别才会输出的日志，主要用于看：
-
-- 多活跃 QP 是否在轮转
-- 一个 DATA work 是否被逐 slice 调度
-- 控制报文是否插到数据报文前面
-
-### 3.3 transport ACK / retransmission 日志
-
-下面这几类都只在 `full` 级别输出。
-
-#### `[ROCE][ACK][TX]`
+#### `[ROCE][RX][REORDER_RELEASE]`（`full`）
 
 含义：
 
-- 接收侧刚刚发出了一个 transport ACK。
-- 它是协议 ACK，不是业务 `ACT`。
-- 当前 ACK 的 `psn` 只作为调试锚点，等于当前累计确认点。
-- 它不再表示“反向普通控制流中的一个必须按序交付的数据包”。
+- reorder buffer 中连续可交付的数据被释放并上送。
 
-#### `[ROCE][ACK][RX]`
+#### `[ROCE][RX][REORDER_OVERFLOW]`（`WARN`，不受 `roce.log_level` 控制）
 
 含义：
 
-- 发送侧收到了一个 transport ACK。
-- `ackPsn` 表示累计确认边界。
-- 这条日志出现时，发送侧会清掉 `ackPsn` 及之前的 outstanding，并尝试继续调度新的普通 packet。
-- 当前 ACK 接收不再依赖反向 `expectedRxPsn` 追平，因此不会再出现“ACK 明明已经累计到高位，却因为反向乱序窗口卡住而不生效”的情况。
+- 收到的 future packet 超出 `reorder_window_packets`，不会进入 reorder buffer。
+- 当前策略是保持累计 ACK 并依赖发送侧 timeout/recovery 补洞。
 
-#### `[ROCE][RTX][TIMEOUT]`
+#### `[ROCE][RTO]`（`basic/full`）
 
 含义：
 
-- 某个 QP 的 oldest outstanding packet 超时。
+- outstanding 最老包触发超时，进入 recovery 处理。
+- 这是当前代码里 timeout 日志前缀（不是旧前缀 `[ROCE][RTX][TIMEOUT]`）。
 
-#### `[ROCE][RX][REORDER_OVERFLOW]`
-
-含义：
-
-- 接收侧发现某个非 ACK future packet 超出了当前 `reorder_window_packets`。
-- 这个 packet 不会进入 reorder buffer，也不会上送业务层。
-- 当前处理策略是：
-  - 保持累计 ACK 在 `expectedRxPsn - 1`
-  - 依赖发送侧 timeout/recovery 来补回缺失洞
-- 当前实现会让该 QP 进入 recovery，并阻塞新的普通 packet。
-
-#### `[ROCE][RTX][SEND]`
+#### `[ROCE][RTX][SEND]`（`basic/full`）
 
 含义：
 
-- 当前有一个待发 retransmission 通过统一 dispatch 路径发出。
+- 某个重传包真正发出。
 
-#### `[ROCE][RTX][DROP]`
-
-含义：
-
-- 某个 packet 超过 `max_retransmissions` 上限，被放弃。
-
-### 3.4 事务流日志
+### 3.3 事务流日志
 
 这几类日志不受 `roce.log_level` 控制。
 
@@ -384,59 +316,93 @@ TriggerSendTo_now declared now time = 500000000123456789 src=0 dst=1 tag=5 size=
 这几类事务流日志主要用于看：
 
 - 一个 flow 什么时候真正收尾
-- 为什么 log 尾部只有大量 `[ROCE][SCHED][TX]` 而看不到事务完成信息
+- 为什么收尾阶段看起来“网络还在动但事务是否已经闭环”
 - 某个 flow 是否停在“数据已发出但还没收到 ACT”的阶段
 
-### 3.5 异常日志
+### 3.4 中间处理过程日志（本轮已移除）
 
-- `[ROCE][TX] ...`
-  - 发送侧构头失败、或 QP 状态异常时打印。
-  - 当前版本里，如果 `EnsureQpReadyToSend()` 后 QP 仍不可发，会直接报错退出。
+下面这批“过程观测类”日志在当前分支已删除，不应再出现在新日志中：
 
-- `[ROCE][RX] ...`
-  - 接收侧校验 RoCE 头时发现异常时打印，例如：
-    - QP 拒收
-    - phase 不一致
-    - opcode 不一致
-    - 其他真正协议错误
+- `[ROCE][REQ][RX]`
+- `[ROCE][REQ][WAIT_RECV_CALLBACK]`
+- `[ROCE][REQ][CALLBACK_BEGIN]`
+- `[ROCE][REQ][CALLBACK_END]`
+- `[ROCE][REQ][CALLBACK_LATE_REG_BEGIN]`
+- `[ROCE][REQ][CALLBACK_LATE_REG_END]`
+- `[ROCE][DATA][ISSUE_AFTER_REQ]`
+- `[ROCE][TXPORT]`
+- `[ROCE][SQ][POST]`
+- `[ROCE][RX][DUPLICATE_DATA_IGNORED]`
 
-- `[ROCE][QPN] ...`
-  - flow 三元组和收到的 `qpn` 映射不一致时打印。
+### 3.5 异常 / 告警日志（当前实现）
+
+#### 3.5.1 `WARN` 类（不受 `roce.log_level` 控制）
+
+- `[ROCE][SQ][FULL]`
+  - SQ 深度用尽，PostSend 拒绝该 work。
+- `[ROCE][RQ][FULL] packet rejected before rx header`
+  - RQ 已满，包在进入 QP 头处理前被拒收。
+- `[ROCE][RQ][FULL] buffered packet rejected`
+  - 需要进 reorder buffer 的包在占用 RQ 条目时失败。
+- `[ROCE][RQ][FULL] packet rejected`
+  - 正常上送路径占用 RQ 条目失败。
+- `[ROCE][RX] QP rejected packet`
+  - QP 引擎拒绝该包（状态/语义不满足）。
+- `[ROCE][RX][REORDER_OVERFLOW]`
+  - future packet 超出乱序窗口。
+- `[ROCE][PORT][BUILD_FAIL]`
+  - scheduler 选中的 slice 构包失败。
+- `[ROCE][ACK][TX] failed to build ack`
+  - ACK 包构建失败。
+- `[ROCE][CQ][OVERFLOW]`
+  - CQ 深度溢出，最老 completion 被挤掉。
+- `[ROCE][SQ][COMPLETE_MISS]`
+  - SQ 为空但收到完成通知。
+- `[ROCE][SQ][COMPLETE_UNKNOWN]`
+  - SQ 非空但找不到对应 `workId`。
+- `[ROCE][SCHED] request callback missing`
+  - REQUEST 收尾时未找到对应 send callback。
+- `[ROCE][RX] missing/invalid RoCE header, fallback legacy parse`
+  - 开启 RoCE 时收到无效头，回落 legacy 解析。
+
+#### 3.5.2 `FATAL` 类（直接终止）
+
+- `[ROCE][RX] ingress port engine missing`
+- `[ROCE][SCHED] missing transport engine`
+- `[ROCE][SQ] failed to prepare work`
+- `[ROCE][SQ] failed to resolve tx port`
+- `[ROCE][SQ] failed to post work`
 
 ## 4. 推荐的日志等级用法
 
 - `full`
-  - 用于调试调度器、QP 和逐 slice 行为。
-  - 也用于调试 transport ACK / timeout / retransmission。
-  - 也适合观察大 sender window 下是“无损但高回压”，还是已经进入真实 drop / retransmission 区间。
-  - 当前阶段要验证多活跃 QP 的 RR，建议先用这个等级。
+  - 输出 `basic` 的全部内容。
+  - 额外输出 `ACK_TX`、`REORDER_BUFFER/REORDER_RELEASE` 等细粒度日志。
+  - 适合定位 reorder / timeout / retransmission 细节。
 
 - `basic`
-  - 用于日常观察业务流方向。
-  - 日志量明显小于 `full`，但仍能看出 `REQUEST -> DATA -> ACT` 和 `src/dst/qpn`。
-  - 当前不会打印包级 ACK / retransmission。
+  - 输出配置激活与关键可靠性事件（如 `[ROCE][RTO]`、`[ROCE][RTX][SEND]`）。
+  - 适合日常排障，日志量明显小于 `full`。
 
 - `off`
   - 用于大规模跑 workload，不看 RoCE 信息日志时使用。
+  - 注意：`WARN/FATAL` 仍会输出；事务流日志是否可见还受 ns-3 组件开关影响。
 
-## 5. 多活跃 QP 观察 workload 的历史备注
+### 4.1 与 `logging.ns3_components` 的关系
 
-历史上曾用 `simworkload/roceMultiQpRR.txt` 观察多目的端 QP 和数据类 RR。
+- `roce.log_level` 只控制 RoCE 的信息日志（`INFO`）子集。
+- `NS_LOG_WARN/NS_LOG_UNCOND/std::cout` 不受 `roce.log_level` 控制。
+- `SendFlowClient` / `RdmaPortEngine` 组件若未启用 `LOG_LEVEL_INFO`，对应 `INFO` 日志也不会出现在 `simulation.log`。
 
-这组记录现在只作为历史排障参考：
+## 5. 当前排查建议
 
-1. `ep: 16` 且 `DP_size` 不能整除时，EP 会被禁用，表现为只有 `[ROCE][CFG]`、没有 `[ROCE][ACTIVE] / [ROCE][SCHED][ENQ] / [ROCE][SCHED][TX]`，并且 `total send count=0`。
-2. 改成 `ep: 4` 后曾经能触发实际发送，并验证过多目的端 QP 创建。
-3. 早期出现过大量 `[ROCE][RX] QP rejected packet ...`，当时原因是接收侧乱序处理过严；当前主路径已经有 bounded reorder 和 ACK/retransmission，不应再把这段旧现象当成当前 RoCE 的状态。
-
-如果以后重新使用这个 workload，建议重新按当前代码和当前 `simulation.log` 做结论，不要直接沿用旧的 `total send count=48` 或旧的 RR 观察结论。
-
-排查时仍可先看：
+排查时建议按下面顺序看：
 
 1. `simulation.log` 里是否出现 `TriggerSendTo_now`。
 2. 是否出现 `[ROCE][ACTIVE]`。
 3. `[main] total send count` 是否大于 `0`。
-4. `roce.log_level=full` 时是否出现 `[ROCE][SCHED][ENQ] / [ROCE][SCHED][TX]`。
+4. 是否出现 `[FLOW][REQ_DONE] / [FLOW][RX_DONE] / [FLOW][TX_DONE]` 完整闭环。
+5. 若怀疑乱序窗口或恢复机制问题，再看 `[ROCE][RX][REORDER_OVERFLOW]`、`[ROCE][RTO]`、`[ROCE][RTX][SEND]`。
 
 ## 6. 配置是如何进入代码的
 
