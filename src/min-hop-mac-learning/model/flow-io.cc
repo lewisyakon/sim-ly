@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <mutex>
 #include <utility>
 
 namespace ns3 {
@@ -27,6 +28,7 @@ NS_OBJECT_ENSURE_REGISTERED(FlowIo);
 namespace {
 // Non-owning registry: avoid reference cycles/re-entrancy during global destruction.
 std::unordered_map<uint32_t, FlowIo*> g_flowIoRegistryByNodeId;
+std::mutex g_flowIoRegistryMutex;
 
 struct FlowIoDropStats
 {
@@ -37,11 +39,13 @@ struct FlowIoDropStats
 };
 
 FlowIoDropStats g_flowIoDropStats;
+std::mutex g_flowIoDropStatsMutex;
 constexpr uint64_t kApproxSchedulerEventBytes = 128;
 
 void
 PrintFlowIoDropSummary()
 {
+  std::lock_guard<std::mutex> lock(g_flowIoDropStatsMutex);
   NS_LOG_UNCOND("[DROP][SUMMARY][FLOWIO] bufOverflowPkts="
                 << g_flowIoDropStats.bufferOverflowDrops
                 << " bufOverflowBytes="
@@ -58,6 +62,7 @@ PrintFlowIoDropSummary()
 void
 EnsureFlowIoDropSummaryScheduled()
 {
+  std::lock_guard<std::mutex> lock(g_flowIoDropStatsMutex);
   if (!g_flowIoDropStats.summaryScheduled)
   {
     g_flowIoDropStats.summaryScheduled = true;
@@ -104,6 +109,7 @@ FlowIo::PauseNodeQueue(Ptr<Node> node, uint32_t queueId)
   {
     return;
   }
+  std::lock_guard<std::mutex> lock(g_flowIoRegistryMutex);
   auto it = g_flowIoRegistryByNodeId.find(node->GetId());
   if (it != g_flowIoRegistryByNodeId.end() && it->second)
   {
@@ -118,6 +124,7 @@ FlowIo::ResumeNodeQueue(Ptr<Node> node, uint32_t queueId)
   {
     return;
   }
+  std::lock_guard<std::mutex> lock(g_flowIoRegistryMutex);
   auto it = g_flowIoRegistryByNodeId.find(node->GetId());
   if (it != g_flowIoRegistryByNodeId.end() && it->second)
   {
@@ -375,7 +382,10 @@ FlowIo::Start(const SocketRxCallback& cb)
     m_sock2dev[PeekPointer(sock)] = devIdx;
   }
 
-  g_flowIoRegistryByNodeId[m_node->GetId()] = this;
+  {
+    std::lock_guard<std::mutex> lock(g_flowIoRegistryMutex);
+    g_flowIoRegistryByNodeId[m_node->GetId()] = this;
+  }
 }
 
 void
@@ -397,6 +407,7 @@ FlowIo::Stop()
 
   if (m_node)
   {
+    std::lock_guard<std::mutex> lock(g_flowIoRegistryMutex);
     auto it = g_flowIoRegistryByNodeId.find(m_node->GetId());
     if (it != g_flowIoRegistryByNodeId.end() && it->second == this)
     {
@@ -535,10 +546,18 @@ FlowIo::EnqueueBuffered(uint32_t devIndex, uint32_t queueId, const Address& dest
   if (m_txBuffer.size() >= m_maxBufferedPackets)
   {
     EnsureFlowIoDropSummaryScheduled();
-    ++g_flowIoDropStats.bufferOverflowDrops;
-    g_flowIoDropStats.bufferOverflowDropBytes += pkt->GetSize();
     uint32_t nodeId = m_node ? m_node->GetId() : UINT32_MAX;
-    uint64_t nodeDrops = ++g_flowIoDropStats.perNodeBufferOverflowDrops[nodeId];
+    uint64_t nodeDrops = 0;
+    uint64_t totalDrops = 0;
+    uint64_t totalDropBytes = 0;
+    {
+      std::lock_guard<std::mutex> lock(g_flowIoDropStatsMutex);
+      ++g_flowIoDropStats.bufferOverflowDrops;
+      g_flowIoDropStats.bufferOverflowDropBytes += pkt->GetSize();
+      nodeDrops = ++g_flowIoDropStats.perNodeBufferOverflowDrops[nodeId];
+      totalDrops = g_flowIoDropStats.bufferOverflowDrops;
+      totalDropBytes = g_flowIoDropStats.bufferOverflowDropBytes;
+    }
 
     static uint64_t sOverflowLogCount = 0;
     if (sOverflowLogCount < 20 || (sOverflowLogCount % 1000) == 0)
@@ -549,8 +568,8 @@ FlowIo::EnqueueBuffered(uint32_t devIndex, uint32_t queueId, const Address& dest
                     << " totalBuf=" << m_txBuffer.size()
                     << " maxBuf=" << m_maxBufferedPackets
                     << " pktSize=" << pkt->GetSize()
-                    << " totalDropPkts=" << g_flowIoDropStats.bufferOverflowDrops
-                    << " totalDropBytes=" << g_flowIoDropStats.bufferOverflowDropBytes
+                    << " totalDropPkts=" << totalDrops
+                    << " totalDropBytes=" << totalDropBytes
                     << " nodeDropPkts=" << nodeDrops);
     }
     ++sOverflowLogCount;
@@ -801,8 +820,11 @@ FlowIo::EnqueueExternalHold(uint32_t queueId, const Address& dest, Ptr<Packet> p
   if (GetExternalHoldPacketCount() >= m_maxBufferedPackets)
   {
     EnsureFlowIoDropSummaryScheduled();
-    ++g_flowIoDropStats.bufferOverflowDrops;
-    g_flowIoDropStats.bufferOverflowDropBytes += pkt->GetSize();
+    {
+      std::lock_guard<std::mutex> lock(g_flowIoDropStatsMutex);
+      ++g_flowIoDropStats.bufferOverflowDrops;
+      g_flowIoDropStats.bufferOverflowDropBytes += pkt->GetSize();
+    }
     ++m_externalHoldDrops;
     m_externalHoldDropBytes += pkt->GetSize();
     static uint64_t sExternalHoldDropLogCount = 0;

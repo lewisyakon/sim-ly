@@ -22,6 +22,35 @@ using namespace ns3;
 
 
 namespace AstraSim {
+namespace {
+bool ShouldLogLayerCompletion(const Layer* layer) {
+  if (layer == nullptr || layer->generator == nullptr) {
+    return false;
+  }
+  if (layer->workload == nullptr) {
+    return layer->generator->id == 0;
+  }
+
+  // Print one representative rank per PP stage to keep logs readable while
+  // still exposing full pipeline progress.
+  return (layer->workload->dp_rank == 0 && layer->workload->tp_rank == 0);
+}
+
+std::string LayerCompletionPrefix(const Layer* layer) {
+  if (layer == nullptr || layer->generator == nullptr) {
+    return "[rank unknown] ";
+  }
+  if (layer->workload == nullptr) {
+    return "[rank " + std::to_string(layer->generator->id) + "] ";
+  }
+
+  return "[rank " + std::to_string(layer->generator->id) + " dp/pp/tp=(" +
+         std::to_string(layer->workload->dp_rank) + "/" +
+         std::to_string(layer->workload->pp_rank) + "/" +
+         std::to_string(layer->workload->tp_rank) + ")] ";
+}
+} // namespace
+
 Layer::Layer(
     std::string id,
     int layer_num,
@@ -128,8 +157,9 @@ void Layer::call(EventType event, CallData* mdata) {
   IntData* intData = ((IntData*)mdata);
   if (event == EventType::Wight_Grad_Comm_Finished_After_Delay) {
     #ifndef PHY_MTP
-    if (generator->id == 0) {
-      std::cout << "***** info: weight gradient collective for layer: " << id
+    if (ShouldLogLayerCompletion(this)) {
+      std::cout << LayerCompletionPrefix(this)
+                << "***** info: weight gradient collective for layer: " << id
                 << " is finished************" << std::endl;
     }
     weight_grad_datasets[data]->finish_tick += weight_grad_update_time;
@@ -174,8 +204,9 @@ void Layer::call(EventType event, CallData* mdata) {
     return;
   } else if (event == EventType::Input_Grad_Comm_Finished_After_Delay) {
     #ifndef PHY_MTP
-    if (generator->id == 0) {
-      std::cout << "***** info: input gradient collective for layer: " << id
+    if (ShouldLogLayerCompletion(this)) {
+      std::cout << LayerCompletionPrefix(this)
+                << "***** info: input gradient collective for layer: " << id
                 << " is finished************" << std::endl;
     }
     input_grad_datasets[data]->finish_tick += input_grad_update_time;
@@ -219,8 +250,9 @@ void Layer::call(EventType event, CallData* mdata) {
     return;
   } else if (event == EventType::Fwd_Comm_Finished_After_Delay) {
     #ifndef PHY_MTP
-    if (generator->id == 0) {
-      std::cout << "***** info: fwd pass comm collective for layer: " << id
+    if (ShouldLogLayerCompletion(this)) {
+      std::cout << LayerCompletionPrefix(this)
+                << "***** info: fwd pass comm collective for layer: " << id
                 << " is finished************" << std::endl;
     }
     fwd_pass_datasets[data]->finish_tick += fwd_update_time;

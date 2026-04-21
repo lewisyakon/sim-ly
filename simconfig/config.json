@@ -1,6 +1,6 @@
 {
-  "workloadpath": "simworkload/16384_workload.txt",
-  "thread": 32,
+  "workloadpath": "simworkload/1024_7B.txt",
+  "thread": 4,
   "gpu_type": "A100",                
   "gpus_per_server": 4,
   "nvswitch_per_server": 1,
@@ -22,7 +22,7 @@
 
   "mactable": {
     "load_enable": true,
-    "dir": "mactable/topo-fattree_k-16_subnet-2_subnetk-16_gpusper-16_nvsper-1"
+    "dir": "mactable/topo-fattree_k-8_subnet-2_subnetk-8_gpusper-8_nvsper-1"
   },
 
   "pfc": {
@@ -35,9 +35,9 @@
 
   "topology": {
     "model": "fattree",
-    "k": 16,
+    "k": 8,
     "subnet_model": 2,              
-    "subnet_k": 16,                             
+    "subnet_k": 8,                             
     "hostperleaf": 2,                            
     "switch_delay_ns_override": 100 
   },

@@ -77,7 +77,7 @@ namespace conf
 {
   uint32_t system = 0;
   uint32_t rank = 0;
-  uint32_t thread = 32;
+  uint32_t thread = 2;
   bool nullmsg = false;
 }; 
 
@@ -309,6 +309,56 @@ static int ParseAllGpusFromWorkloadHeader(const std::string& workload_path) {
     }
   }
   return -1;
+}
+
+static std::string ResolveNetworkConfigPathFromArgv(int argc, char* argv[]) {
+  std::string config_path = "simconfig/config.json";
+  const std::string long_prefix = "--network_conf=";
+  for (int i = 1; i < argc; ++i) {
+    if (argv[i] == nullptr) {
+      continue;
+    }
+    const std::string arg = argv[i];
+    if (arg == "-c" && (i + 1) < argc && argv[i + 1] != nullptr) {
+      config_path = argv[i + 1];
+      ++i;
+      continue;
+    }
+    if (arg.rfind(long_prefix, 0) == 0) {
+      config_path = arg.substr(long_prefix.size());
+    }
+  }
+  return config_path;
+}
+
+static uint32_t ResolveThreadFromConfig(const std::string& config_path, uint32_t fallback) {
+  std::ifstream in(config_path);
+  if (!in.is_open()) {
+    return fallback;
+  }
+  nlohmann::json j;
+  try {
+    in >> j;
+  } catch (...) {
+    return fallback;
+  }
+  if (!j.contains("thread")) {
+    return fallback;
+  }
+  try {
+    int thread = -1;
+    if (j["thread"].is_number_integer()) {
+      thread = j["thread"].get<int>();
+    } else if (j["thread"].is_string()) {
+      thread = std::stoi(j["thread"].get<std::string>());
+    }
+    if (thread > 0) {
+      return static_cast<uint32_t>(thread);
+    }
+  } catch (...) {
+    return fallback;
+  }
+  return fallback;
 }
 
 static std::string ResolvePpScheduleFromConfig(const std::string& config_path) {
@@ -1591,10 +1641,15 @@ static int user_param_prase(int argc,char * argv[],struct user_param* user_param
 void Initialize(int argc, char * argv[])
 {
     #ifdef NS3_MPI
+    std::string networkConfCliArg;
     CommandLine cmd;
     // parse mtp/mpi options
     cmd.AddValue("system", "Number of logical processes in MTP manual partition", conf::system);
     cmd.AddValue("nullmsg", "Enable null message algorithm", conf::nullmsg);
+    // Keep custom config args visible to ns-3 CommandLine so -c/--network_conf
+    // does not fail before user_param_prase() handles it.
+    cmd.AddValue("network_conf", "Path to network config JSON", networkConfCliArg);
+    cmd.AddValue("c", "Alias for network_conf", networkConfCliArg);
     cmd.Parse(argc, argv);
 
     MtpInterface::Enable(conf::thread);
@@ -1611,7 +1666,16 @@ void GetGlobalStart()
   global_start = std::chrono::high_resolution_clock::now();
 }
 
+/*
+mpirun -np 2 --map-by ppr:2:node:PE=4 --bind-to core  \
+  build/scratch/ns3.44-my_AstraSimNetwork-default
+
+--hostfile hostfile.txt --mca btl_tcp_if_include 10.201.0.0/16
+*/
+
 int main(int argc, char *argv[]) {
+  const std::string startup_config = ResolveNetworkConfigPathFromArgv(argc, argv);
+  conf::thread = ResolveThreadFromConfig(startup_config, conf::thread);
 
   #ifdef NS3_MPI
   Initialize(argc, argv);
@@ -1915,12 +1979,12 @@ int main(int argc, char *argv[]) {
   auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(global_end - global_start);
   (void)duration;
   #ifdef NS3_MPI
-  // if(MpiInterface::GetSystemId() == 0)
-  // {
-  //   std::cout<<"total runtime="<<duration.count()<<"ms"<<"\n";
-  // }
+  if(MpiInterface::GetSystemId() == 0)
+  {
+    std::cout<<"total runtime="<<duration.count()<<"ms"<<"\n";
+  }
   #elif NS3_MTP
-  // std::cout<<"total runtime="<<duration.count()<<"ms"<<"\n";
+  std::cout<<"total runtime="<<duration.count()<<"ms"<<"\n";
   #endif
 
   Simulator::Destroy();

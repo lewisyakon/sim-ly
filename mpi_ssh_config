@@ -1,0 +1,17 @@
+Host lewis
+    HostName 10.201.100.127
+    Port 2222
+    User lympi
+    ForwardX11 no
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    IdentityFile /home/lympi/.ssh/id_rsa
+
+Host lab
+    HostName 10.201.0.206
+    Port 2222
+    User lympi
+    ForwardX11 no
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    IdentityFile /home/lympi/.ssh/id_rsa

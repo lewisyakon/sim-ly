@@ -17,9 +17,7 @@
 #include <algorithm>
 #include <sstream>
 #include <chrono>
-#include <mutex>
 #include <iostream>
-#include <iomanip>
 #include <limits>
 
 namespace ns3
@@ -30,80 +28,19 @@ NS_OBJECT_ENSURE_REGISTERED(MinHopBridgeNetDevice);
 
 namespace
 {
-struct FloodWindowSummary
-{
-    bool seen = false;
-    bool printed = false;
-    Time startSim = Time(0);
-    Time endSim = Time(0);
-    std::chrono::steady_clock::time_point startWall;
-    std::chrono::steady_clock::time_point endWall;
-};
-
-FloodWindowSummary g_floodWindowSummary;
-std::mutex g_floodWindowSummaryMutex;
-
 void
 RecordFloodWindowTouch()
 {
-    std::lock_guard<std::mutex> guard(g_floodWindowSummaryMutex);
-    Time nowSim = Simulator::Now();
-    auto nowWall = std::chrono::steady_clock::now();
-    if (!g_floodWindowSummary.seen)
-    {
-        g_floodWindowSummary.seen = true;
-        g_floodWindowSummary.startSim = nowSim;
-        g_floodWindowSummary.endSim = nowSim;
-        g_floodWindowSummary.startWall = nowWall;
-        g_floodWindowSummary.endWall = nowWall;
-        return;
-    }
-    g_floodWindowSummary.endSim = nowSim;
-    g_floodWindowSummary.endWall = nowWall;
-}
-
-void
-TryPrintFloodWindowSummaryOnce(bool printToStdout)
-{
-    std::lock_guard<std::mutex> guard(g_floodWindowSummaryMutex);
-    if (!g_floodWindowSummary.seen)
-    {
-        if (printToStdout)
-        {
-            std::cout << "[FLOOD][WINDOW][GLOBAL] status=no_data_yet (unit: sim_time=ns, wall_time=ns/ms)\n";
-        }
-        return;
-    }
-    if (g_floodWindowSummary.printed)
-    {
-        return;
-    }
-    g_floodWindowSummary.printed = true;
-    int64_t simDurationNs = (g_floodWindowSummary.endSim - g_floodWindowSummary.startSim).GetNanoSeconds();
-    int64_t wallDurationNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                 g_floodWindowSummary.endWall - g_floodWindowSummary.startWall)
-                                 .count();
-    double wallDurationS = static_cast<double>(wallDurationNs) / 1e9;
-    std::ostringstream oss;
-    oss << std::fixed << std::setprecision(3)
-        << "[FLOOD][WINDOW][GLOBAL]"
-        << " startSim=" << g_floodWindowSummary.startSim.GetNanoSeconds() << " ns"
-        << " endSim=" << g_floodWindowSummary.endSim.GetNanoSeconds() << " ns"
-        << " simDuration=" << simDurationNs << " ns"
-        << " wallDuration=" << wallDurationNs << " ns"
-        << " (" << wallDurationS << " s)";
-    NS_LOG_UNCOND(oss.str());
-    if (printToStdout)
-    {
-        std::cout << oss.str() << std::endl;
-    }
+    // Flood window global timing is intentionally disabled.
+    // Keeping this no-op avoids teardown-time lock/log contention in MTP/MPI runs.
 }
 } // namespace
 
 void
 MinHopBridgeNetDevice::PrintFloodWindowSummary(bool printToStdout)
 {
-    TryPrintFloodWindowSummaryOnce(printToStdout);
+    (void)printToStdout;
+    // Flood window summary output disabled by design.
 }
 
 TypeId
@@ -214,7 +151,6 @@ MinHopBridgeNetDevice::DoDispose()
                       << " fwdSendFailDrops=" << m_forwardSendFailDrops
                       << " localSendFailDrops=" << m_localSendFailDrops);
     }
-    TryPrintFloodWindowSummaryOnce(false);
     for (auto iter = m_ports.begin(); iter != m_ports.end(); iter++)
     {
         *iter = nullptr;
