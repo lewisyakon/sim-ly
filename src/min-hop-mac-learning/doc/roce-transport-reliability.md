@@ -1,5 +1,7 @@
 # RoCE 传输可靠性说明
 
+最近修改：2026-04-23
+
 记录时间：2026-04-10
 
 这份文档按当前 `RdmaPortEngine` 主路径重写。旧版文档里大量函数名和状态还停留在 `my_sendflowclient` 承担 ACK/重传/reorder 的阶段，已经不适合作为当前实现说明。
@@ -60,6 +62,11 @@
 3. 对应 egress queue 因 pause 或 per-qid inflight limit 暂时不能准入的 QP。
 
 这意味着当前 offered load 不再只是由上层 workload 一口气灌入决定，而是会被 transport window、recovery、PFC/pause 和端口准入共同限制。
+
+需要和 [topology-endpoint-bridge-model.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/topology-endpoint-bridge-model.md) 一起看的一点是：
+
+- `FlowIo` 仍然保留本地 software buffer/pause 映射
+- 但它不是 RoCE 主窗口、主 ACK、主重传状态源头
 
 ## 4. ACK 处理
 
@@ -151,7 +158,7 @@ QP 空闲后，`MaybeReleaseIdleTxQp_(...)` 会检查：
 4. 没有动态 RTO，例如 SRTT/RTTVAR。
 5. 没有完整 `ECN / CNP / DCQCN` 拥塞控制。
 6. 主路径不是 `RoCEv2 over UDP/IP`。
-7. 多出端口场景还没有进入主逻辑。
+7. 端点侧已经支持 external bridge 和 external rail 清单，但真正的多出端口 striping / 多 port runtime 绑定还没有进入主逻辑。
 
 ## 9. 与内存问题的关系
 

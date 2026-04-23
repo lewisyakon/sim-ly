@@ -1,6 +1,8 @@
 # RoCE 当前状态
 
-记录时间：2026-04-10
+最近修改：2026-04-23
+
+记录时间：2026-04-23
 
 这份文档只回答当前工作区里 RoCE 实现已经做到哪一步，以及最近一次本地日志能证明什么。过往阶段性计划请不要从这里反推当前状态。
 
@@ -24,6 +26,11 @@
    - `QP / SQ / RQ / CQ` 的最小运行时模型
    - packetize、ACK、retransmission、reorder
    - pause-aware 端口准入和 per-qid inflight 限制
+
+4. GPU 端点 bridge 模型
+   - `innerBridge + optional externalBridge`
+   - 外侧 bridge 可启用 `TerminalLearningOnly`
+   - 只学表、不承担 transit 转发
 
 也就是说，当前 RoCE 主路径已经不再依赖旧的 `sendflowclient` 内部 fallback。真正的 packet runtime 已经下沉到挂在 `PointToPointNetDevice` 上的 `RdmaPortEngine`。
 
@@ -51,6 +58,9 @@
 18. per-qid inflight packet 限制
 19. send/recv completion 记录
 20. QP 空闲后的 runtime 状态释放
+21. `innerBridge + externalBridge` 端点布局
+22. 外侧 bridge 的 `TerminalLearningOnly` 行为
+23. `FlowIo` 与 bridge/PFC 的本地 pause 映射
 
 对应的主要代码位置是：
 
@@ -114,7 +124,7 @@
 3. `RQ` 是最小 receive slot 模型，不是完整 `post_recv`/RNR 语义。
 4. `SRQ` 没有实现。
 5. QP bringup 被自动压缩为 `Reset -> Init -> RTR -> RTS`。
-6. 当前主实现仍针对“出端口唯一”的路径，多出端口绑定策略还没有成为主逻辑。
+6. 端点侧已经支持 `innerBridge/externalBridge` 分离和 external rail 清单，但每个 work 仍只会绑定一个物理 egress port；真正的多 rail striping 还没有进入主逻辑。
 7. 主路径不是现实中常见的 `RoCEv2 over UDP/IP`，而是自定义二层 RoCE-like transport。
 8. 还没有完整 `ECN/CNP/DCQCN` 拥塞控制闭环。
 

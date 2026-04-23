@@ -24,6 +24,7 @@
 #include<map>
 #include <memory>
 #include <set>
+#include <vector>
 #include"min-hop-bridge-net-device.h"
 #include "FlowTagHeader.h"
 #include "flow-io.h"
@@ -78,6 +79,17 @@ public:
   void SetRoceMode(RoceMode mode);
   RoceMode GetRoceMode() const;
   bool IsRoceEnabled() const;
+  void SetExternalRailCount(uint32_t railCount);
+  uint32_t GetExternalRailCount() const;
+  struct ExternalSubflowPlanItem
+  {
+    uint32_t railIndex = 0;
+    uint64_t bytes = 0;
+  };
+  std::vector<ExternalSubflowPlanItem> BuildExternalSubflowPlan(uint64_t totalBytes,
+                                                                 uint32_t tag,
+                                                                 uint32_t src,
+                                                                 uint32_t dst) const;
   
 private:
   virtual void StartApplication(void);
@@ -158,6 +170,7 @@ private:
   RoceMode m_roceMode = RoceMode::Legacy;
   std::unique_ptr<RoceTransportEngine> m_roceTransport;
   bool m_roceActiveLogged = false;
+  uint32_t m_externalRailCount = 1;
 };
 
 

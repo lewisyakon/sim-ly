@@ -171,7 +171,12 @@ class MinHopBridgeNetDevice : public NetDevice
 
     bool Learn(Mac48Address source, Ptr<NetDevice> port, uint8_t hopCount);
     std::vector<Ptr<NetDevice>> GetLearnedState(Mac48Address source);
-    Ptr<NetDevice> ecmp(std::vector<Ptr<NetDevice> > outports, Mac48Address src,  Mac48Address dst, uint64_t uid);
+    Ptr<NetDevice> ecmp(std::vector<Ptr<NetDevice> > outports,
+                        Mac48Address src,
+                        Mac48Address dst,
+                        uint64_t uid,
+                        uint32_t flowTag = 0,
+                        bool hasFlowTag = false);
 
     /** A map of MAC address to learned state. */
     std::map<Mac48Address, std::vector<LearnedState> > m_learnState;
@@ -186,6 +191,7 @@ class MinHopBridgeNetDevice : public NetDevice
     PromiscReceiveCallback m_promiscRxCallback;
     Time m_expirationTime;
     bool m_enableLearning;
+    bool m_terminalLearningOnly;
 
     double m_highWatermark;
     double m_lowWatermark;

@@ -127,6 +127,12 @@ MinHopBridgeNetDevice::GetTypeId()
                           BooleanValue(true),
                           MakeBooleanAccessor(&MinHopBridgeNetDevice::m_enableLearning),
                           MakeBooleanChecker())
+            .AddAttribute("TerminalLearningOnly",
+                          "When true, packets arriving from bridge ports are only used for "
+                          "local learning/receive and will not be forwarded onward.",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&MinHopBridgeNetDevice::m_terminalLearningOnly),
+                          MakeBooleanChecker())
             .AddAttribute("PfcHighWatermark",
                           "Pause threshold ratio for ingress/egress queue occupancy.",
                           DoubleValue(0.8),
@@ -151,6 +157,7 @@ MinHopBridgeNetDevice::MinHopBridgeNetDevice()
       m_mtu(1500),
       m_expirationTime(Seconds(99999)),
       m_enableLearning(true),
+      m_terminalLearningOnly(false),
       m_highWatermark(0.8),
       m_lowWatermark(0.2),
       m_ingressQueueDrops(0),
@@ -688,15 +695,25 @@ MinHopBridgeNetDevice::DrainIngressQueue(Ptr<NetDevice> incomingPort)
 
         bool shouldCheckAvailability = false;
         bool hasPath = true;
-        if (headPacketType == PacketType::PACKET_OTHERHOST &&
+        const bool terminalTransitPacket =
+            m_terminalLearningOnly &&
+            incomingPort != nullptr &&
+            ((headPacketType == PacketType::PACKET_OTHERHOST &&
+              dst48 != Mac48Address::ConvertFrom(m_address)) ||
+             headPacketType == PacketType::PACKET_BROADCAST ||
+             headPacketType == PacketType::PACKET_MULTICAST);
+
+        if (!terminalTransitPacket &&
+            headPacketType == PacketType::PACKET_OTHERHOST &&
             dst48 != Mac48Address::ConvertFrom(m_address))
         {
             shouldCheckAvailability = true;
             hasPath = isFlood ? HasAvailableFloodPath(incomingPort, dst48)
                               : HasAvailableUnicastPath(incomingPort, dst48);
         }
-        else if (headPacketType == PacketType::PACKET_BROADCAST ||
-                 headPacketType == PacketType::PACKET_MULTICAST)
+        else if (!terminalTransitPacket &&
+                 (headPacketType == PacketType::PACKET_BROADCAST ||
+                  headPacketType == PacketType::PACKET_MULTICAST))
         {
             shouldCheckAvailability = true;
             hasPath = HasAvailableFloodPath(incomingPort, dst48);
@@ -881,6 +898,30 @@ MinHopBridgeNetDevice::ScheduleReceive(Ptr<NetDevice> incomingPort,
         m_promiscRxCallback(this, p, protocol, src, dst, packetType);
     }
 
+    if (m_terminalLearningOnly &&
+        incomingPort != nullptr &&
+        ((packetType == PACKET_OTHERHOST &&
+          dst48 != Mac48Address::ConvertFrom(m_address)) ||
+         packetType == PACKET_BROADCAST ||
+         packetType == PACKET_MULTICAST))
+    {
+        static uint64_t sTerminalDropLogCount = 0;
+        if (sTerminalDropLogCount < 200 || (sTerminalDropLogCount % 10000) == 0)
+        {
+            // NS_LOG_INFO("[BRIDGE][TERMINAL][DROP] bridge="
+            //             << Mac48Address::ConvertFrom(GetAddress())
+            //             << " ingressPort="
+            //             << Mac48Address::ConvertFrom(incomingPort->GetAddress())
+            //             << " src=" << src48
+            //             << " dst=" << dst48
+            //             << " packetType=" << static_cast<uint32_t>(packetType)
+            //             << " floodForward=" << (newHops > 0)
+            //             << " learnedPaths=" << GetLearnedState(src48).size());
+        }
+        ++sTerminalDropLogCount;
+        return;
+    }
+
     // Forwarding/Receiving logic
     switch (packetType)
     {
@@ -978,7 +1019,12 @@ MinHopBridgeNetDevice::AddEntry(Mac48Address mac, const std::vector<uint32_t>& p
 }
 
 Ptr<NetDevice>
-MinHopBridgeNetDevice::ecmp(std::vector<Ptr<NetDevice> > outPorts, Mac48Address src,  Mac48Address dst, uint64_t uid){
+MinHopBridgeNetDevice::ecmp(std::vector<Ptr<NetDevice> > outPorts,
+                            Mac48Address src,
+                            Mac48Address dst,
+                            uint64_t uid,
+                            uint32_t flowTag,
+                            bool hasFlowTag){
     std::vector<Ptr<NetDevice>> candidatePorts;
     candidatePorts.reserve(outPorts.size());
     for (auto const& outPort : outPorts)
@@ -1029,43 +1075,25 @@ MinHopBridgeNetDevice::ecmp(std::vector<Ptr<NetDevice> > outPorts, Mac48Address 
         // NS_LOG_INFO("m_address (converted to MAC): " << m_address);
         return candidatePorts[index];
     }
-    if (ecmpmodel==2){//哈希测试
-        // --- 全部内嵌的小工具 ---
-        auto macToU64 = [](const Mac48Address& a)->uint64_t {
-        uint8_t b[6]; a.CopyTo(b);
-        return (uint64_t)b[0]<<40 | (uint64_t)b[1]<<32 | (uint64_t)b[2]<<24 |
-                (uint64_t)b[3]<<16 | (uint64_t)b[4]<<8  | (uint64_t)b[5];
-        };
-        auto fmix64 = [](uint64_t k)->uint64_t {
-        k ^= k >> 33; k *= 0xff51afd7ed558ccdULL;
-        k ^= k >> 33; k *= 0xc4ceb9fe1a85ec53ULL;
-        k ^= k >> 33; return k;
-        };
-        auto rotl64 = [](uint64_t x, int r)->uint64_t { return (x<<r) | (x>>(64-r)); };
-        auto fastrange64 = [](uint64_t h, uint32_t n)->uint32_t {
-        #if defined(__SIZEOF_INT128__)
-        return (uint32_t)(((__uint128_t)h * n) >> 64); // 无偏
-        #else
-        return (uint32_t)(h % n); // 兜底
-        #endif
-        };
+    if (ecmpmodel==2){//HASH（按流优先；无tag时回退到uid）
+        std::ostringstream oss;
+        // 组合键：(src, dst, 本地地址, flowTag/uid)
+        oss << src << dst;
+        oss << m_address;
+        if (hasFlowTag)
+        {
+            oss << "tag:" << flowTag;
+        }
+        else
+        {
+            oss << "uid:" << uid;
+        }
+        std::string key = oss.str();
+        std::hash<std::string> hasher;
+        size_t hash = hasher(key);
 
-        Mac48Address selfMac = Mac48Address::ConvertFrom(m_address);
-        // 组合键：(src, dst, 本端MAC, uid)
-        // 如需“按流哈希”，把 k4 改成 flow_id（或 {tag,src,dst} 的稳定编码），别用 uid。
-        uint64_t h  = 0x9e3779b97f4a7c15ULL;      // 种子
-        uint64_t k1 = macToU64(src);
-        uint64_t k2 = macToU64(dst);
-        uint64_t k3 = macToU64(selfMac);
-        uint64_t k4 = uid;                        // ← 按包；按流请改为 flow_id
-
-        h ^= fmix64(k1); h = rotl64(h,27) * 0x9ddfea08eb382d69ULL;
-        h ^= fmix64(k2); h = rotl64(h,27) * 0x9ddfea08eb382d69ULL;
-        h ^= fmix64(k3); h = rotl64(h,27) * 0x9ddfea08eb382d69ULL;
-        h ^= fmix64(k4); h = fmix64(h);
-
-        uint32_t idx = fastrange64(h, (uint32_t)candidatePorts.size());
-        return candidatePorts[idx];
+        uint32_t index = hash % candidatePorts.size();
+        return candidatePorts[index];
     }
     return candidatePorts.front();
 }
@@ -1106,7 +1134,22 @@ MinHopBridgeNetDevice::ForwardUnicast(Ptr<NetDevice> incomingPort,
             }
             ecmpCandidates.push_back(port);
         }
-        Ptr<NetDevice> realoutport = ecmp(ecmpCandidates, src, dst, packet->GetUid());
+        uint32_t flowTag = 0;
+        bool hasFlowTag = false;
+        Ptr<Packet> flowProbe = packet->Copy();
+        HopCountHeader flowProbeHopHeader;
+        ThreePHeader flowProbeTpHeader;
+        if (flowProbe->PeekHeader(flowProbeHopHeader) > 0)
+        {
+            flowProbe->RemoveHeader(flowProbeHopHeader);
+        }
+        if (flowProbe->PeekHeader(flowProbeTpHeader) > 0)
+        {
+            flowTag = flowProbeTpHeader.GetTag();
+            hasFlowTag = true;
+        }
+        Ptr<NetDevice> realoutport =
+            ecmp(ecmpCandidates, src, dst, packet->GetUid(), flowTag, hasFlowTag);
 
         if (realoutport)
         {

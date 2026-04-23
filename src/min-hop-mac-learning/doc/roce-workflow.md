@@ -1,5 +1,7 @@
 # RoCE 工作流说明
 
+最近修改：2026-04-23
+
 这份文档讲的是“当前最终实现里，一条流怎样从上层下来，经过逻辑层和端口层，最后从物理 port 发出去”。
 
 ## 1. 总览
@@ -85,13 +87,17 @@ Astra-Sim
 
 ### 2.4 `sendflowclient` 解析实际 egress port
 
-当前只支持“出端口唯一”的主路径，但实现里已经把最终发送落点放在具体 port 上。
+当前虽然还没有做单 work 多口并发，但实现里已经把最终发送落点放在具体 port 上，而且端点布局已经支持 `innerBridge + optional externalBridge`。
 
 发送时：
 
-1. `External` 直接取外部口
-2. `Loopback` 且 `mindex == m_outDeviceIndex` 时，也直接取外部口
-3. 其他 `Internal/Loopback` 场景，通过 bridge 的 `ResolveLocalInjectionEgressPort(...)` 解析真实 `outPort`
+1. `External`
+   - 先尝试把 `m_outDeviceIndex` 直接当物理口
+   - 如果 `m_outDeviceIndex` 实际上是 `externalBridge`，则由 `externalBridge` 的 `ResolveLocalInjectionEgressPort(...)` 找真实 `outPort`
+2. `Loopback` 且 `mindex == m_outDeviceIndex`
+   - 走与 `External` 相同的外侧逻辑
+3. 其他 `Internal/Loopback`
+   - 通过 `m_bridgeDevice`，也就是 `innerBridge`，解析真实 `outPort`
 
 然后 `sendflowclient` 找到这个 `outPort` 上 aggregate 的 `RdmaPortEngine`。
 
@@ -329,16 +335,23 @@ reorder 现在在 port engine 里：
 1. `sendflowclient`
    - 业务层
 
-2. `RoceTransportEngine`
+2. `FlowIo`
+   - socket 绑定
+   - legacy/fallback buffer
+   - 本地软件 pause 适配
+
+3. `RoceTransportEngine`
    - 逻辑层
 
-3. `RdmaPortEngine`
+4. `RdmaPortEngine`
    - packet runtime + port runtime
 
-4. `bridge`
-   - 仍然只负责选 `outPort`
+5. `bridge`
+   - 选择 `outPort`
+   - 学表 / flood / forwarding
+   - 外侧终端 bridge 上的 learning-only drop
 
-5. `PointToPointNetDevice`
+6. `PointToPointNetDevice`
    - 真正上链路
 
 如果你想判断“这次解耦是不是已经成型”，最值得看的就是这一条边界链。

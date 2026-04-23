@@ -100,6 +100,98 @@ std::vector<Ptr<MinHopBridgeNetDevice>> FullmeshDevices;
 std::vector<Ptr<MinHopBridgeNetDevice>> TestSwitchDevices;
 
 std::vector<Ptr<MinHopBridgeNetDevice>> SubNetDevices;
+std::vector<Ptr<MinHopBridgeNetDevice>> ExternalBridgeDevices;
+
+struct GpuExternalIoLayout
+{
+    uint32_t innerBridgeIfIndex = 0;
+    uint32_t externalBridgeIfIndex = UINT32_MAX;
+    std::vector<uint32_t> externalRailIfIndices;
+    Mac48Address endpointMac = Mac48Address();
+    Ptr<NetDevice> innerBridge;
+    Ptr<NetDevice> externalBridge;
+};
+
+std::vector<GpuExternalIoLayout> GpuExternalIoLayouts;
+
+static inline void
+ResetGpuExternalIoLayouts()
+{
+    GpuExternalIoLayouts.clear();
+    GpuExternalIoLayouts.resize(numGPUs);
+}
+
+static inline GpuExternalIoLayout&
+EnsureGpuExternalIoLayout(uint32_t gpuIndex)
+{
+    if (gpuIndex >= GpuExternalIoLayouts.size())
+    {
+        GpuExternalIoLayouts.resize(gpuIndex + 1);
+    }
+    return GpuExternalIoLayouts[gpuIndex];
+}
+
+static inline const GpuExternalIoLayout&
+GetGpuExternalIoLayout(uint32_t gpuIndex)
+{
+    NS_ASSERT_MSG(gpuIndex < GpuExternalIoLayouts.size(),
+                  "GPU external IO layout missing for gpuIndex=" << gpuIndex);
+    return GpuExternalIoLayouts[gpuIndex];
+}
+
+static inline bool
+HasDedicatedGpuExternalBridge(const GpuExternalIoLayout& ioLayout)
+{
+    return ioLayout.externalBridge != nullptr &&
+           ioLayout.externalBridgeIfIndex != UINT32_MAX &&
+           !ioLayout.externalRailIfIndices.empty();
+}
+
+static inline void
+RegisterGpuBridgeOnlyIoLayout(uint32_t gpuIndex,
+                              const Ptr<MinHopBridgeNetDevice>& innerBridge)
+{
+    GpuExternalIoLayout& ioLayout = EnsureGpuExternalIoLayout(gpuIndex);
+    ioLayout.innerBridgeIfIndex = innerBridge->GetIfIndex();
+    ioLayout.externalBridgeIfIndex = UINT32_MAX;
+    ioLayout.externalRailIfIndices.clear();
+    ioLayout.innerBridge = innerBridge;
+    ioLayout.externalBridge = nullptr;
+}
+
+static inline void
+RegisterGpuSingleRailExternalIoLayout(uint32_t gpuIndex,
+                                      const Ptr<MinHopBridgeNetDevice>& innerBridge,
+                                      const Ptr<MinHopBridgeNetDevice>& externalBridge,
+                                      const Ptr<NetDevice>& railDevice)
+{
+    GpuExternalIoLayout& ioLayout = EnsureGpuExternalIoLayout(gpuIndex);
+    ioLayout.innerBridgeIfIndex = innerBridge->GetIfIndex();
+    ioLayout.externalBridgeIfIndex = externalBridge->GetIfIndex();
+    ioLayout.externalRailIfIndices = {railDevice->GetIfIndex()};
+    ioLayout.innerBridge = innerBridge;
+    ioLayout.externalBridge = externalBridge;
+}
+
+static inline void
+FinalizeGpuEndpointMacFromInnerBridge(uint32_t gpuIndex)
+{
+    GpuExternalIoLayout& ioLayout = EnsureGpuExternalIoLayout(gpuIndex);
+    NS_ASSERT_MSG(ioLayout.innerBridge != nullptr,
+                  "Inner bridge missing when finalizing endpoint MAC for gpu="
+                      << gpuIndex);
+    ioLayout.endpointMac =
+        Mac48Address::ConvertFrom(ioLayout.innerBridge->GetAddress());
+}
+
+static inline void
+FinalizeAllGpuEndpointMacsFromInnerBridge(uint32_t gpuCount)
+{
+    for (uint32_t gpuIndex = 0; gpuIndex < gpuCount; ++gpuIndex)
+    {
+        FinalizeGpuEndpointMacFromInnerBridge(gpuIndex);
+    }
+}
 
 static inline void
 ApplyBridgePfcWatermarks(const Ptr<MinHopBridgeNetDevice>& dev)
@@ -116,6 +208,20 @@ CreateGpuSubnetBridge(Ptr<Node> gpu, uint32_t intraMaxJump)
     dev->set_ecmp_model(ecmpmodel);
     dev->Set_switchDelay(NanoSeconds(0));
     dev->SetMtu(m_mtu);
+    ApplyBridgePfcWatermarks(dev);
+    gpu->AddDevice(dev);
+    return dev;
+}
+
+static inline Ptr<MinHopBridgeNetDevice>
+CreateGpuExternalBridge(Ptr<Node> gpu)
+{
+    Ptr<MinHopBridgeNetDevice> dev = CreateObject<MinHopBridgeNetDevice>();
+    dev->set_maxjump(max_jump);
+    dev->set_ecmp_model(ecmpmodel);
+    dev->Set_switchDelay(NanoSeconds(0));
+    dev->SetMtu(m_mtu);
+    dev->SetAttribute("TerminalLearningOnly", BooleanValue(true));
     ApplyBridgePfcWatermarks(dev);
     gpu->AddDevice(dev);
     return dev;
@@ -137,6 +243,97 @@ NormalizeGpuMacsToBridge(Ptr<Node> gpu, const Ptr<MinHopBridgeNetDevice>& bridge
     const Mac48Address mac = GetBridgeMac(bridge);
     for (uint32_t di = 1; di < gpu->GetNDevices(); ++di) {
         gpu->GetDevice(di)->SetAddress(mac);
+    }
+}
+
+static inline int
+GetEffectiveFloodTime();
+
+static inline void
+InstallGpuWarmupClients(NodeContainer& nodes, uint32_t gpuCount)
+{
+    if (mactable_load_enable)
+    {
+        return;
+    }
+
+    uint16_t customEtherType = 0x88B5;
+    for (uint32_t i = 0; i < gpuCount; ++i)
+    {
+        Ptr<Node> clientNode = nodes.Get(i);
+        #ifdef NS3_MPI
+        if (clientNode->GetSystemId() != MpiInterface::GetSystemId())
+        {
+            continue;
+        }
+        #endif
+
+        const GpuExternalIoLayout& ioLayout = GetGpuExternalIoLayout(i);
+        std::vector<uint32_t> warmupIfIndices = ioLayout.externalRailIfIndices;
+        if (warmupIfIndices.empty())
+        {
+            warmupIfIndices.push_back(ioLayout.innerBridgeIfIndex);
+        }
+
+        for (uint32_t ifIndex : warmupIfIndices)
+        {
+            PacketSocketAddress clientSocketAddr;
+            clientSocketAddr.SetSingleDevice(ifIndex);
+            clientSocketAddr.SetPhysicalAddress(ioLayout.endpointMac);
+            clientSocketAddr.SetProtocol(customEtherType);
+
+            Ptr<HopCountClient> client = CreateObject<HopCountClient>();
+            client->SetRemote(clientSocketAddr);
+            client->SetAttribute("PacketSize", UintegerValue(100));
+            client->SetAttribute("Interval", TimeValue(Seconds(1.5)));
+            client->SetAttribute("MaxPackets", UintegerValue(1));
+            clientNode->AddApplication(client);
+
+            double startTime = 1.0 + (i * 0.2);
+            ApplicationContainer clientApps(client);
+            clientApps.Start(Seconds(startTime));
+            clientApps.Stop(Seconds(GetEffectiveFloodTime()-1));
+        }
+    }
+}
+
+static inline void
+InstallGpuSendFlowApps(NodeContainer& nodes, uint32_t gpuCount)
+{
+    for (uint32_t i = 0; i < gpuCount; ++i)
+    {
+        Ptr<Node> clientNode = nodes.Get(i);
+        const GpuExternalIoLayout& ioLayout = GetGpuExternalIoLayout(i);
+        uint16_t proto = g_roce_cfg.enable ? g_roce_cfg.etherType : 0x9999;
+        Ptr<sendflowclient> app = CreateObject<sendflowclient>();
+        app->SetRoceConfig(g_roce_cfg);
+        app->SetExternalRailCount(
+            std::max<uint32_t>(1, ioLayout.externalRailIfIndices.size()));
+        app->SetStartTime(Seconds(GetEffectiveFloodTime()-1));
+        app->SetStopTime(Seconds(2000000000));
+        clientNode->AddApplication(app);
+
+        if (HasDedicatedGpuExternalBridge(ioLayout))
+        {
+            app->initialization(proto,
+                                ioLayout.externalBridgeIfIndex,
+                                ioLayout.innerBridgeIfIndex,
+                                ioLayout.innerBridge);
+        }
+        else
+        {
+            app->initialization(proto,
+                                ioLayout.innerBridgeIfIndex,
+                                ioLayout.innerBridge);
+        }
+
+        PacketSocketAddress clientSocketAddr;
+        clientSocketAddr.SetPhysicalAddress(ioLayout.endpointMac);
+        clientSocketAddr.SetProtocol(proto);
+
+        nodeaddresstable[i] = clientSocketAddr;
+        nodeapptable[i] = app;
+        nodetable[i] = clientNode;
     }
 }
 static inline void
@@ -332,6 +529,8 @@ GetWorstCaseRocePathBudget()
     }
     case 4: // Test: small star-like fallback
         return {2, 1};
+    case 5: // HPN (2-tier, dual-plane): host-tor-agg-tor-host
+        return {4, 3};
     default:
         return {6, 5};
     }
@@ -455,6 +654,8 @@ TopologyModelName(uint32_t model)
         return "torus";
     case 4:
         return "test";
+    case 5:
+        return "hpn";
     default:
         return "unknown";
     }
@@ -481,6 +682,9 @@ BuildMacTableScenarioTag()
         break;
     case 4:
         oss << "_k-" << k_test;
+        break;
+    case 5:
+        oss << "_tor-per-plane-" << k_all << "_host-per-tor-" << hostperleaf;
         break;
     default:
         break;
@@ -733,6 +937,7 @@ CollectAllBridgeDevices()
     AppendBridgeVectorUnique(FullmeshDevices, devices);
     AppendBridgeVectorUnique(TestSwitchDevices, devices);
     AppendBridgeVectorUnique(SubNetDevices, devices);
+    AppendBridgeVectorUnique(ExternalBridgeDevices, devices);
     return devices;
 }
 
@@ -868,7 +1073,7 @@ bool ReadConf(std::string network_conf)
     if (JHas(top,"model")) {
       if (top["model"].is_number_integer()) {
         int v = top["model"].get<int>();
-        if (v>=0 && v<=4) return v;
+        if (v>=0 && v<=5) return v;
       } else if (top["model"].is_string()) {
         std::string s = top["model"].get<std::string>(); 
         for (auto& c:s) c=(char)std::tolower((unsigned char)c);
@@ -877,6 +1082,7 @@ bool ReadConf(std::string network_conf)
         if (s=="fullmesh") return 2;
         if (s=="torus")    return 3;
         if (s=="test")     return 4;
+        if (s=="hpn")      return 5;
       }
     }
     return 0; // 默认 FatTree
@@ -1286,6 +1492,23 @@ bool ReadConf(std::string network_conf)
       switch_delay = switch_delay_override ? switch_delay_override : 100; // ns
     } break;
 
+    case 5: { // HPN (2-tier dual-plane Clos-like backend)
+      const uint32_t torPerPlane = std::max<uint32_t>(1, k_all);
+      const uint32_t aggPerPlane = std::max<uint32_t>(1, k_all);
+      const uint32_t hostPerTor = std::max<uint32_t>(1, hostperleaf);
+
+      numLeaf = torPerPlane * 2;   // ToR switches across dual planes
+      numSpine = aggPerPlane * 2;  // Aggregation switches across dual planes
+      numHosts = torPerPlane * hostPerTor;
+
+      numGPUs = numHosts * static_cast<uint32_t>(gpus_per_server);
+      nvswitch_num = numHosts * static_cast<uint32_t>(nvswitch_per_server);
+      switch_num = numLeaf + numSpine;
+      node_num = numGPUs + switch_num + nvswitch_num;
+
+      switch_delay = switch_delay_override ? switch_delay_override : 100; // ns
+    } break;
+
     default: {
       std::cerr << "[Config] unknown Topology_model: " << Topology_model << "\n";
       // 回滚备份
@@ -1390,7 +1613,7 @@ void SetConfig(){
     g_pfcHighWatermark = pfc_high_watermark;
     g_pfcLowWatermark = pfc_low_watermark;
 
-    Topology_model=0;//0--FatTree;1--Clos;2--FullMesh;3--Torus;4--Test
+    Topology_model=0;//0--FatTree;1--Clos;2--FullMesh;3--Torus;4--Test;5--HPN
     subnet_model=0;//0--nosubnet;1--nvswitch;2--FullMesh;3--Torus;
     subnet_k=4;
     //-----------------subnet_set----------------
@@ -1489,11 +1712,29 @@ void SetConfig(){
 
         switch_delay=100;//单位纳秒
     }
+    //HPN(双平面两层)
+    if (Topology_model==5){
+        const uint32_t torPerPlane = std::max<uint32_t>(1, k_all);
+        const uint32_t aggPerPlane = std::max<uint32_t>(1, k_all);
+        const uint32_t hostPerTor = std::max<uint32_t>(1, hostperleaf);
+
+        numLeaf = torPerPlane * 2;
+        numSpine = aggPerPlane * 2;
+        numHosts = torPerPlane * hostPerTor;
+
+        numGPUs = numHosts * gpus_per_server;
+        nvswitch_num = numHosts * nvswitch_per_server;
+        switch_num = numLeaf + numSpine;
+        node_num = numGPUs + switch_num + nvswitch_num;
+
+        switch_delay=100;//单位纳秒
+    }
     RefreshRoceAckTimeoutFromNetworkConfig();
 }
 
 void SetupNetwork(){
     NS_LOG_INFO("common now");
+    ResetGpuExternalIoLayouts();
     
     // LogComponentEnable("MultithreadedSimulatorImpl", LOG_LEVEL_INFO);
     // LogComponentEnable("MtpInterface",LOG_LEVEL_INFO);
@@ -1657,15 +1898,23 @@ void SetupNetwork(){
                         
                         for (uint32_t g=0;g<gpus_per_server;g++){//首先连接外部
                             uint32_t gpuindex=hostIndex*gpus_per_server+g;
-                            //创建节点交换器
-                            Ptr<MinHopBridgeNetDevice> br = CreateGpuSubnetBridge(hosts.Get(gpuindex),1);
-                            SubNetDevices.push_back(br);
+                            Ptr<Node> gpuNode = hosts.Get(gpuindex);
+                            Ptr<MinHopBridgeNetDevice> innerBridge =
+                                CreateGpuSubnetBridge(gpuNode,1);
+                            SubNetDevices.push_back(innerBridge);
+                            Ptr<MinHopBridgeNetDevice> externalBridge =
+                                CreateGpuExternalBridge(gpuNode);
+                            ExternalBridgeDevices.push_back(externalBridge);
 
-                            NodeContainer link(edgeSwitches.Get(edgeIndex), hosts.Get(gpuindex));
+                            NodeContainer link(edgeSwitches.Get(edgeIndex), gpuNode);
                             NetDeviceContainer devs = p2pHelper.Install(link);
                             edgeDevices[edgeIndex]->AddBridgePort(devs.Get(0));
-                            hostDevices.push_back(devs.Get(1)); // 主机侧设备
-                            gpuaddress.push_back(devs.Get(1)->GetAddress());
+                            externalBridge->AddBridgePort(devs.Get(1));
+                            RegisterGpuSingleRailExternalIoLayout(
+                                gpuindex,
+                                innerBridge,
+                                externalBridge,
+                                devs.Get(1));
                         }
                         //然后创建子网拓扑
                         BuildServerSubnet_NvSwitch(hostIndex,hosts,nvswitch,nvlinkhelper);
@@ -1685,15 +1934,23 @@ void SetupNetwork(){
                         uint32_t subnet_offset=hostIndex*gpus_per_server;
                         for (uint32_t g=0;g<gpus_per_server;g++){//首先连接外部
                             uint32_t gpuindex=hostIndex*gpus_per_server+g;
-                            //创建节点交换器
-                            Ptr<MinHopBridgeNetDevice> br = CreateGpuSubnetBridge(hosts.Get(gpuindex),1);
-                            SubNetDevices.push_back(br);
+                            Ptr<Node> gpuNode = hosts.Get(gpuindex);
+                            Ptr<MinHopBridgeNetDevice> innerBridge =
+                                CreateGpuSubnetBridge(gpuNode,1);
+                            SubNetDevices.push_back(innerBridge);
+                            Ptr<MinHopBridgeNetDevice> externalBridge =
+                                CreateGpuExternalBridge(gpuNode);
+                            ExternalBridgeDevices.push_back(externalBridge);
 
-                            NodeContainer link(edgeSwitches.Get(edgeIndex), hosts.Get(gpuindex));
+                            NodeContainer link(edgeSwitches.Get(edgeIndex), gpuNode);
                             NetDeviceContainer devs = p2pHelper.Install(link);
                             edgeDevices[edgeIndex]->AddBridgePort(devs.Get(0));
-                            hostDevices.push_back(devs.Get(1)); // 主机侧设备
-                            gpuaddress.push_back(devs.Get(1)->GetAddress());
+                            externalBridge->AddBridgePort(devs.Get(1));
+                            RegisterGpuSingleRailExternalIoLayout(
+                                gpuindex,
+                                innerBridge,
+                                externalBridge,
+                                devs.Get(1));
                         }
                         //然后创建子网拓扑
                         BuildServerSubnet_FullMesh(hostIndex,hosts,nvlinkhelper);
@@ -1710,15 +1967,23 @@ void SetupNetwork(){
                         uint32_t hostIndex = p * (k_fattree * k_fattree / 4) + i * (k_fattree / 2) + j;
                         for (uint32_t g=0;g<gpus_per_server;g++){//首先连接外部
                             uint32_t gpuindex=hostIndex*gpus_per_server+g;
-                            //创建节点交换器
-                            Ptr<MinHopBridgeNetDevice> br = CreateGpuSubnetBridge(hosts.Get(gpuindex),1);
-                            SubNetDevices.push_back(br);
+                            Ptr<Node> gpuNode = hosts.Get(gpuindex);
+                            Ptr<MinHopBridgeNetDevice> innerBridge =
+                                CreateGpuSubnetBridge(gpuNode,1);
+                            SubNetDevices.push_back(innerBridge);
+                            Ptr<MinHopBridgeNetDevice> externalBridge =
+                                CreateGpuExternalBridge(gpuNode);
+                            ExternalBridgeDevices.push_back(externalBridge);
 
-                            NodeContainer link(edgeSwitches.Get(edgeIndex), hosts.Get(gpuindex));
+                            NodeContainer link(edgeSwitches.Get(edgeIndex), gpuNode);
                             NetDeviceContainer devs = p2pHelper.Install(link);
                             edgeDevices[edgeIndex]->AddBridgePort(devs.Get(0));
-                            hostDevices.push_back(devs.Get(1)); // 主机侧设备
-                            gpuaddress.push_back(devs.Get(1)->GetAddress());
+                            externalBridge->AddBridgePort(devs.Get(1));
+                            RegisterGpuSingleRailExternalIoLayout(
+                                gpuindex,
+                                innerBridge,
+                                externalBridge,
+                                devs.Get(1));
                         }
                         //然后创建子网拓扑
                         BuildServerSubnet_Torus(hostIndex,hosts,nvlinkhelper);
@@ -1727,68 +1992,13 @@ void SetupNetwork(){
            }        
         }
         
-        // 获取所有主机的 MAC 地址 ---
-        std::vector<Mac48Address> hostMacs;
-        for (uint32_t i = 0; i < hostDevices.size(); ++i) {
-            Mac48Address mac = Mac48Address::ConvertFrom(hostDevices[i]->GetAddress());
-            hostMacs.push_back(mac);
-        }
+        FinalizeAllGpuEndpointMacsFromInnerBridge(numGPUs);
         // 配置 PacketSocket 应用层 ---
         PacketSocketHelper packetSocketHelper;
         packetSocketHelper.Install(hosts); // 为所有主机安装 PacketSocket
 
-        if (!mactable_load_enable)
-        {
-            // 为每个主机安装发往其他主机的 HopCountClient
-            uint16_t customEtherType = 0x88B5;
-            for (uint32_t i = 0; i < numGPUs; ++i){
-                Ptr<Node> clientNode = hosts.Get(i);
-                #ifdef NS3_MPI
-                if(clientNode->GetSystemId() != MpiInterface::GetSystemId())
-                {
-                    continue;
-                }
-                #endif
-                for (uint32_t k=0;k<=1;k++){
-                    PacketSocketAddress clientSocketAddr;
-                    clientSocketAddr.SetSingleDevice(k);
-                    clientSocketAddr.SetPhysicalAddress(hostMacs[i]);
-                    clientSocketAddr.SetProtocol(customEtherType);
-
-                    Ptr<HopCountClient> client = CreateObject<HopCountClient>();
-                    client->SetRemote(clientSocketAddr);
-                    client->SetAttribute("PacketSize", UintegerValue(100));
-                    client->SetAttribute("Interval", TimeValue(Seconds(1.5)));
-                    client->SetAttribute("MaxPackets", UintegerValue(1));
-                    hosts.Get(i)->AddApplication(client);
-
-                    double startTime = 1.0 + (i * 0.2);
-                    ApplicationContainer clientApps(client);
-                    clientApps.Start(Seconds(startTime));
-                    clientApps.Stop(Seconds(GetEffectiveFloodTime()-1));
-                }
-            }
-        }
-        for (uint32_t i = 0; i < numGPUs; ++i) {
-            Ptr<Node> clientNode = hosts.Get(i);
-            uint16_t proto = g_roce_cfg.enable ? g_roce_cfg.etherType : 0x9999;
-            Ptr<sendflowclient> App = CreateObject<sendflowclient>();
-            App->SetRoceConfig(g_roce_cfg);
-            App->SetStartTime(Seconds(GetEffectiveFloodTime()-1));
-            App->SetStopTime(Seconds(2000000000));
-            hosts.Get(i)->AddApplication(App);
-
-            App->initialization(proto,1,0,SubNetDevices[i]);
-            
-            PacketSocketAddress clientSocketAddr;
-            //这个没问题，如果有子网也会统一到本地交换机的地址，也是0号地址
-            clientSocketAddr.SetPhysicalAddress(hosts.Get(i)->GetDevice(0)->GetAddress());
-            clientSocketAddr.SetProtocol(proto);
-
-            nodeaddresstable[i]=clientSocketAddr;
-            nodeapptable[i]=App;
-            nodetable[i] = clientNode;
-        }
+        InstallGpuWarmupClients(hosts, numGPUs);
+        InstallGpuSendFlowApps(hosts, numGPUs);
     }
     
     //Clos
@@ -1870,14 +2080,22 @@ void SetupNetwork(){
                     uint32_t hostIndex=leafindex*hostperleaf+j;
                     for (uint32_t g=0;g<gpus_per_server;g++){//首先连接外部
                         uint32_t gpuindex=hostIndex*gpus_per_server+g;
-                        //创建节点交换器
-                        Ptr<MinHopBridgeNetDevice> br = CreateGpuSubnetBridge(hosts.Get(gpuindex),1);
-                        SubNetDevices.push_back(br);
-                        NodeContainer link(LeafSwitchs.Get(leafindex), hosts.Get(gpuindex));
+                        Ptr<Node> gpuNode = hosts.Get(gpuindex);
+                        Ptr<MinHopBridgeNetDevice> innerBridge =
+                            CreateGpuSubnetBridge(gpuNode,1);
+                        SubNetDevices.push_back(innerBridge);
+                        Ptr<MinHopBridgeNetDevice> externalBridge =
+                            CreateGpuExternalBridge(gpuNode);
+                        ExternalBridgeDevices.push_back(externalBridge);
+                        NodeContainer link(LeafSwitchs.Get(leafindex), gpuNode);
                         NetDeviceContainer devs = p2pHelper.Install(link);
                         LeafDevices[leafindex]->AddBridgePort(devs.Get(0));
-                        hostDevices.push_back(devs.Get(1)); // 主机侧设备
-                        gpuaddress.push_back(devs.Get(1)->GetAddress());
+                        externalBridge->AddBridgePort(devs.Get(1));
+                        RegisterGpuSingleRailExternalIoLayout(
+                            gpuindex,
+                            innerBridge,
+                            externalBridge,
+                            devs.Get(1));
                     }
                     //然后创建子网拓扑
                     BuildServerSubnet_NvSwitch(hostIndex,hosts,nvswitch,nvlinkhelper);
@@ -1892,15 +2110,23 @@ void SetupNetwork(){
                     uint32_t hostIndex=leafindex*hostperleaf+j;
                     for (uint32_t g=0;g<gpus_per_server;g++){//首先连接外部
                         uint32_t gpuindex=hostIndex*gpus_per_server+g;
-                        //创建节点交换器
-                        Ptr<MinHopBridgeNetDevice> br = CreateGpuSubnetBridge(hosts.Get(gpuindex),1);
-                        SubNetDevices.push_back(br);
+                        Ptr<Node> gpuNode = hosts.Get(gpuindex);
+                        Ptr<MinHopBridgeNetDevice> innerBridge =
+                            CreateGpuSubnetBridge(gpuNode,1);
+                        SubNetDevices.push_back(innerBridge);
+                        Ptr<MinHopBridgeNetDevice> externalBridge =
+                            CreateGpuExternalBridge(gpuNode);
+                        ExternalBridgeDevices.push_back(externalBridge);
 
-                        NodeContainer link(LeafSwitchs.Get(leafindex), hosts.Get(gpuindex));
+                        NodeContainer link(LeafSwitchs.Get(leafindex), gpuNode);
                         NetDeviceContainer devs = p2pHelper.Install(link);
                         LeafDevices[leafindex]->AddBridgePort(devs.Get(0));
-                        hostDevices.push_back(devs.Get(1)); // 主机侧设备
-                        gpuaddress.push_back(devs.Get(1)->GetAddress());
+                        externalBridge->AddBridgePort(devs.Get(1));
+                        RegisterGpuSingleRailExternalIoLayout(
+                            gpuindex,
+                            innerBridge,
+                            externalBridge,
+                            devs.Get(1));
                     }
                     //然后创建子网拓扑
                     BuildServerSubnet_FullMesh(hostIndex,hosts,nvlinkhelper);
@@ -1915,15 +2141,23 @@ void SetupNetwork(){
                     uint32_t hostIndex=leafindex*hostperleaf+j;
                     for (uint32_t g=0;g<gpus_per_server;g++){//首先连接外部
                         uint32_t gpuindex=hostIndex*gpus_per_server+g;
-                        //创建节点交换器
-                        Ptr<MinHopBridgeNetDevice> br = CreateGpuSubnetBridge(hosts.Get(gpuindex),subnet_k);
-                        SubNetDevices.push_back(br);
+                        Ptr<Node> gpuNode = hosts.Get(gpuindex);
+                        Ptr<MinHopBridgeNetDevice> innerBridge =
+                            CreateGpuSubnetBridge(gpuNode,subnet_k);
+                        SubNetDevices.push_back(innerBridge);
+                        Ptr<MinHopBridgeNetDevice> externalBridge =
+                            CreateGpuExternalBridge(gpuNode);
+                        ExternalBridgeDevices.push_back(externalBridge);
 
-                        NodeContainer link(LeafSwitchs.Get(leafindex), hosts.Get(gpuindex));
+                        NodeContainer link(LeafSwitchs.Get(leafindex), gpuNode);
                         NetDeviceContainer devs = p2pHelper.Install(link);
                         LeafDevices[leafindex]->AddBridgePort(devs.Get(0));
-                        hostDevices.push_back(devs.Get(1)); // 主机侧设备
-                        gpuaddress.push_back(devs.Get(1)->GetAddress());
+                        externalBridge->AddBridgePort(devs.Get(1));
+                        RegisterGpuSingleRailExternalIoLayout(
+                            gpuindex,
+                            innerBridge,
+                            externalBridge,
+                            devs.Get(1));
                     }
                     //然后创建子网拓扑
                     BuildServerSubnet_Torus(hostIndex,hosts,nvlinkhelper);
@@ -1931,70 +2165,216 @@ void SetupNetwork(){
             }    
         }
         
-         // 获取所有主机的 MAC 地址 ---
-        std::vector<Mac48Address> hostMacs;
-        for (uint32_t i = 0; i < hostDevices.size(); ++i) {
-            Mac48Address mac = Mac48Address::ConvertFrom(hostDevices[i]->GetAddress());
-            hostMacs.push_back(mac);
-        }
+        FinalizeAllGpuEndpointMacsFromInnerBridge(numGPUs);
         // --- 8. 配置 PacketSocket 应用层 ---
         PacketSocketHelper packetSocketHelper;
         packetSocketHelper.Install(hosts); // 为所有主机安装 PacketSocket
 
+        InstallGpuWarmupClients(hosts, numGPUs);
+        InstallGpuSendFlowApps(hosts, numGPUs);
+    }
 
-        if (!mactable_load_enable)
-        {
-            // 为每个主机安装发往其他主机的 HopCountClient
-            uint16_t customEtherType = 0x88B5;
-            for (uint32_t i = 0; i < numGPUs; ++i){
-                Ptr<Node> clientNode = hosts.Get(i);
-                #ifdef NS3_MPI
-                if(clientNode->GetSystemId() != MpiInterface::GetSystemId())
-                {
-                    continue;
-                }
-                #endif
-                for (uint32_t k=0;k<=1;k++){
-                    PacketSocketAddress clientSocketAddr;
-                    clientSocketAddr.SetSingleDevice(k);
-                    clientSocketAddr.SetPhysicalAddress(hostMacs[i]);
-                    clientSocketAddr.SetProtocol(customEtherType);
+    // HPN (2-tier dual-plane + non-stacked dual-ToR)
+    if (Topology_model==5){
+        NS_LOG_INFO("[HPN][BUILD] begin"
+                    << " torPerPlane=" << k_all
+                    << " aggPerPlane=" << k_all
+                    << " hostPerTor=" << hostperleaf
+                    << " gpusPerServer=" << gpus_per_server
+                    << " totalHosts=" << numHosts
+                    << " totalGpus=" << numGPUs
+                    << " switchDelayNs=" << switch_delay
+                    << " linkRate=" << normallink_rate
+                    << " linkDelay=" << normallink_delay);
+        NodeContainer AggSwitchs;
+        AggSwitchs.Create(numSpine);
+        NodeContainer TorSwitchs;
+        TorSwitchs.Create(numLeaf);
+        NodeContainer hosts;
+        hosts.Create(numGPUs);
+        NodeContainer nvswitch;
+        nvswitch.Create(nvswitch_num);
 
-                    Ptr<HopCountClient> client = CreateObject<HopCountClient>();
-                    client->SetRemote(clientSocketAddr);
-                    client->SetAttribute("PacketSize", UintegerValue(100));
-                    client->SetAttribute("Interval", TimeValue(Seconds(1.5)));
-                    client->SetAttribute("MaxPackets", UintegerValue(1));
-                    hosts.Get(i)->AddApplication(client);
+        for (uint32_t i = 0; i < numSpine; ++i) {
+            Ptr<MinHopBridgeNetDevice> dev = CreateObject<MinHopBridgeNetDevice>();
+            dev->set_maxjump(max_jump);
+            dev->set_ecmp_model(ecmpmodel);
+            dev->Set_switchDelay(NanoSeconds(switch_delay));
+            dev->SetMtu(m_mtu);
+            ApplyBridgePfcWatermarks(dev);
+            AggSwitchs.Get(i)->AddDevice(dev);
+            SpineDevices.push_back(dev);
+        }
+        for (uint32_t i = 0; i < numLeaf; ++i) {
+            Ptr<MinHopBridgeNetDevice> dev = CreateObject<MinHopBridgeNetDevice>();
+            dev->set_maxjump(max_jump);
+            dev->set_ecmp_model(ecmpmodel);
+            dev->Set_switchDelay(NanoSeconds(switch_delay));
+            dev->SetMtu(m_mtu);
+            ApplyBridgePfcWatermarks(dev);
+            TorSwitchs.Get(i)->AddDevice(dev);
+            LeafDevices.push_back(dev);
+        }
+        for (uint32_t i = 0; i < nvswitch.GetN(); ++i) {
+            Ptr<MinHopBridgeNetDevice> nvs = CreateObject<MinHopBridgeNetDevice>();
+            nvs->set_ecmp_model(ecmpmodel);
+            nvs->Set_switchDelay(Seconds(0));
+            nvs->SetMtu(m_mtu);
+            ApplyBridgePfcWatermarks(nvs);
+            nvswitch.Get(i)->AddDevice(nvs);
+            nvswitchDevices.push_back(nvs);
+        }
 
-                    double startTime = 1.0 + (i * 0.2);
-                    ApplicationContainer clientApps(client);
-                    clientApps.Start(Seconds(startTime));
-                    clientApps.Stop(Seconds(GetEffectiveFloodTime()-1));
+        PointToPointHelper p2pHelper;
+        p2pHelper.SetDeviceAttribute("DataRate", StringValue(normallink_rate));
+        p2pHelper.SetChannelAttribute("Delay", StringValue(normallink_delay));
+        p2pHelper.SetQueue("ns3::PppRoundRobinQueue",
+                           "MaxPacketsPerQueue", StringValue(DropTailQueue_size),
+                           "NumQueues", StringValue(DropTailQueue_num));
+        p2pHelper.SetDeviceAttribute("Mtu", UintegerValue(m_mtu));
+
+        PointToPointHelper nvlinkhelper;
+        nvlinkhelper.SetDeviceAttribute("DataRate", StringValue(nvlink_rate));
+        nvlinkhelper.SetChannelAttribute("Delay", StringValue(nvlink_delay));
+        nvlinkhelper.SetQueue("ns3::PppRoundRobinQueue",
+                              "MaxPacketsPerQueue", StringValue(DropTailQueue_size),
+                              "NumQueues", StringValue(DropTailQueue_num));
+        nvlinkhelper.SetDeviceAttribute("Mtu", UintegerValue(m_mtu));
+
+        const uint32_t planeCount = 2;
+        NS_ASSERT_MSG(numLeaf % planeCount == 0 && numSpine % planeCount == 0,
+                      "HPN requires an even number of ToR/Agg switches across dual planes");
+        const uint32_t torPerPlane = numLeaf / planeCount;
+        const uint32_t aggPerPlane = numSpine / planeCount;
+        const uint64_t torDownlinksPerTor =
+            static_cast<uint64_t>(hostperleaf) * static_cast<uint64_t>(gpus_per_server);
+        const uint64_t torUplinksPerTor = aggPerPlane;
+        const bool torLinkBalanced = (torDownlinksPerTor == torUplinksPerTor);
+        NS_LOG_INFO("[HPN][TO_R_BALANCE]"
+                    << " downlinksPerTor=" << torDownlinksPerTor
+                    << " uplinksPerTor=" << torUplinksPerTor
+                    << " balanced=" << (torLinkBalanced ? "true" : "false"));
+        auto AddressToMacString = [](const Address& address) -> std::string {
+            if (!Mac48Address::IsMatchingType(address))
+            {
+                return "NA";
+            }
+            std::ostringstream oss;
+            oss << Mac48Address::ConvertFrom(address);
+            return oss.str();
+        };
+
+        // Build dual independent planes: ToR<->Aggregation links only within the same plane.
+        for (uint32_t plane = 0; plane < planeCount; ++plane) {
+            const uint32_t torBase = plane * torPerPlane;
+            const uint32_t aggBase = plane * aggPerPlane;
+            for (uint32_t ti = 0; ti < torPerPlane; ++ti) {
+                const uint32_t torIndex = torBase + ti;
+                for (uint32_t ai = 0; ai < aggPerPlane; ++ai) {
+                    const uint32_t aggIndex = aggBase + ai;
+                    NodeContainer link(TorSwitchs.Get(torIndex), AggSwitchs.Get(aggIndex));
+                    NetDeviceContainer devs = p2pHelper.Install(link);
+                    LeafDevices[torIndex]->AddBridgePort(devs.Get(0));
+                    SpineDevices[aggIndex]->AddBridgePort(devs.Get(1));
                 }
             }
         }
 
-        for (uint32_t i = 0; i < numGPUs; ++i) {
-            Ptr<Node> clientNode = hosts.Get(i);
-            uint16_t proto = g_roce_cfg.enable ? g_roce_cfg.etherType : 0x9999;
-            Ptr<sendflowclient> App = CreateObject<sendflowclient>();
-            App->SetRoceConfig(g_roce_cfg);
-            App->SetStartTime(Seconds(GetEffectiveFloodTime()-1));
-            App->SetStopTime(Seconds(2000000000));
-            hosts.Get(i)->AddApplication(App);
+        // Per GPU node:
+        //   device0 = internal bridge (subnet)
+        //   device1 = external bridge (HPN backend egress manager)
+        // No internal/external bridge direct link by design.
+        for (uint32_t serverId = 0; serverId < numHosts; ++serverId) {
+            const uint32_t torPlane0 = serverId % torPerPlane;
+            const uint32_t torPlane1 = torPerPlane + (serverId % torPerPlane);
 
-            App->initialization(proto,1,0,SubNetDevices[i]);
-            
-            PacketSocketAddress clientSocketAddr;
-            //这个没问题，如果有子网也会统一到本地交换机的地址，也是0号地址
-            clientSocketAddr.SetPhysicalAddress(hosts.Get(i)->GetDevice(0)->GetAddress());
-            clientSocketAddr.SetProtocol(proto);
+            for (uint32_t g = 0; g < gpus_per_server; ++g) {
+                const uint32_t gpuindex = serverId * gpus_per_server + g;
+                Ptr<Node> gpuNode = hosts.Get(gpuindex);
 
-            nodeaddresstable[i]=clientSocketAddr;
-            nodeapptable[i]=App;
-            nodetable[i] = clientNode;
+                Ptr<MinHopBridgeNetDevice> innerBridge = CreateGpuSubnetBridge(gpuNode, 1);
+                SubNetDevices.push_back(innerBridge);
+
+                Ptr<MinHopBridgeNetDevice> externalBridge = CreateGpuExternalBridge(gpuNode);
+                ExternalBridgeDevices.push_back(externalBridge);
+
+                NodeContainer uplink0(TorSwitchs.Get(torPlane0), gpuNode);
+                NetDeviceContainer devs0 = p2pHelper.Install(uplink0);
+                LeafDevices[torPlane0]->AddBridgePort(devs0.Get(0));
+                externalBridge->AddBridgePort(devs0.Get(1));
+
+                NodeContainer uplink1(TorSwitchs.Get(torPlane1), gpuNode);
+                NetDeviceContainer devs1 = p2pHelper.Install(uplink1);
+                LeafDevices[torPlane1]->AddBridgePort(devs1.Get(0));
+                externalBridge->AddBridgePort(devs1.Get(1));
+
+                GpuExternalIoLayout& ioLayout = EnsureGpuExternalIoLayout(gpuindex);
+                ioLayout.innerBridgeIfIndex = innerBridge->GetIfIndex();
+                ioLayout.externalBridgeIfIndex = externalBridge->GetIfIndex();
+                ioLayout.externalRailIfIndices = {
+                    devs0.Get(1)->GetIfIndex(),
+                    devs1.Get(1)->GetIfIndex()};
+                ioLayout.innerBridge = innerBridge;
+                ioLayout.externalBridge = externalBridge;
+
+                static uint64_t sHpnGpuWireLogCount = 0;
+                if (sHpnGpuWireLogCount < 128 || (sHpnGpuWireLogCount % 2048) == 0)
+                {
+                    NS_LOG_INFO("[HPN][GPU_WIRE]"
+                                << " gpu=" << gpuindex
+                                << " server=" << serverId
+                                << " innerIf=" << innerBridge->GetIfIndex()
+                                << " innerMac=" << AddressToMacString(innerBridge->GetAddress())
+                                << " outerIf=" << externalBridge->GetIfIndex()
+                                << " outerMac=" << AddressToMacString(externalBridge->GetAddress())
+                                << " tor0=" << torPlane0
+                                << " tor1=" << torPlane1
+                                << " uplink0If=" << devs0.Get(1)->GetIfIndex()
+                                << " uplink0Mac=" << AddressToMacString(devs0.Get(1)->GetAddress())
+                                << " uplink1If=" << devs1.Get(1)->GetIfIndex()
+                                << " uplink1Mac=" << AddressToMacString(devs1.Get(1)->GetAddress()));
+                }
+                ++sHpnGpuWireLogCount;
+            }
+
+            if (subnet_model==0 || subnet_model==1){
+                BuildServerSubnet_NvSwitch(serverId,hosts,nvswitch,nvlinkhelper);
+            }
+            if (subnet_model==2){
+                BuildServerSubnet_FullMesh(serverId,hosts,nvlinkhelper);
+            }
+            if (subnet_model==3){
+                BuildServerSubnet_Torus(serverId,hosts,nvlinkhelper);
+            }
         }
+
+        for (uint32_t gpuindex = 0; gpuindex < numGPUs; ++gpuindex)
+        {
+            FinalizeGpuEndpointMacFromInnerBridge(gpuindex);
+            GpuExternalIoLayout& ioLayout = EnsureGpuExternalIoLayout(gpuindex);
+            static uint64_t sHpnGpuReadyLogCount = 0;
+            if (sHpnGpuReadyLogCount < 128 || (sHpnGpuReadyLogCount % 2048) == 0)
+            {
+                NS_LOG_INFO("[HPN][GPU_READY]"
+                            << " gpu=" << gpuindex
+                            << " innerIf=" << SubNetDevices[gpuindex]->GetIfIndex()
+                            << " innerMac=" << AddressToMacString(SubNetDevices[gpuindex]->GetAddress())
+                            << " outerIf=" << ExternalBridgeDevices[gpuindex]->GetIfIndex()
+                            << " outerMac=" << AddressToMacString(ExternalBridgeDevices[gpuindex]->GetAddress())
+                            << " nodeDeviceCount=" << hosts.Get(gpuindex)->GetNDevices());
+            }
+            ++sHpnGpuReadyLogCount;
+        }
+        NS_LOG_INFO("[HPN][BUILD] end"
+                    << " totalInnerBridge=" << SubNetDevices.size()
+                    << " totalOuterBridge=" << ExternalBridgeDevices.size()
+                    << " totalTor=" << LeafDevices.size()
+                    << " totalAgg=" << SpineDevices.size());
+
+        PacketSocketHelper packetSocketHelper;
+        packetSocketHelper.Install(hosts);
+        InstallGpuWarmupClients(hosts, numGPUs);
+        InstallGpuSendFlowApps(hosts, numGPUs);
     }
     
     //fullmesh和torus改了没测试过
@@ -2046,66 +2426,16 @@ void SetupNetwork(){
         for (uint32_t g=0;g<numGPUs;g++){
             uint32_t gpuindex=g;
             NormalizeGpuMacsToBridge(hosts.Get(gpuindex),FullmeshDevices[gpuindex]);
+            RegisterGpuBridgeOnlyIoLayout(gpuindex, FullmeshDevices[gpuindex]);
         }
-        // 获取所有主机的 MAC 地址 ---
-        std::vector<Mac48Address> hostMacs;
-        for (uint32_t i=0;i<numGPUs;i++){
-            Mac48Address mac = Mac48Address::ConvertFrom(FullmeshDevices[i]->GetAddress());
-            hostMacs.push_back(mac);
-        }
+        FinalizeAllGpuEndpointMacsFromInnerBridge(numGPUs);
 
         // 配置 PacketSocket 应用层 ---
         PacketSocketHelper packetSocketHelper;
         packetSocketHelper.Install(hosts); // 为所有主机安装 PacketSocket
 
-
-        if (!mactable_load_enable)
-        {
-            // 为每个主机安装发往其他主机的 HopCountClient
-            uint16_t customEtherType = 0x88B5;
-            for (uint32_t i = 0; i < numGPUs; ++i){
-                #ifdef NS3_MPI
-                if(hosts.Get(i)->GetSystemId() != MpiInterface::GetSystemId())
-                {
-                    continue;
-                }
-                #endif
-                PacketSocketAddress clientSocketAddr;
-                clientSocketAddr.SetSingleDevice(0);
-                clientSocketAddr.SetPhysicalAddress(hostMacs[i]);
-                clientSocketAddr.SetProtocol(customEtherType);
-                Ptr<HopCountClient> client = CreateObject<HopCountClient>();
-                client->SetRemote(clientSocketAddr);
-                client->SetAttribute("PacketSize", UintegerValue(100));
-                client->SetAttribute("Interval", TimeValue(Seconds(1.5)));
-                client->SetAttribute("MaxPackets", UintegerValue(1));
-                hosts.Get(i)->AddApplication(client);
-
-                double startTime = 1.0 + (i * 0.2);
-                ApplicationContainer clientApps(client);
-                clientApps.Start(Seconds(startTime));
-                clientApps.Stop(Seconds(GetEffectiveFloodTime()-1));
-            }
-        }
-        for (uint32_t i = 0; i < numGPUs; ++i) {
-            Ptr<Node> clientNode = hosts.Get(i);
-            uint16_t proto = g_roce_cfg.enable ? g_roce_cfg.etherType : 0x9999;
-            Ptr<sendflowclient> App = CreateObject<sendflowclient>();
-            App->SetRoceConfig(g_roce_cfg);
-            App->SetStartTime(Seconds(GetEffectiveFloodTime()-1));
-            App->SetStopTime(Seconds(2000000000));
-            hosts.Get(i)->AddApplication(App);
-
-            App->initialization(proto,0,SubNetDevices[i]);
-
-            PacketSocketAddress clientSocketAddr;
-            clientSocketAddr.SetPhysicalAddress(hosts.Get(i)->GetDevice(0)->GetAddress());
-            clientSocketAddr.SetProtocol(proto);
-
-            nodeaddresstable[i]=clientSocketAddr;
-            nodeapptable[i]=App;
-            nodetable[i] = clientNode;
-        }
+        InstallGpuWarmupClients(hosts, numGPUs);
+        InstallGpuSendFlowApps(hosts, numGPUs);
     }
     
     //torus
@@ -2155,54 +2485,33 @@ void SetupNetwork(){
         for (uint32_t g=0;g<numGPUs;g++){
             uint32_t gpuindex=g;
             NormalizeGpuMacsToBridge(TorusSwitch.Get(gpuindex),TorusDevices[gpuindex]);
+            RegisterGpuBridgeOnlyIoLayout(gpuindex, TorusDevices[gpuindex]);
         }
-        // 获取所有主机的 MAC 地址 ---
-        std::vector<Mac48Address> hostMacs;
-        for (uint32_t i=0;i<numGPUs;i++){
-            Mac48Address mac = Mac48Address::ConvertFrom(TorusDevices[i]->GetAddress());
-            hostMacs.push_back(mac);
-        }
+        FinalizeAllGpuEndpointMacsFromInnerBridge(numGPUs);
         
         // 配置 PacketSocket 应用层 ---
         PacketSocketHelper packetSocketHelper;
         packetSocketHelper.Install(TorusSwitch); // 为所有主机安装 PacketSocket
 
-
-        if (!mactable_load_enable)
-        {
-            // 为每个主机安装发往其他主机的 HopCountClient
-            uint16_t customEtherType = 0x88B5;
-            for (uint32_t i = 0; i < numGPUs; ++i){
-                PacketSocketAddress clientSocketAddr;
-                clientSocketAddr.SetSingleDevice(0);
-                clientSocketAddr.SetPhysicalAddress(hostMacs[i]);
-                clientSocketAddr.SetProtocol(customEtherType);
-                Ptr<HopCountClient> client = CreateObject<HopCountClient>();
-                client->SetRemote(clientSocketAddr);
-                client->SetAttribute("PacketSize", UintegerValue(100));
-                client->SetAttribute("Interval", TimeValue(Seconds(1.5)));
-                client->SetAttribute("MaxPackets", UintegerValue(1));
-                TorusSwitch.Get(i)->AddApplication(client);
-
-                double startTime = 1.0 + (i * 0.2);
-                ApplicationContainer clientApps(client);
-                clientApps.Start(Seconds(startTime));
-                clientApps.Stop(Seconds(GetEffectiveFloodTime()-1));
-            }
-        }
+        InstallGpuWarmupClients(TorusSwitch, numGPUs);
         for (uint32_t i = 0; i < numGPUs; ++i) {
             Ptr<Node> clientNode = TorusSwitch.Get(i);
+            const GpuExternalIoLayout& ioLayout = GetGpuExternalIoLayout(i);
             uint16_t proto = g_roce_cfg.enable ? g_roce_cfg.etherType : 0x9999;
             Ptr<sendflowclient> App = CreateObject<sendflowclient>();
             App->SetRoceConfig(g_roce_cfg);
+            App->SetExternalRailCount(
+                std::max<uint32_t>(1, ioLayout.externalRailIfIndices.size()));
             App->SetStartTime(Seconds(GetEffectiveFloodTime()-1));
             App->SetStopTime(Seconds(2000000000));
             TorusSwitch.Get(i)->AddApplication(App);
 
-            App->initialization(proto,0,SubNetDevices[i]);
+            App->initialization(proto,
+                                ioLayout.innerBridgeIfIndex,
+                                ioLayout.innerBridge);
             
             PacketSocketAddress clientSocketAddr;
-            clientSocketAddr.SetPhysicalAddress(TorusSwitch.Get(i)->GetDevice(0)->GetAddress());
+            clientSocketAddr.SetPhysicalAddress(ioLayout.endpointMac);
             clientSocketAddr.SetProtocol(proto);
 
             // nodeaddresstable[i]=clientSocketAddr;
@@ -2243,7 +2552,7 @@ void SetupNetwork(){
 
 void printlearnstate(){
     NS_LOG_INFO("--------- 打印所有 主机 的地址 ---------");
-    if (Topology_model==0 or Topology_model==1){
+    if (Topology_model==0 or Topology_model==1 or Topology_model==5){
         for (auto dev : SubNetDevices) dev->Print_LocalMacAddress();
     }
 
@@ -2258,6 +2567,11 @@ void printlearnstate(){
     if (Topology_model==1){//Clos
         for (auto dev : SpineDevices) dev->PrintLearnedState();
         for (auto dev : LeafDevices) dev->PrintLearnedState();
+    }
+    if (Topology_model==5){//HPN
+        for (auto dev : SpineDevices) dev->PrintLearnedState();
+        for (auto dev : LeafDevices) dev->PrintLearnedState();
+        for (auto dev : ExternalBridgeDevices) dev->PrintLearnedState();
     }
     if (Topology_model==2){//FullMesh
         for (auto dev : FullmeshDevices) dev->PrintLearnedState();

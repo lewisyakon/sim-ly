@@ -1,5 +1,7 @@
 # RoCE 类结构与调用关系说明
 
+最近修改：2026-04-23
+
 这份文档回答 5 个问题：
 
 1. 现在有哪些 RoCE 相关类。
@@ -42,11 +44,15 @@
 Astra-Sim
   -> my_entry / my_AstraSimNetwork
   -> sendflowclient
+       -> FlowIo
+            -> bind innerBridge socket
+            -> optionally bind externalBridge socket
        -> RoceTransportEngine
             -> RoceThreePhaseFsm
-       -> FlowIo
-            -> external p2p device
-            -> or MinHopBridgeNetDevice
+       -> innerBridge (m_bridgeDevice)
+            -> ResolveLocalInjectionEgressPort(...)
+       -> or externalBridge (when m_outDeviceIndex is a bridge)
+            -> ResolveLocalInjectionEgressPort(...)
                  -> selected outPort (PointToPointNetDevice)
                       -> RdmaPortEngine
                            -> RoceTxScheduler
@@ -379,30 +385,33 @@ packetization 发生在它之后，而不是在它之前。
 
 ### 3.13 `FlowIo`
 
-`FlowIo` 现在主要仍是 socket/device 桥。
+`FlowIo` 现在主要是 socket/device 桥，加上一层本地软件 pause/buffer 适配。
 
 RoCE 打开时，它的作用是：
 
-1. `External` 路径下仍提供上层 I/O 入口
+1. `BridgeAndExternal` 模式下，同时绑定 `innerBridge` 和 `externalBridge`
 2. 非 RoCE legacy 路径保持原样
+3. 本地注入路径上保留 software buffer / retry
+4. 如果目标设备本身就是带 `RdmaPortEngine` 的物理口，先尝试直接提交到 port engine
 
-RoCE 主路径现在已经不再依赖 `FlowIo` 去实现 transport runtime。
+RoCE 主路径现在已经不再依赖 `FlowIo` 去实现 transport runtime；它只是 I/O 入口和 fallback/local-pause 适配层。
 
 ### 3.14 `MinHopBridgeNetDevice`
 
 bridge 仍然负责：
 
 1. 学表
-2. 转发
+2. 在真正 forwarding bridge 上做转发
 3. ECMP / flood
 4. 选择真实 `outPort`
+5. 在外侧终端 bridge 上执行“学习后丢弃 transit 包”
 
 它和 RoCE 的耦合现在主要只有两点：
 
 1. 发送时提供 egress 解析
 2. 接收时写入 `RdmaIngressPortTag`
 
-bridge 不维护 QP，不维护 ACK，不维护重传。
+bridge 不维护 QP，不维护 ACK，不维护重传。`TerminalLearningOnly` 也只应该给外侧 bridge 用，而不是给所有 bridge 统一开启。
 
 ## 4. 当前类之间怎样耦合
 
@@ -432,6 +441,12 @@ sendflowclient
 3. `RdmaPortEngine` 把它写进 `QpRuntime::sqEntries`
 4. `RoceTxScheduler` 再切成 `RoceTxSlice`
 5. `BuildPacketForSlice_()` 才真正生成 packet 和 `RoceSimHeader`
+
+当前还有一个端点布局相关的关键点：
+
+1. `Internal / 普通 Loopback` 通过 `m_bridgeDevice`，也就是 `innerBridge`，解析 `outPort`
+2. `External` 优先把 `m_outDeviceIndex` 当成物理口
+3. 如果 `m_outDeviceIndex` 实际上是 `externalBridge`，再由 `externalBridge` 解析真实 `outPort`
 
 ### 4.2 接收方向
 
@@ -526,8 +541,8 @@ completion 现在也是 port 侧：
 1. `CQ` 还不是独立对象类，而是 `QpRuntime` 内部 completion 队列
 2. completion 目前还没有成为上层主驱动语义，`TX_DONE` 仍然由 3P 的 `ACT` 完成闭环
 3. `RQ` 是最小 receive slot 模型，还没有做 `SRQ`
-4. 当前只针对“出端口唯一”的场景实现主路径
-5. 多出端口/多 rail 的绑定策略还没有落代码
+4. 当前每个具体 work 仍只会落到一个物理 egress port，不做单 work 多口并发
+5. 拓扑侧已经落了 `innerBridge/externalBridge` 布局和 external rail 清单，但 transport side 的多 rail striping / per-logical-QP 多端口绑定还没有展开
 
 ## 8. 最值得你 review 的地方
 
@@ -540,4 +555,3 @@ completion 现在也是 port 侧：
 5. `RdmaDispatchTag` 是否只剩 metadata 作用，而不是状态源头
 
 如果这几条你看下来都成立，那么这轮解耦就算真正站住了。
-

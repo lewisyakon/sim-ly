@@ -1,5 +1,7 @@
 # RoCE 后续调度方案备忘
 
+最近修改：2026-04-23
+
 记录时间：2026-04-10
 
 这份文档只记录“如果以后继续提高调度真实性，可以考虑什么”。它不再描述早期 stage 1 调度状态。
@@ -12,7 +14,7 @@
 
 如果需要了解旧阶段背景，再看：
 
-- [roce-scheduler-stage1.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-scheduler-stage1.md)
+- [archive/roce-scheduler-stage1.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/archive/roce-scheduler-stage1.md)
 
 ## 1. 当前调度状态
 

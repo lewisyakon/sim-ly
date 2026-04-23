@@ -883,6 +883,28 @@ sendflowclient::IsRoceEnabled() const {
 }
 
 void
+sendflowclient::SetExternalRailCount(uint32_t railCount) {
+  m_externalRailCount = std::max<uint32_t>(1, railCount);
+}
+
+uint32_t
+sendflowclient::GetExternalRailCount() const {
+  return m_externalRailCount;
+}
+
+std::vector<sendflowclient::ExternalSubflowPlanItem>
+sendflowclient::BuildExternalSubflowPlan(uint64_t totalBytes,
+                                         uint32_t tag,
+                                         uint32_t src,
+                                         uint32_t dst) const {
+  (void)tag;
+  (void)src;
+  (void)dst;
+  // Reserved for future multi-rail striping; keep single-flow behavior for now.
+  return {{0, totalBytes}};
+}
+
+void
 sendflowclient::InitializeRdmaPortEngines_() {
   Ptr<Node> node = GetNode();
   if (node == nullptr) {
@@ -1003,11 +1025,41 @@ sendflowclient::ResolveRoceTxPortEngine_(const Address& dest,
                                          uint64_t uidHint) const {
   const Address wireDest = ExtractRoceWireDestination_(dest);
 
+  auto resolveExternalPortEngine = [&]() -> Ptr<RdmaPortEngine> {
+    Ptr<RdmaPortEngine> direct = GetRdmaPortEngineByDeviceIndex_(m_outDeviceIndex);
+    if (direct != nullptr) {
+      return direct;
+    }
+
+    Ptr<Node> node = GetNode();
+    if (node == nullptr || m_outDeviceIndex >= node->GetNDevices()) {
+      return nullptr;
+    }
+
+    Ptr<MinHopBridgeNetDevice> externalBridge =
+        DynamicCast<MinHopBridgeNetDevice>(node->GetDevice(m_outDeviceIndex));
+    if (externalBridge == nullptr) {
+      return nullptr;
+    }
+
+    Ptr<NetDevice> outPort = externalBridge->ResolveLocalInjectionEgressPort(
+        externalBridge->GetAddress(), wireDest, uidHint);
+    if (outPort == nullptr) {
+      return nullptr;
+    }
+
+    Ptr<PointToPointNetDevice> p2p = DynamicCast<PointToPointNetDevice>(outPort);
+    if (p2p == nullptr) {
+      return nullptr;
+    }
+    return p2p->GetObject<RdmaPortEngine>();
+  };
+
   if (sendmodel == FlowSendMode::External) {
-    return GetRdmaPortEngineByDeviceIndex_(m_outDeviceIndex);
+    return resolveExternalPortEngine();
   }
   if (sendmodel == FlowSendMode::Loopback && static_cast<uint32_t>(mindex) == m_outDeviceIndex) {
-    return GetRdmaPortEngineByDeviceIndex_(m_outDeviceIndex);
+    return resolveExternalPortEngine();
   }
 
   Ptr<MinHopBridgeNetDevice> bridge = DynamicCast<MinHopBridgeNetDevice>(m_bridgeDevice);

@@ -1,5 +1,7 @@
 # RoCE 配置与日志说明
 
+最近修改：2026-04-23
+
 ## 1. JSON 中 `roce` 配置项说明
 
 配置路径：`simconfig/config.json` 的 `"roce"` 对象。
@@ -11,6 +13,8 @@
   - [roce-current-status.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-current-status.md)
   - [roce-workflow.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-workflow.md)
   - [roce-transport-reliability.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-transport-reliability.md)
+- 如果你想看当前 GPU 端点的 inner/external bridge、`TerminalLearningOnly`、FlowIo/PFC 边界，请看：
+  - [topology-endpoint-bridge-model.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/topology-endpoint-bridge-model.md)
 
 - `enable`（bool）
   - 含义：是否启用 RoCE 旁路逻辑。
@@ -250,6 +254,45 @@ all passes finished at time: ...
 含义：
 
 - 某个重传包真正发出。
+
+### 3.2A bridge / 端点相关日志
+
+下面这些日志不属于 RoCE transport 内部状态机，但在当前端点双 bridge 模型里经常需要一起看。
+
+#### `[BRIDGE][RETRY][NO_PATH]`
+
+含义：
+
+- 普通 forwarding bridge 的 ingress 队列头包当前没有可用出路。
+- bridge 会保留该头包并安排 ingress drain retry，而不是立刻丢弃。
+- 当前 `TerminalLearningOnly` 的修正点之一，就是终端外侧 bridge 上的 transit 包不再走这条 retry 链。
+
+#### `[BRIDGE][TERMINAL][DROP]`
+
+含义：
+
+- 终端外侧 bridge 已经利用收到的 transit 包完成必要学习。
+- 但该 bridge 不承担后续 transit 转发，因此在学习后直接停止转发。
+
+当前说明：
+
+- 代码里这条日志模板仍然保留在 terminal-drop 分支。
+- 默认 `NS_LOG_INFO` 输出已注释，避免大规模 flood 学习阶段日志爆炸。
+- 因此看到它，说明 terminal 分支在工作；看不到它，不代表 terminal 分支不存在。
+
+#### `[PFC][THRESH][LOCAL][PAUSE/RESUME]`
+
+含义：
+
+- bridge 检测到本地注入队列达到高/低水位。
+- 当前动作是通过 `FlowIo::PauseNodeQueue(...)` / `ResumeNodeQueue(...)` 控制本地软件发送队列。
+
+#### `[PFC][THRESH][NONLOCAL][PAUSE/RESUME]`
+
+含义：
+
+- bridge 检测到来自真实 ingress port 的队列达到高/低水位。
+- 当前动作是向上游物理口回发 `PauseHeader`。
 
 ### 3.3 事务流日志
 

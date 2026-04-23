@@ -1,5 +1,7 @@
 # RoCE Scheduler Stage 1 归档
 
+最近修改：2026-04-23
+
 记录时间：2026-04-10
 
 这份文档是历史归档。旧版 `Stage 1` 文档描述的是 RoCE 调度还主要在 `sendflowclient + RoceTxScheduler` 内部完成的阶段；当前主路径已经迁移到 port-bound `RdmaPortEngine`。
