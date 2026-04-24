@@ -1,2 +1,2 @@
-lewis slots=1
-lab slots=1
+lab206 slots=2
+lab254 slots=2

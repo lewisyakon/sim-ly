@@ -90,7 +90,7 @@ FlowIo::GetTypeId()
                         MakeTimeChecker())
           .AddAttribute("MaxBufferedPackets",
                         "Maximum buffered packets in FlowIo before dropping new packets.",
-                        UintegerValue(20000000),
+                        UintegerValue(200000),
                         MakeUintegerAccessor(&FlowIo::m_maxBufferedPackets),
                         MakeUintegerChecker<uint32_t>())
           .AddAttribute("NumTxQueues",

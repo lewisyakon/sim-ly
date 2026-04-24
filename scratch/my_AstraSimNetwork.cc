@@ -1670,7 +1670,13 @@ void GetGlobalStart()
 mpirun -np 2 --map-by ppr:2:node:PE=4 --bind-to core  \
   build/scratch/ns3.44-my_AstraSimNetwork-default
 
---hostfile hostfile.txt --mca btl_tcp_if_include 10.201.0.0/16
+mpirun --hostfile /mnt/nfs/cloud/hybrid/hostfile.txt -np 4 \
+  --wdir /mnt/nfs/cloud/hybrid \
+  --launch-agent "/usr/local/bin/mpi-docker-agent /usr/bin/orted" \
+  --map-by ppr:2:node:PE=16 \
+  --bind-to core \
+  --mca btl_tcp_if_include 10.201.0.0/16 \
+  /mnt/nfs/cloud/hybrid/build/scratch/ns3.44-my_AstraSimNetwork-default
 */
 
 int main(int argc, char *argv[]) {

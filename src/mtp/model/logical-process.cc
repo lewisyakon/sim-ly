@@ -73,6 +73,8 @@ LogicalProcess::Enable(const uint32_t systemId, const uint32_t systemCount)
 {
     m_systemId = systemId;
     m_systemCount = systemCount;
+    m_mailbox.clear();
+    m_mailbox.resize(m_systemCount);
 }
 
 void
@@ -139,8 +141,6 @@ LogicalProcess::CalculateLookAhead()
                 {
                     m_lookAhead = delay.Get();
                 }
-                // add the neighbour to the mailbox
-                m_mailbox[remoteNode->GetSystemId()];
             }
         }
     }
@@ -154,9 +154,8 @@ LogicalProcess::ReceiveMessages()
     NS_LOG_FUNCTION(this);
 
     m_pendingEventCount = 0;
-    for (auto& item : m_mailbox)
+    for (auto& queue : m_mailbox)
     {
-        auto& queue = item.second;
         std::sort(queue.begin(), queue.end(), std::greater<>());
         while (!queue.empty())
         {
@@ -248,6 +247,8 @@ LogicalProcess::ScheduleWithContext(LogicalProcess* remote,
     }
     else
     {
+        NS_ASSERT_MSG(m_systemId < remote->m_mailbox.size(),
+                      "LogicalProcess sender system ID out of mailbox bounds");
         ev.key.m_uid = EventId::UID::INVALID;
         remote->m_mailbox[m_systemId].emplace_back(m_currentTs, m_systemId, m_uid, ev);
     }

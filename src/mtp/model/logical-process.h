@@ -35,7 +35,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <map>
 #include <tuple>
 #include <vector>
 
@@ -186,8 +185,8 @@ class LogicalProcess
     Ptr<Scheduler> m_events;
     Time m_lookAhead;
 
-    std::map<uint32_t, std::vector<std::tuple<uint64_t, uint32_t, uint32_t, Scheduler::Event>>>
-        m_mailbox; // event message mail box
+    std::vector<std::vector<std::tuple<uint64_t, uint32_t, uint32_t, Scheduler::Event>>>
+        m_mailbox; // per-sender event queues indexed by sender system ID
     std::chrono::nanoseconds::rep m_executionTime;
 };
 

@@ -4,8 +4,8 @@ FROM ubuntu:24.04
 # 2. 设置非交互式安装，避免构建时卡住
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN groupadd -g 1003 lympi &&\
-	useradd -ms /bin/bash -u 1003 -g 1003 lympi
+RUN groupadd -g 1601 lympi &&\
+	useradd -ms /bin/bash -u 1601 -g 1601 lympi
 
 # 3. 合并所有 APT 依赖项
 #    - 这会是一个很长的命令，但它只会创建一个 Docker 镜像层，效率更高

@@ -64,6 +64,7 @@ bool mactable_load_enable;
 std::string mactable_load_dir;
 double pfc_high_watermark;
 double pfc_low_watermark;
+uint32_t flowio_max_buffered_packets;
 uint32_t node_num, switch_num, link_num, trace_num, nvswitch_num, gpus_per_server,
             nvswitch_per_server,numGPUs;
 uint32_t Topology_model,subnet_model,subnet_k,numHosts,switch_delay;
@@ -763,6 +764,9 @@ bool ReadConf(std::string network_conf)
   auto JGetDouble = [&](const json& x, const char* k, double& out){
     if (JHas(x,k)) out = x.at(k).get<double>();
   };
+  auto JGetU32 = [&](const json& x, const char* k, uint32_t& out){
+    if (JHas(x,k)) out = x.at(k).get<uint32_t>();
+  };
   auto to_upper = [](std::string s){ for(char& c:s) c = (char)std::toupper((unsigned char)c); return s; };
 
   auto ParseGpuType = [&](const std::string& sIn)->GPUType {
@@ -894,6 +898,7 @@ bool ReadConf(std::string network_conf)
   auto pfc_log_level_bak        = g_pfcLogLevel;
   auto pfc_high_global_bak      = g_pfcHighWatermark;
   auto pfc_low_global_bak       = g_pfcLowWatermark;
+  auto flowio_max_buffered_packets_bak = flowio_max_buffered_packets;
   auto mactable_load_enable_bak = mactable_load_enable;
   auto mactable_load_dir_bak    = mactable_load_dir;
   auto effective_floadtime_bak  = effective_floadtime;
@@ -921,6 +926,7 @@ bool ReadConf(std::string network_conf)
     JGetStr(nw, "nvlink_delay",          nvlink_delay);
     JGetStr(nw, "drop_tail_queue_size",  DropTailQueue_size);
     JGetStr(nw, "drop_tail_queue_num",  DropTailQueue_num);
+    JGetU32(nw, "flowio_max_buffered_packets", flowio_max_buffered_packets);
     if (JHas(nw, "pfc_high_watermark"))
     {
       JGetDouble(nw, "pfc_high_watermark", pfc_high_watermark);
@@ -969,6 +975,7 @@ bool ReadConf(std::string network_conf)
     const auto& pf = j["pfc"];
     JGetStr(pf, "drop_tail_queue_size", DropTailQueue_size);
     JGetStr(pf, "drop_tail_queue_num", DropTailQueue_num);
+    JGetU32(pf, "flowio_max_buffered_packets", flowio_max_buffered_packets);
     if (JHas(pf, "high_watermark"))
     {
       JGetDouble(pf, "high_watermark", pfc_high_watermark);
@@ -1164,6 +1171,7 @@ bool ReadConf(std::string network_conf)
       g_pfcLogLevel = pfc_log_level_bak;
       g_pfcHighWatermark = pfc_high_global_bak;
       g_pfcLowWatermark = pfc_low_global_bak;
+      flowio_max_buffered_packets = flowio_max_buffered_packets_bak;
       mactable_load_enable = mactable_load_enable_bak;
       mactable_load_dir = mactable_load_dir_bak;
       effective_floadtime = effective_floadtime_bak;
@@ -1235,6 +1243,7 @@ void SetConfig(){
     mactable_load_dir="mactable";
     pfc_high_watermark=0.8;
     pfc_low_watermark=0.2;
+    flowio_max_buffered_packets = 200000;
     g_pfcHighWatermark = pfc_high_watermark;
     g_pfcLowWatermark = pfc_low_watermark;
 
@@ -1342,6 +1351,22 @@ void SetConfig(){
 
 void SetupNetwork(){
     NS_LOG_INFO("common now");
+
+    // Keep FlowIo software buffering bounded and aligned with runtime queue fanout.
+    Config::SetDefault("ns3::FlowIo::MaxBufferedPackets",
+                       UintegerValue(flowio_max_buffered_packets));
+    uint32_t flowio_num_tx_queues = 16;
+    try
+    {
+        flowio_num_tx_queues = static_cast<uint32_t>(std::stoul(DropTailQueue_num));
+    }
+    catch (...)
+    {
+        flowio_num_tx_queues = 16;
+    }
+    flowio_num_tx_queues = std::max<uint32_t>(1, flowio_num_tx_queues);
+    Config::SetDefault("ns3::FlowIo::NumTxQueues",
+                       UintegerValue(flowio_num_tx_queues));
     
     // LogComponentEnable("MultithreadedSimulatorImpl", LOG_LEVEL_INFO);
     // LogComponentEnable("MtpInterface",LOG_LEVEL_INFO);
