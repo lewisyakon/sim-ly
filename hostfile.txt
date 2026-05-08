@@ -1,2 +1,3 @@
-lab206 slots=2
-lab254 slots=2
+lab206 slots=32
+lab254 slots=32
+lab188 slots=64
