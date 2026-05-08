@@ -1,6 +1,6 @@
 # Min-Hop Mac Learning 文档索引
 
-最近修改：2026-04-23
+最近修改：2026-05-07
 
 这组文档现在以“当前代码已经实现成什么样”为中心，不再按早期阶段性原型来描述。当前文档分成两部分：
 
@@ -68,40 +68,45 @@
    - `TerminalLearningOnly` 到底做什么
    - FlowIo、bridge、PFC 现在分别落在哪一层
 
-3. [roce-reality-gap-review.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-reality-gap-review.md)
+3. [external-topology-v1.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/external-topology-v1.md)
+   - 外部拓扑文本文件 v1 的格式和合法性规则
+   - GPU rank / 交换机编号 / 外网和内网链路的语义
+   - external topology 构建器必须保留哪些 GPU 标准组件
+
+4. [roce-reality-gap-review.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-reality-gap-review.md)
    - 当前实现和现实 RoCE 的差距到底在哪里
    - 哪些差距会影响大规模网络行为
    - 哪些是必须补、建议补、可以暂缓
 
-4. [memory-leak-investigation.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/memory-leak-investigation.md)
+5. [memory-leak-investigation.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/memory-leak-investigation.md)
    - 本轮内存增长问题的根因
    - CSV dimension utilization 为什么会制造超大中间结构
    - 当前关闭 CSV 和清理临时内存探针后的验证口径
 
-5. [roce-class-architecture.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-class-architecture.md)
+6. [roce-class-architecture.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-class-architecture.md)
    - 每个 RoCE 类分别负责什么
    - 类之间怎样耦合、怎样传参
    - 从外部调用时暴露什么接口
    - 整体已经支持什么功能
 
-6. [roce-workflow.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-workflow.md)
+7. [roce-workflow.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-workflow.md)
    - 一条流从 Astra-Sim 下发后，怎样经过 transport、bridge、port、QP，最终从物理口发出去
    - 接收时怎样回到 ingress `RdmaPortEngine`
    - ACK、reorder、completion 分别在哪里发生
 
-7. [roce-transport-reliability.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-transport-reliability.md)
+8. [roce-transport-reliability.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-transport-reliability.md)
    - ACK、重传、窗口、reorder 当前落在哪里
    - 哪些可靠性能力已经从 `sendflowclient` 下沉到 `RdmaPortEngine`
 
-8. [roce-config-and-logs.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-config-and-logs.md)
+9. [roce-config-and-logs.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-config-and-logs.md)
    - 配置项解释
    - 日志口径解释
 
-9. [roce-qp-and-transport.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-qp-and-transport.md)
+10. [roce-qp-and-transport.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-qp-and-transport.md)
    - 现实中的 `QP / port / CQ / SRQ`
    - 它们在当前仿真里的映射
 
-10. [roce-future-scheduling-options.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-future-scheduling-options.md)
+11. [roce-future-scheduling-options.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-future-scheduling-options.md)
    - 如果后续继续提高 port 调度真实性，可以考虑哪些方案
    - 为什么当前暂时不继续改调度层
 

@@ -1,0 +1,548 @@
+# 外部拓扑输入 v1 规格
+
+最近修改：2026-05-08
+
+记录时间：2026-05-07
+
+这份文档定义当前实现的 `external-topology-v1`。它是一个内部实现规格，不是用户手册。目标是把当前硬编码拓扑里的“物理连接方式”抽出来，允许用户用一个简单文本文件定义 GPU、交换机、外网链路和内网链路，同时保留现有 GPU 端点、FlowIo、RoCE/RDMA、warmup app、sendflowclient 等完整仿真能力。
+
+## 0. 当前实现状态
+
+截至 2026-05-07，v1 已接入当前 scratch 主入口：
+
+1. `scratch/my_common.h` 中新增 `Topology_model == 6`，配置名支持 `"external"` 和 `"file"`。
+2. `scratch/my_common.h` 中新增 external topology parser，负责检查整数格式、端点范围、自环、同段重边、外网 GPU-GPU、内网非 GPU-GPU 和额外 token。
+3. `scratch/my_common.h` 中新增 external topology 构建分支，为每个 GPU 创建 `innerBridge` 和 `externalBridge`，为每个交换机创建唯一 `MinHopBridgeNetDevice`，并按文件边列表安装 `normal_link` 和 `nvlink`。
+4. `scratch/my_entry.h` 中新增 external topology 的 internal/external 发送判定：同一内网连通分量内走 `FlowSendMode::Internal`，否则走 `FlowSendMode::External`。
+5. warmup 现在覆盖两类网络：有外网 rail 的 GPU 会从外网 rail 发外网学习包；只要 `innerBridge` 有内网端口，就会从 `innerBridge` 额外发 broadcast flood，让内网 `nvlink` bridge 也通过泛洪学习。
+6. 当前 smoke 样例位于：
+   - `simtopo/external-smoke.topo`
+   - `simconfig/external-smoke.json`
+   - `simworkload/microAllReduce4_external.txt`
+7. 当前 64 GPU k=4 FatTree + 4-GPU fullmesh 子网样例位于：
+   - `simtopo/external-fattree-k4-gpu4-fullmesh.topo`
+   - `simworkload/microAllReduce64_external_fattree.txt`
+
+实现兼容性边界：external topology 文件只创建 GPU 和交换机物理连接。当前 scratch Astra 前端仍假定存在逻辑 nvswitch 编号，因此 external 分支暂时设置 `nvswitch_num = numGPUs` 作为上层兼容占位，但不会创建额外物理 nvswitch 链路。普通 GPU 集合通信 smoke 已验证；NVLS 或显式依赖 nvswitch 语义的 workload 仍需要单独确认。
+
+## 1. 设计目标
+
+当前 `scratch/my_common.h` 里的 FatTree、Clos、HPN 等拓扑都是代码硬编码。用户想构建新拓扑时，需要改 C++ 代码，这对大规模实验和自动生成拓扑都不方便。
+
+`external-topology-v1` 的目标是：
+
+1. 用一个行式文本文件描述物理连接。
+2. GPU 编号直接等于集合通信使用的 GPU rank。
+3. 交换机编号固定排在 GPU 编号之后。
+4. 外部文件只定义连接关系，不定义 GPU 内部组件。
+5. 构建器仍然为每个 GPU 创建完整标准端点。
+6. 不检查拓扑设计是否合理，只检查输入是否满足本格式的构建契约。
+
+本格式刻意不使用 JSON。原因是拓扑主体本质是边列表，未来规模可能非常大；行式文本更适合脚本生成、手工抽查和大规模 diff。全局仿真配置仍然可以继续放在 `simconfig/config.json` 中。
+
+## 2. 非目标
+
+v1 暂不解决以下问题：
+
+1. 不支持用户自定义 GPU 编号到内部 rank 的映射。
+2. 不支持每条链路单独配置速率、延迟、队列大小或 MTU。
+3. 不支持注释语法。
+4. 不支持在拓扑文件中声明 server、pod、plane、rail 等层级语义。
+5. 不支持用重边表达并行链路。
+6. 不负责检查拓扑是否连通、是否无环、是否满足 FatTree/Clos/HPN 等结构约束。
+7. 不负责检查 workload 是否一定能在该拓扑上成功完成。
+
+这些能力后续可以作为 v2 或额外转换器实现。v1 只负责把一个清晰、最小的连接文件翻译成当前仿真器的标准节点和链路对象。
+
+## 3. 文件格式
+
+文件由整数 token 组成。用户侧应按下面的行结构书写：
+
+```text
+N M
+K
+Q0 P0
+Q1 P1
+...
+Q(K-1) P(K-1)
+V
+Q0 P0
+Q1 P1
+...
+Q(V-1) P(V-1)
+```
+
+含义：
+
+1. `N`：GPU 数量。
+2. `M`：交换机数量。
+3. `K`：外网链路数量。
+4. 接下来 `K` 行：每行两个整数 `Q P`，表示一条外网 `normal_link`。
+5. `V`：内网链路数量。
+6. 接下来 `V` 行：每行两个整数 `Q P`，表示一条内网 `nvlink`。
+
+v1 不包含 GPU 编号数组和交换机编号数组。编号由 `N` 和 `M` 强制推导。
+
+## 4. 编号规则
+
+节点编号固定为：
+
+```text
+GPU:      0, 1, 2, ..., N-1
+Switch:   N, N+1, ..., N+M-1
+```
+
+因此：
+
+1. GPU `i` 的编号就是内部 GPU rank `i`。
+2. workload、集合通信并行组和拓扑文件使用同一套 GPU rank。
+3. 交换机 `s` 的外部文件编号是 `N + switchIndex`。
+4. 实现中可以通过 `switchIndex = nodeId - N` 找到交换机容器下标。
+
+建议实现以下辅助函数，避免在构建代码中反复写裸条件：
+
+```cpp
+bool IsGpu(uint32_t nodeId) {
+    return nodeId < gpuCount;
+}
+
+bool IsSwitch(uint32_t nodeId) {
+    return nodeId >= gpuCount && nodeId < gpuCount + switchCount;
+}
+
+uint32_t GpuIndex(uint32_t nodeId) {
+    return nodeId;
+}
+
+uint32_t SwitchIndex(uint32_t nodeId) {
+    return nodeId - gpuCount;
+}
+```
+
+这里的 `gpuCount` 对应文件里的 `N`，`switchCount` 对应文件里的 `M`。
+
+## 5. 外网链路规则
+
+外网段表示使用 `normal_link` 参数的后端网络链路。
+
+外网链路合法性：
+
+```text
+GPU - Switch      合法
+Switch - GPU      合法
+Switch - Switch   合法
+GPU - GPU         非法
+```
+
+外网链路构建规则：
+
+1. 使用 `normallink_rate`。
+2. 使用 `normallink_delay`。
+3. 使用当前全局 `m_mtu`。
+4. 使用当前全局 `PppRoundRobinQueue` 配置。
+5. 如果某端是 GPU，该端物理 `PointToPointNetDevice` 由该 GPU 的 `externalBridge` 管理。
+6. 如果某端是交换机，该端物理 `PointToPointNetDevice` 由该交换机唯一 `MinHopBridgeNetDevice` 管理。
+
+GPU-GPU 不允许出现在外网段。原因是 GPU-GPU 通信如果要表达为物理直连，应由内网段管理，并挂到 GPU 的 `innerBridge`；外网段中的 GPU 端口只表达 GPU 面向后端网络的外部端口。
+
+## 6. 内网链路规则
+
+内网段表示使用 `nvlink` 参数的 GPU 内部连接。
+
+内网链路合法性：
+
+```text
+GPU - GPU         合法
+GPU - Switch      非法
+Switch - GPU      非法
+Switch - Switch   非法
+```
+
+内网链路构建规则：
+
+1. 使用 `nvlink_rate`。
+2. 使用 `nvlink_delay`。
+3. 使用当前全局 `m_mtu`。
+4. 使用当前全局 `PppRoundRobinQueue` 配置。
+5. 两端物理 `PointToPointNetDevice` 分别由对应 GPU 的 `innerBridge` 管理。
+
+交换机不能出现在内网段。内网段只描述 GPU 间的内部高带宽连接。
+
+## 7. 自环和重边
+
+自环非法。无论外网段还是内网段，只要出现：
+
+```text
+Q == P
+```
+
+就应拒绝该拓扑文件。
+
+重边非法。链路按无向边判断，`Q P` 和 `P Q` 是同一条边。实现中应把边规范化为：
+
+```text
+(min(Q, P), max(Q, P))
+```
+
+同一段中同一个规范化 pair 只能出现一次。
+
+外网段和内网段分别检查重边即可。由于外网禁止 GPU-GPU、内网只允许 GPU-GPU，合法输入下同一条边不会跨段重复表达。
+
+禁止重边的原因是当前不希望用重复边表达并行链路。并行链路、轨道、平面、多 rail 等语义后续应该由明确拓扑结构或更高版本格式表达，而不是通过重复一行边隐式表达。
+
+## 8. 拓扑合理性边界
+
+构建器只检查输入是否满足格式契约，不检查网络设计是否合理。
+
+应该检查：
+
+1. 文件能打开。
+2. `N`、`M`、`K`、`V` 能被解析为非负整数，其中 `N` 必须大于 0。
+3. 每条边的两个端点都满足 `0 <= id < N + M`。
+4. 自环非法。
+5. 同一段内重边非法。
+6. 外网段不能出现 GPU-GPU。
+7. 内网段必须全部是 GPU-GPU。
+8. 文件中 token 数量不足时应报错。
+
+不应该检查：
+
+1. GPU 是否都有外网链路。
+2. GPU 是否都有内网链路。
+3. 交换机是否都有端口。
+4. 全图是否连通。
+5. 是否存在孤立 GPU 或孤立交换机。
+6. 是否存在环路。
+7. 是否满足任何特定拓扑族。
+8. 是否和 workload 的通信模式匹配。
+
+如果某个 GPU 没有外网链路，它仍然是合法拓扑。构建器仍应创建该 GPU 的完整标准端点，只是它的 `externalRailIfIndices` 为空。后续如果 workload 让它发送外网流，应由发送路径给出清晰错误，而不是构建阶段拒绝。
+
+如果某个 GPU 没有内网链路，也仍然合法。它仍有 `innerBridge`、FlowIo、sendflowclient、warmup app 和 RoCE/RDMA 相关组件。
+
+## 9. 标准 GPU 端点要求
+
+外部拓扑文件只定义连接方式，不定义 GPU 节点内部构建。
+
+因此 external topology 构建时，不能因为连接来自外部文件就创建“简化 GPU”。每个 GPU 都必须具备当前正常 GPU 拓扑应具备的组件，包括但不限于：
+
+1. GPU `Node`。
+2. `innerBridge`。
+3. `externalBridge`。
+4. `GpuExternalIoLayout`。
+5. `FlowIo` 所需的 device/index/address 绑定信息。
+6. `sendflowclient`。
+7. `PacketSocket` 相关安装。
+8. `nodeaddresstable`。
+9. `nodetable`。
+10. warmup / 泛洪用 app。
+11. RoCE/RDMA 相关组件。
+12. PFC / queue pause 相关端口配置。
+
+换句话说，外部拓扑构建器只替换硬编码拓扑中的“连线循环”，不替换 GPU 标准端点初始化流程。
+
+## 10. Bridge 归属
+
+每个 GPU 创建两个 bridge：
+
+```text
+GPU node
+  innerBridge
+  externalBridge
+```
+
+其中：
+
+1. `innerBridge` 管理内网 `nvlink` 端口。
+2. `externalBridge` 管理外网 `normal_link` 端口。
+3. endpoint MAC 仍应按当前统一模型从 `innerBridge` 得到。
+4. `externalBridge` 仍应使用当前外侧 bridge 语义，即作为 GPU 外部出入口和学习载体，不作为普通 transit bridge。
+
+每个交换机创建一个 bridge：
+
+```text
+Switch node
+  switchBridge
+```
+
+其中：
+
+1. 该交换机参与的所有外网端口都加入这个唯一 bridge。
+2. 交换机不参与内网链路。
+3. 交换机 bridge 是普通网络转发 bridge，承担外网 transit 语义。
+
+## 11. 构建流程建议
+
+实现时建议把 external topology 构建拆成五个阶段。
+
+### 11.1 解析文件
+
+解析结果可以存成一个轻量结构：
+
+```cpp
+struct ExternalTopologySpec {
+    uint32_t gpuCount;
+    uint32_t switchCount;
+    std::vector<std::pair<uint32_t, uint32_t>> externalLinks;
+    std::vector<std::pair<uint32_t, uint32_t>> internalLinks;
+};
+```
+
+解析阶段只做格式契约检查，不创建 ns-3 对象。
+
+### 11.2 创建节点和 bridge
+
+创建：
+
+1. `NodeContainer hosts; hosts.Create(gpuCount);`
+2. `NodeContainer switches; switches.Create(switchCount);`
+3. 每个 GPU 的 `innerBridge`。
+4. 每个 GPU 的 `externalBridge`。
+5. 每个 switch 的唯一 bridge。
+
+GPU 相关 vector 应按 GPU rank 直接索引：
+
+```text
+SubNetDevices[gpuId]
+ExternalBridgeDevices[gpuId]
+GpuExternalIoLayouts[gpuId]
+```
+
+交换机相关 vector 应按 `switchIndex = nodeId - gpuCount` 索引。可以新增一个 external topology 专用 vector，例如：
+
+```cpp
+std::vector<Ptr<MinHopBridgeNetDevice>> ExternalSwitchDevices;
+```
+
+如果希望复用现有打印和 mactable 汇总逻辑，也可以把它追加到现有 bridge 收集流程里。
+
+### 11.3 安装外网链路
+
+创建 normal link helper：
+
+```cpp
+PointToPointHelper normalHelper;
+normalHelper.SetDeviceAttribute("DataRate", StringValue(normallink_rate));
+normalHelper.SetChannelAttribute("Delay", StringValue(normallink_delay));
+normalHelper.SetQueue("ns3::PppRoundRobinQueue",
+                      "MaxPacketsPerQueue", StringValue(DropTailQueue_size),
+                      "NumQueues", StringValue(DropTailQueue_num));
+normalHelper.SetDeviceAttribute("Mtu", UintegerValue(m_mtu));
+```
+
+对每条外网边 `a b`：
+
+1. 取出两端 ns-3 node。
+2. 安装 P2P 链路。
+3. 根据端点角色把对应 netdevice 加到 `externalBridge` 或 switch bridge。
+4. 如果端点是 GPU，把 GPU 侧物理口 ifIndex 追加到 `GpuExternalIoLayouts[gpu].externalRailIfIndices`。
+
+GPU 侧 layout 初始化时应先填：
+
+```text
+innerBridgeIfIndex
+externalBridgeIfIndex
+innerBridge
+externalBridge
+```
+
+外网链路安装时再逐条追加外部 rail。
+
+### 11.4 安装内网链路
+
+创建 nvlink helper：
+
+```cpp
+PointToPointHelper nvlinkHelper;
+nvlinkHelper.SetDeviceAttribute("DataRate", StringValue(nvlink_rate));
+nvlinkHelper.SetChannelAttribute("Delay", StringValue(nvlink_delay));
+nvlinkHelper.SetQueue("ns3::PppRoundRobinQueue",
+                      "MaxPacketsPerQueue", StringValue(DropTailQueue_size),
+                      "NumQueues", StringValue(DropTailQueue_num));
+nvlinkHelper.SetDeviceAttribute("Mtu", UintegerValue(m_mtu));
+```
+
+对每条内网边 `a b`：
+
+1. 两端必须是 GPU。
+2. 安装 P2P 链路。
+3. `SubNetDevices[a]->AddBridgePort(devA)`。
+4. `SubNetDevices[b]->AddBridgePort(devB)`。
+
+### 11.5 统一收尾
+
+链路全部安装完成后，执行和现有标准拓扑一致的收尾流程：
+
+1. `FinalizeAllGpuEndpointMacsFromInnerBridge(gpuCount)`。
+2. `PacketSocketHelper.Install(hosts)`。
+3. `InstallGpuWarmupClients(hosts, gpuCount)`。
+4. 保持 `nodeaddresstable`、`nodeapptable`、`nodetable` 按 GPU rank 填充。
+5. 保持 mactable load/dump 逻辑。
+6. 保持 PFC、RoCE ack timeout、logging 等全局配置逻辑。
+
+如果后续发现某些 RoCE/RDMA 组件实际是在 `sendflowclient` 初始化、`PointToPointNetDevice` 端口安装或其他路径里完成，external topology 分支应复用同样路径，而不是另写简化版本。
+
+## 12. 与现有配置的关系
+
+建议在 `simconfig/config.json` 中新增一种 topology model：
+
+```json
+"topology": {
+  "model": "external",
+  "file": "simtopo/example.topo",
+  "subnet_model": 0,
+  "subnet_k": 1,
+  "switch_delay_ns_override": 100
+}
+```
+
+其中：
+
+1. `model = "external"` 进入 external topology 构建分支。
+2. `file` 指向本文定义的拓扑文件。
+3. `N` 直接决定 `numGPUs`。
+4. `M` 直接决定 `switch_num`。
+5. `node_num = numGPUs + switch_num + nvswitch_num` 的含义需要实现时重新确认。
+
+这里有一个重要设计点：external topology 文件不负责声明 GPU 内部构建方式。v1 里的内网链路已经直接由文件给出，因此 external 分支不应该再由 `subnet_model` 自动生成额外 GPU-GPU 或 GPU-NVSwitch 内部链路。
+
+如果为了兼容现有 Astra-Sim 上层仍需要 `nvswitch_num` 或 `NVswitchs`，external 分支应单独定义它的映射规则。第一阶段可以先把文件中的 `N` 个 GPU 作为真实参与集合通信的 GPU rank，是否创建额外 nvswitch 节点应由实现方案明确决定，不能让 `subnet_model` 隐式再生成一套内部网络。
+
+### 12.1 `max_jump` 和 RoCE ACK timeout 注意事项
+
+external topology 文件当前只描述连接关系，不负责声明或推导泛洪传播预算。也就是说，外部拓扑下 `network.max_jump` 仍然来自 `simconfig/config.json`，不是从 `.topo` 文件中的图结构自动计算出来的。
+
+当前实现中，`max_jump` 同时影响两类网络：
+
+1. 外网 `normal_link` 上的 min-hop MAC 学习泛洪传播跳数。
+2. external topology 分支下内网 `nvlink` bridge 的泛洪传播跳数。
+
+用户提供外部拓扑文件时，应保证 `network.max_jump` 不小于需要学习的最长最短路径跳数。这里的路径包括外网 GPU-switch/switch-switch 路径，也包括内网 `nvlink` 连通分量内的 GPU-GPU 路径。如果 `max_jump` 设置过小，泛洪包会在 bridge 处因为 hop count 超限被丢弃，后续可能表现为 MAC 表学习不完整、业务流找不到可用路径、`NO_PATH` retry 或异常重传。
+
+`workload.floadtime_s` 只控制 warmup 阶段的时间窗口，不等价于泛洪包的跳数预算。泛洪包本身的传播边界由 `max_jump` 控制。
+
+RoCE 的 `ack_timeout_mode = "auto"` 在 external topology 下也有同样的限制：当前实现不会遍历 `.topo` 文件计算真实 RTT 或图直径，而是把 `max_jump` 当作 one-way link budget，并使用 `max_jump - 1` 作为 one-way switch budget，再结合全局 `normallink_delay`、`switch_delay`、`mtu` 和 `normallink_rate` 推导 ACK timeout 基线，最后乘以 `ack_timeout_factor`。
+
+因此 external topology 用户需要同时检查两件事：
+
+1. `max_jump` 是否足够覆盖该拓扑上需要学习的路径。
+2. `ack_timeout_mode = "auto"` 由 `max_jump` 间接推导出的超时时间是否适合该拓扑；如果外部拓扑很深、链路参数和全局 normal link 参数不一致，或希望使用更保守的重传超时，应改用 `ack_timeout_mode = "manual"` 并显式设置 `ack_timeout_ns`。
+
+后续如果需要进一步自动化，可以在 external topology parser 阶段计算外网图直径、内网连通分量直径，并据此派生建议 `max_jump` 和 RoCE ACK timeout 预算；但 v1 当前没有实现这一步。
+
+## 13. 示例
+
+一个最小例子：
+
+```text
+4 2
+4
+0 4
+1 4
+2 5
+3 5
+2
+0 1
+2 3
+```
+
+解释：
+
+```text
+GPU:      0, 1, 2, 3
+Switch:   4, 5
+```
+
+外网：
+
+```text
+0 -- 4   normal_link, GPU0 externalBridge <-> Switch4 bridge
+1 -- 4   normal_link, GPU1 externalBridge <-> Switch4 bridge
+2 -- 5   normal_link, GPU2 externalBridge <-> Switch5 bridge
+3 -- 5   normal_link, GPU3 externalBridge <-> Switch5 bridge
+```
+
+内网：
+
+```text
+0 -- 1   nvlink, GPU0 innerBridge <-> GPU1 innerBridge
+2 -- 3   nvlink, GPU2 innerBridge <-> GPU3 innerBridge
+```
+
+下面这些输入应被拒绝。注意：v1 文件本身不支持注释，下面每个代码块只展示原始文件内容；非法原因写在代码块前。
+
+外网 GPU-GPU 非法：
+
+```text
+4 2
+1
+0 1
+0
+```
+
+内网出现交换机非法：
+
+```text
+4 2
+0
+1
+0 4
+```
+
+自环非法：
+
+```text
+4 2
+1
+4 4
+0
+```
+
+重边非法，`0 4` 和 `4 0` 是同一条无向边：
+
+```text
+4 2
+2
+0 4
+4 0
+0
+```
+
+## 14. 实现验收清单
+
+第一阶段实现完成后，至少应验证：
+
+1. 可以从 `simconfig/config.json` 选择 `model = "external"` 并读取 `file`。
+2. parser 能正确读取 `N M K V` 和两段边列表。
+3. parser 能拒绝越界端点。
+4. parser 能拒绝自环。
+5. parser 能拒绝重边。
+6. parser 能拒绝外网 GPU-GPU。
+7. parser 能拒绝内网非 GPU-GPU。
+8. 每个 GPU 都创建 `innerBridge` 和 `externalBridge`。
+9. 每个 switch 都创建唯一 bridge。
+10. 外网 GPU 端口加入 `externalBridge`。
+11. 外网 switch 端口加入 switch bridge。
+12. 内网 GPU 端口加入 `innerBridge`。
+13. `GpuExternalIoLayouts[gpu].externalRailIfIndices` 能反映文件里的外网 GPU 端口。
+14. `FinalizeAllGpuEndpointMacsFromInnerBridge` 正常执行。
+15. `InstallGpuWarmupClients` 正常执行。
+16. `nodeaddresstable`、`nodeapptable`、`nodetable` 按 GPU rank 填充。
+17. RoCE 开启时，外部拓扑下仍能走正常 `RdmaPortEngine` 物理端口路径。
+18. 没有外网链路的 GPU 不应在构建阶段崩溃。
+19. 没有内网链路的 GPU 不应在构建阶段崩溃。
+20. mactable dump/load 的 bridge 收集范围包含 external topology 下创建的 bridge。
+
+## 15. 后续扩展方向
+
+v1 稳定后再考虑：
+
+1. 支持注释。
+2. 支持显式 section header。
+3. 支持每条链路单独配置速率、延迟和链路类型。
+4. 支持外部文件声明 plane/rail/pod 等更高层语义。
+5. 支持从 SIMAI 文本拓扑、邻接矩阵或其他格式转换成本格式。
+6. 支持外部拓扑可视化坐标文件。
+7. 支持更严格的可选拓扑合理性检查，例如连通性检查、孤立节点报告、端口数统计。
+
+这些都不应阻塞第一阶段。第一阶段只实现本文定义的最小可用规格。

@@ -2,7 +2,7 @@
   "workloadpath": "simworkload/microAllReduce.txt",
   "thread": 1,
   "gpu_type": "A100",                
-  "gpus_per_server": 4,
+  "gpus_per_server": 1,
   "nvswitch_per_server": 1,
   "pp_schedule": "gpipe",
 
@@ -17,13 +17,13 @@
   },
 
   "workload": {
-    "floadtime_s": 500
+    "floadtime_s": 20
   },
 
   "logging": {
     "dir": "simlog",
-    "simulation_log": "simulation2.log",
-    "nccl_log": "SimAI.log",
+    "simulation_log": "external-fattree-k4-gpu4-fullmesh.log",
+    "nccl_log": "external-fattree-k4-gpu4-fullmesh-SimAI.log",
     "log_levels": {
       "roce": "off",
       "pfc": "off"
@@ -33,14 +33,14 @@
       "rdma_port_engine": true,
       "generic_simulation": true,
       "min_hop_bridge_net_device": true,
-      "point_to_point_net_device": true,
-      "ppp_round_robin_queue": true
+      "point_to_point_net_device": false,
+      "ppp_round_robin_queue": false
     }
   },
 
   "mactable": {
     "load_enable": false,
-    "dump_enable": true,
+    "dump_enable": false,
     "dir": "mactable"
   },
 
@@ -52,10 +52,11 @@
   },
 
   "topology": {
-    "model": "fattree",
+    "model": "external",
+    "file": "simtopo/external-fattree-k4-gpu4-fullmesh.topo",
     "k": 4,
     "subnet_model": 0,              
-    "subnet_k": 4,                             
+    "subnet_k": 1,                             
     "hostperleaf": 2,                            
     "switch_delay_ns_override": 100 
   },

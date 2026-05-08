@@ -333,6 +333,10 @@ sendflowclient::ProcessThreePhasePayload_(Ptr<Packet> p,
         }
         m_dataPacketsReceived[flowKey]++;
         if (m_dataPacketsReceived[flowKey] == m_dataPacketsExpected[flowKey]) {
+            // Release the completed DATA RX QP before posting ACT. Synthetic QPNs
+            // are local to each endpoint, so the ACT TX lane can reuse the same
+            // qpn value on this port.
+            MaybeReleaseRoceRxQp_(hasTransportQpKey, transportQpKey, roceIngressDeviceIndex);
             Address ackDest = from;
             uint64_t acksize = acklen;
             uint32_t ackTag  = tag;
@@ -383,7 +387,6 @@ sendflowclient::ProcessThreePhasePayload_(Ptr<Packet> p,
             m_dataPacketsExpected.erase(flowKey);
             m_dataPacketsReceived.erase(flowKey);
             m_deliveredDataFragmentIds.erase(flowKey);
-            MaybeReleaseRoceRxQp_(hasTransportQpKey, transportQpKey, roceIngressDeviceIndex);
         }
     } else {
         NS_LOG_WARN("{tag,src,dst}= " << tag<<"  "<<src<<" "<<dst << ": Received DATA packet without expected count setup.");

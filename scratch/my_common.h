@@ -47,6 +47,8 @@
 #include <sstream>
 #include <fstream>
 #include <cmath>
+#include <limits>
+#include <set>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <cerrno>
@@ -101,6 +103,19 @@ std::vector<Ptr<MinHopBridgeNetDevice>> TestSwitchDevices;
 
 std::vector<Ptr<MinHopBridgeNetDevice>> SubNetDevices;
 std::vector<Ptr<MinHopBridgeNetDevice>> ExternalBridgeDevices;
+std::vector<Ptr<MinHopBridgeNetDevice>> ExternalSwitchDevices;
+
+struct ExternalTopologySpec
+{
+    uint32_t gpuCount = 0;
+    uint32_t switchCount = 0;
+    std::vector<std::pair<uint32_t, uint32_t>> externalLinks;
+    std::vector<std::pair<uint32_t, uint32_t>> internalLinks;
+    std::vector<uint32_t> internalComponent;
+};
+
+std::string external_topology_file;
+ExternalTopologySpec g_externalTopologySpec;
 
 struct GpuExternalIoLayout
 {
@@ -269,17 +284,10 @@ InstallGpuWarmupClients(NodeContainer& nodes, uint32_t gpuCount)
         #endif
 
         const GpuExternalIoLayout& ioLayout = GetGpuExternalIoLayout(i);
-        std::vector<uint32_t> warmupIfIndices = ioLayout.externalRailIfIndices;
-        if (warmupIfIndices.empty())
-        {
-            warmupIfIndices.push_back(ioLayout.innerBridgeIfIndex);
-        }
-
-        for (uint32_t ifIndex : warmupIfIndices)
-        {
+        auto installWarmupClient = [&](uint32_t ifIndex, Mac48Address dstMac) {
             PacketSocketAddress clientSocketAddr;
             clientSocketAddr.SetSingleDevice(ifIndex);
-            clientSocketAddr.SetPhysicalAddress(ioLayout.endpointMac);
+            clientSocketAddr.SetPhysicalAddress(dstMac);
             clientSocketAddr.SetProtocol(customEtherType);
 
             Ptr<HopCountClient> client = CreateObject<HopCountClient>();
@@ -293,6 +301,23 @@ InstallGpuWarmupClients(NodeContainer& nodes, uint32_t gpuCount)
             ApplicationContainer clientApps(client);
             clientApps.Start(Seconds(startTime));
             clientApps.Stop(Seconds(GetEffectiveFloodTime()-1));
+        };
+
+        for (uint32_t ifIndex : ioLayout.externalRailIfIndices)
+        {
+            installWarmupClient(ifIndex, ioLayout.endpointMac);
+        }
+
+        Ptr<MinHopBridgeNetDevice> innerBridge =
+            DynamicCast<MinHopBridgeNetDevice>(ioLayout.innerBridge);
+        if (innerBridge != nullptr && innerBridge->GetNBridgePorts() > 0)
+        {
+            installWarmupClient(ioLayout.innerBridgeIfIndex,
+                                Mac48Address::GetBroadcast());
+        }
+        else if (ioLayout.externalRailIfIndices.empty())
+        {
+            installWarmupClient(ioLayout.innerBridgeIfIndex, ioLayout.endpointMac);
         }
     }
 }
@@ -420,6 +445,257 @@ GetEffectiveFloodTime()
     return std::max(1, effective_floadtime);
 }
 
+static inline bool
+ExternalTopologyIsGpu(const ExternalTopologySpec& spec, uint32_t nodeId)
+{
+    return nodeId < spec.gpuCount;
+}
+
+static inline bool
+ExternalTopologyIsSwitch(const ExternalTopologySpec& spec, uint32_t nodeId)
+{
+    return nodeId >= spec.gpuCount && nodeId < spec.gpuCount + spec.switchCount;
+}
+
+static inline uint32_t
+ExternalTopologySwitchIndex(const ExternalTopologySpec& spec, uint32_t nodeId)
+{
+    return nodeId - spec.gpuCount;
+}
+
+static inline std::pair<uint32_t, uint32_t>
+NormalizeUndirectedEdge(uint32_t a, uint32_t b)
+{
+    return std::make_pair(std::min(a, b), std::max(a, b));
+}
+
+static inline bool
+ReadExternalTopologyUint(std::istream& in,
+                         const std::string& fieldName,
+                         uint32_t& out,
+                         std::string& error)
+{
+    long long value = -1;
+    if (!(in >> value))
+    {
+        error = "missing or invalid integer field: " + fieldName;
+        return false;
+    }
+    if (value < 0 ||
+        static_cast<unsigned long long>(value) >
+            static_cast<unsigned long long>(std::numeric_limits<uint32_t>::max()))
+    {
+        error = "integer field out of uint32 range: " + fieldName;
+        return false;
+    }
+    out = static_cast<uint32_t>(value);
+    return true;
+}
+
+static inline void
+BuildExternalTopologyInternalComponents(ExternalTopologySpec& spec)
+{
+    spec.internalComponent.clear();
+    spec.internalComponent.resize(spec.gpuCount);
+    for (uint32_t i = 0; i < spec.gpuCount; ++i)
+    {
+        spec.internalComponent[i] = i;
+    }
+
+    auto findRoot = [&](uint32_t x) {
+        while (spec.internalComponent[x] != x)
+        {
+            spec.internalComponent[x] =
+                spec.internalComponent[spec.internalComponent[x]];
+            x = spec.internalComponent[x];
+        }
+        return x;
+    };
+
+    auto unite = [&](uint32_t a, uint32_t b) {
+        uint32_t ra = findRoot(a);
+        uint32_t rb = findRoot(b);
+        if (ra != rb)
+        {
+            spec.internalComponent[rb] = ra;
+        }
+    };
+
+    for (const auto& link : spec.internalLinks)
+    {
+        unite(link.first, link.second);
+    }
+
+    for (uint32_t i = 0; i < spec.gpuCount; ++i)
+    {
+        spec.internalComponent[i] = findRoot(i);
+    }
+}
+
+static inline bool
+ParseExternalTopologyFile(const std::string& path,
+                          ExternalTopologySpec& spec,
+                          std::string& error)
+{
+    spec = ExternalTopologySpec();
+
+    std::ifstream in(path);
+    if (!in)
+    {
+        error = "cannot open external topology file: " + path;
+        return false;
+    }
+
+    if (!ReadExternalTopologyUint(in, "N", spec.gpuCount, error) ||
+        !ReadExternalTopologyUint(in, "M", spec.switchCount, error))
+    {
+        return false;
+    }
+    if (spec.gpuCount == 0)
+    {
+        error = "external topology requires N > 0";
+        return false;
+    }
+
+    const uint64_t totalNodes =
+        static_cast<uint64_t>(spec.gpuCount) + static_cast<uint64_t>(spec.switchCount);
+    if (totalNodes > std::numeric_limits<uint32_t>::max())
+    {
+        error = "external topology N + M exceeds uint32 range";
+        return false;
+    }
+
+    auto validateEndpoint = [&](uint32_t nodeId, const std::string& label) {
+        if (nodeId >= totalNodes)
+        {
+            error = "edge endpoint out of range in " + label + ": " +
+                    std::to_string(nodeId);
+            return false;
+        }
+        return true;
+    };
+
+    uint32_t externalLinkCount = 0;
+    if (!ReadExternalTopologyUint(in, "K", externalLinkCount, error))
+    {
+        return false;
+    }
+    spec.externalLinks.reserve(externalLinkCount);
+    std::set<std::pair<uint32_t, uint32_t>> externalSeen;
+    for (uint32_t i = 0; i < externalLinkCount; ++i)
+    {
+        uint32_t a = 0;
+        uint32_t b = 0;
+        const std::string label = "external link " + std::to_string(i);
+        if (!ReadExternalTopologyUint(in, label + " Q", a, error) ||
+            !ReadExternalTopologyUint(in, label + " P", b, error))
+        {
+            return false;
+        }
+        if (!validateEndpoint(a, label) || !validateEndpoint(b, label))
+        {
+            return false;
+        }
+        if (a == b)
+        {
+            error = "self-loop is illegal in " + label + ": " + std::to_string(a);
+            return false;
+        }
+        if (ExternalTopologyIsGpu(spec, a) && ExternalTopologyIsGpu(spec, b))
+        {
+            error = "GPU-GPU edge is illegal in external-link section: " +
+                    std::to_string(a) + " " + std::to_string(b);
+            return false;
+        }
+        const auto normalized = NormalizeUndirectedEdge(a, b);
+        if (!externalSeen.insert(normalized).second)
+        {
+            error = "duplicate undirected edge in external-link section: " +
+                    std::to_string(a) + " " + std::to_string(b);
+            return false;
+        }
+        spec.externalLinks.emplace_back(a, b);
+    }
+
+    uint32_t internalLinkCount = 0;
+    if (!ReadExternalTopologyUint(in, "V", internalLinkCount, error))
+    {
+        return false;
+    }
+    spec.internalLinks.reserve(internalLinkCount);
+    std::set<std::pair<uint32_t, uint32_t>> internalSeen;
+    for (uint32_t i = 0; i < internalLinkCount; ++i)
+    {
+        uint32_t a = 0;
+        uint32_t b = 0;
+        const std::string label = "internal link " + std::to_string(i);
+        if (!ReadExternalTopologyUint(in, label + " Q", a, error) ||
+            !ReadExternalTopologyUint(in, label + " P", b, error))
+        {
+            return false;
+        }
+        if (!validateEndpoint(a, label) || !validateEndpoint(b, label))
+        {
+            return false;
+        }
+        if (a == b)
+        {
+            error = "self-loop is illegal in " + label + ": " + std::to_string(a);
+            return false;
+        }
+        if (!ExternalTopologyIsGpu(spec, a) || !ExternalTopologyIsGpu(spec, b))
+        {
+            error = "non-GPU endpoint is illegal in internal-link section: " +
+                    std::to_string(a) + " " + std::to_string(b);
+            return false;
+        }
+        const auto normalized = NormalizeUndirectedEdge(a, b);
+        if (!internalSeen.insert(normalized).second)
+        {
+            error = "duplicate undirected edge in internal-link section: " +
+                    std::to_string(a) + " " + std::to_string(b);
+            return false;
+        }
+        spec.internalLinks.emplace_back(a, b);
+    }
+
+    if (static_cast<uint64_t>(externalLinkCount) +
+            static_cast<uint64_t>(internalLinkCount) >
+        std::numeric_limits<uint32_t>::max())
+    {
+        error = "external topology K + V exceeds uint32 range";
+        return false;
+    }
+
+    in >> std::ws;
+    if (!in.eof())
+    {
+        error = "extra non-whitespace content after expected external topology content";
+        return false;
+    }
+
+    BuildExternalTopologyInternalComponents(spec);
+    return true;
+}
+
+static inline bool
+IsExternalTopologyInternalPair(int src, int dst)
+{
+    if (src < 0 || dst < 0)
+    {
+        return false;
+    }
+    const uint32_t s = static_cast<uint32_t>(src);
+    const uint32_t d = static_cast<uint32_t>(dst);
+    if (s >= g_externalTopologySpec.internalComponent.size() ||
+        d >= g_externalTopologySpec.internalComponent.size())
+    {
+        return false;
+    }
+    return g_externalTopologySpec.internalComponent[s] ==
+           g_externalTopologySpec.internalComponent[d];
+}
+
 struct RoceAckTimeoutPathBudget
 {
     uint32_t oneWayLinks = 0;
@@ -531,6 +807,12 @@ GetWorstCaseRocePathBudget()
         return {2, 1};
     case 5: // HPN (2-tier, dual-plane): host-tor-agg-tor-host
         return {4, 3};
+    case 6: // External topology: arbitrary graph; use max_jump as a conservative budget.
+    {
+        const uint32_t links = std::max<uint32_t>(1, static_cast<uint32_t>(std::max(1, max_jump)));
+        const uint32_t switches = links > 0 ? links - 1 : 0;
+        return {links, switches};
+    }
     default:
         return {6, 5};
     }
@@ -608,6 +890,27 @@ DirnameOnly(const std::string& path)
     return (pos == std::string::npos) ? "" : path.substr(0, pos);
 }
 
+static inline bool
+IsAbsolutePath(const std::string& path)
+{
+    return !path.empty() && path.front() == '/';
+}
+
+static inline std::string
+ResolvePathRelativeToFile(const std::string& path, const std::string& baseFile)
+{
+    if (path.empty() || IsAbsolutePath(path))
+    {
+        return path;
+    }
+    const std::string baseDir = DirnameOnly(baseFile);
+    if (baseDir.empty())
+    {
+        return path;
+    }
+    return JoinPath(baseDir, path);
+}
+
 static inline std::string
 SanitizeDirToken(std::string s)
 {
@@ -656,6 +959,8 @@ TopologyModelName(uint32_t model)
         return "test";
     case 5:
         return "hpn";
+    case 6:
+        return "external";
     default:
         return "unknown";
     }
@@ -685,6 +990,12 @@ BuildMacTableScenarioTag()
         break;
     case 5:
         oss << "_tor-per-plane-" << k_all << "_host-per-tor-" << hostperleaf;
+        break;
+    case 6:
+        oss << "_gpus-" << numGPUs
+            << "_switches-" << switch_num
+            << "_extlinks-" << g_externalTopologySpec.externalLinks.size()
+            << "_intlinks-" << g_externalTopologySpec.internalLinks.size();
         break;
     default:
         break;
@@ -936,6 +1247,7 @@ CollectAllBridgeDevices()
     AppendBridgeVectorUnique(TorusDevices, devices);
     AppendBridgeVectorUnique(FullmeshDevices, devices);
     AppendBridgeVectorUnique(TestSwitchDevices, devices);
+    AppendBridgeVectorUnique(ExternalSwitchDevices, devices);
     AppendBridgeVectorUnique(SubNetDevices, devices);
     AppendBridgeVectorUnique(ExternalBridgeDevices, devices);
     return devices;
@@ -1073,7 +1385,7 @@ bool ReadConf(std::string network_conf)
     if (JHas(top,"model")) {
       if (top["model"].is_number_integer()) {
         int v = top["model"].get<int>();
-        if (v>=0 && v<=5) return v;
+        if (v>=0 && v<=6) return v;
       } else if (top["model"].is_string()) {
         std::string s = top["model"].get<std::string>(); 
         for (auto& c:s) c=(char)std::tolower((unsigned char)c);
@@ -1083,6 +1395,7 @@ bool ReadConf(std::string network_conf)
         if (s=="torus")    return 3;
         if (s=="test")     return 4;
         if (s=="hpn")      return 5;
+        if (s=="external" || s=="file") return 6;
       }
     }
     return 0; // 默认 FatTree
@@ -1199,9 +1512,47 @@ bool ReadConf(std::string network_conf)
   auto effective_floadtime_bak  = effective_floadtime;
   auto pfc_high_watermark_bak   = pfc_high_watermark;
   auto pfc_low_watermark_bak    = pfc_low_watermark;
+  auto external_topology_file_bak = external_topology_file;
+  auto external_topology_spec_bak = g_externalTopologySpec;
   bool mactable_load_switch_seen = false;
   bool mactable_dump_switch_seen = false;
   bool legacy_dump_enable_value = mactable_dump_enable;
+
+  auto RollbackConfig = [&]() {
+    gpu_type = gpu_type_bak;
+    gpus_per_server = gpus_per_server_bak;
+    nvswitch_per_server = nvswitch_per_server_bak;
+    ecmpmodel = ecmpmodel_bak;
+    max_jump = max_jump_bak;
+    floadtime = floadtime_bak;
+    m_mtu = m_mtu_bak;
+    normallink_rate = normallink_rate_bak;
+    nvlink_rate = nvlink_rate_bak;
+    normallink_delay = normallink_delay_bak;
+    nvlink_delay = nvlink_delay_bak;
+    DropTailQueue_size = DropTailQueue_size_bak;
+    DropTailQueue_num = DropTailQueue_num_bak;
+    Topology_model = Topology_model_bak;
+    k_fattree = k_bak;
+    k_clos = k_bak;
+    hostperleaf = hostperleaf_bak;
+    k_mesh = k_bak;
+    k_torus = k_bak;
+    k_test = k_bak;
+    g_roce_cfg = roce_cfg_bak;
+    g_pfcLogLevel = pfc_log_level_bak;
+    g_pfcHighWatermark = pfc_high_global_bak;
+    g_pfcLowWatermark = pfc_low_global_bak;
+    mactable_load_enable = mactable_load_enable_bak;
+    mactable_dump_enable = mactable_dump_enable_bak;
+    mactable_load_dir = mactable_load_dir_bak;
+    mactable_dump_dir = mactable_dump_dir_bak;
+    effective_floadtime = effective_floadtime_bak;
+    pfc_high_watermark = pfc_high_watermark_bak;
+    pfc_low_watermark = pfc_low_watermark_bak;
+    external_topology_file = external_topology_file_bak;
+    g_externalTopologySpec = external_topology_spec_bak;
+  };
 
 
   // ---------- 1) 顶层通用 ----------
@@ -1402,6 +1753,7 @@ bool ReadConf(std::string network_conf)
     if (JHas(top,"subnet_model"))   subnet_model   = top["subnet_model"].get<int>();
     if (JHas(top,"subnet_k"))   subnet_k   = top["subnet_k"].get<int>();
     if (JHas(top,"hostperleaf")) hostperleaf = top["hostperleaf"].get<int>();
+    if (JHas(top,"file")) external_topology_file = top["file"].get<std::string>();
     if (JHas(top,"switch_delay_ns_override"))
       switch_delay_override = top["switch_delay_ns_override"].is_null() ? 0ULL
                                  : top["switch_delay_ns_override"].get<uint64_t>();
@@ -1509,28 +1861,42 @@ bool ReadConf(std::string network_conf)
       switch_delay = switch_delay_override ? switch_delay_override : 100; // ns
     } break;
 
+    case 6: { // External topology v1
+      if (external_topology_file.empty()) {
+        std::cerr << "[Config] topology.model=external requires topology.file\n";
+        RollbackConfig();
+        return false;
+      }
+
+      ExternalTopologySpec parsedSpec;
+      std::string parseError;
+      if (!ParseExternalTopologyFile(external_topology_file, parsedSpec, parseError)) {
+        std::cerr << "[Config] external topology parse failed: " << parseError << "\n";
+        RollbackConfig();
+        return false;
+      }
+
+      g_externalTopologySpec = parsedSpec;
+      numGPUs = g_externalTopologySpec.gpuCount;
+      numHosts = numGPUs;
+      switch_num = g_externalTopologySpec.switchCount;
+      link_num = static_cast<uint32_t>(g_externalTopologySpec.externalLinks.size() +
+                                       g_externalTopologySpec.internalLinks.size());
+
+      // Keep the current scratch Astra frontend's logical nvswitch numbering
+      // convention intact. The external topology file itself still only defines
+      // GPU and switch nodes; no extra physical nvswitch links are generated here.
+      gpus_per_server = 1;
+      nvswitch_per_server = 1;
+      nvswitch_num = numGPUs;
+      node_num = numGPUs + switch_num + nvswitch_num;
+
+      switch_delay = switch_delay_override ? switch_delay_override : 100; // ns
+    } break;
+
     default: {
       std::cerr << "[Config] unknown Topology_model: " << Topology_model << "\n";
-      // 回滚备份
-      gpu_type = gpu_type_bak; gpus_per_server = gpus_per_server_bak; nvswitch_per_server = nvswitch_per_server_bak;
-      ecmpmodel = ecmpmodel_bak; max_jump = max_jump_bak; floadtime = floadtime_bak; m_mtu = m_mtu_bak;
-      normallink_rate = normallink_rate_bak; nvlink_rate = nvlink_rate_bak;
-      normallink_delay = normallink_delay_bak; nvlink_delay = nvlink_delay_bak;
-      DropTailQueue_size = DropTailQueue_size_bak; DropTailQueue_num = DropTailQueue_num_bak;
-      Topology_model = Topology_model_bak;
-      k_fattree = k_bak; k_clos = k_bak; hostperleaf = hostperleaf_bak;
-      k_mesh = k_bak; k_torus = k_bak; k_test = k_bak;
-      g_roce_cfg = roce_cfg_bak;
-      g_pfcLogLevel = pfc_log_level_bak;
-      g_pfcHighWatermark = pfc_high_global_bak;
-      g_pfcLowWatermark = pfc_low_global_bak;
-      mactable_load_enable = mactable_load_enable_bak;
-      mactable_dump_enable = mactable_dump_enable_bak;
-      mactable_load_dir = mactable_load_dir_bak;
-      mactable_dump_dir = mactable_dump_dir_bak;
-      effective_floadtime = effective_floadtime_bak;
-      pfc_high_watermark = pfc_high_watermark_bak;
-      pfc_low_watermark = pfc_low_watermark_bak;
+      RollbackConfig();
       return false;
     }
   }
@@ -1613,7 +1979,7 @@ void SetConfig(){
     g_pfcHighWatermark = pfc_high_watermark;
     g_pfcLowWatermark = pfc_low_watermark;
 
-    Topology_model=0;//0--FatTree;1--Clos;2--FullMesh;3--Torus;4--Test;5--HPN
+    Topology_model=0;//0--FatTree;1--Clos;2--FullMesh;3--Torus;4--Test;5--HPN;6--External
     subnet_model=0;//0--nosubnet;1--nvswitch;2--FullMesh;3--Torus;
     subnet_k=4;
     //-----------------subnet_set----------------
@@ -2176,16 +2542,6 @@ void SetupNetwork(){
 
     // HPN (2-tier dual-plane + non-stacked dual-ToR)
     if (Topology_model==5){
-        NS_LOG_INFO("[HPN][BUILD] begin"
-                    << " torPerPlane=" << k_all
-                    << " aggPerPlane=" << k_all
-                    << " hostPerTor=" << hostperleaf
-                    << " gpusPerServer=" << gpus_per_server
-                    << " totalHosts=" << numHosts
-                    << " totalGpus=" << numGPUs
-                    << " switchDelayNs=" << switch_delay
-                    << " linkRate=" << normallink_rate
-                    << " linkDelay=" << normallink_delay);
         NodeContainer AggSwitchs;
         AggSwitchs.Create(numSpine);
         NodeContainer TorSwitchs;
@@ -2376,6 +2732,129 @@ void SetupNetwork(){
         InstallGpuWarmupClients(hosts, numGPUs);
         InstallGpuSendFlowApps(hosts, numGPUs);
     }
+
+    // External topology v1: the file defines only physical connectivity.
+    // GPU endpoint components are still created through the standard
+    // innerBridge/externalBridge path.
+    if (Topology_model==6){
+        const ExternalTopologySpec& spec = g_externalTopologySpec;
+        NodeContainer hosts;
+        hosts.Create(numGPUs);
+        NodeContainer switches;
+        switches.Create(switch_num);
+
+        #ifdef NS3_MPI
+        uint32_t numRanks = MpiInterface::GetSize();
+        for (uint32_t i = 0; i < numGPUs; ++i) {
+            hosts.Get(i)->SetSystemId(i % numRanks);
+        }
+        for (uint32_t i = 0; i < switch_num; ++i) {
+            switches.Get(i)->SetSystemId(i % numRanks);
+        }
+        #endif
+
+        for (uint32_t i = 0; i < numGPUs; ++i) {
+            Ptr<Node> gpuNode = hosts.Get(i);
+            Ptr<MinHopBridgeNetDevice> innerBridge =
+                CreateGpuSubnetBridge(gpuNode, max_jump);
+            innerBridge->SetAddress(Mac48Address::Allocate());
+            SubNetDevices.push_back(innerBridge);
+
+            Ptr<MinHopBridgeNetDevice> externalBridge =
+                CreateGpuExternalBridge(gpuNode);
+            externalBridge->SetAddress(Mac48Address::Allocate());
+            ExternalBridgeDevices.push_back(externalBridge);
+
+            GpuExternalIoLayout& ioLayout = EnsureGpuExternalIoLayout(i);
+            ioLayout.innerBridgeIfIndex = innerBridge->GetIfIndex();
+            ioLayout.externalBridgeIfIndex = externalBridge->GetIfIndex();
+            ioLayout.externalRailIfIndices.clear();
+            ioLayout.innerBridge = innerBridge;
+            ioLayout.externalBridge = externalBridge;
+        }
+
+        for (uint32_t i = 0; i < switch_num; ++i) {
+            Ptr<MinHopBridgeNetDevice> dev = CreateObject<MinHopBridgeNetDevice>();
+            dev->set_maxjump(max_jump);
+            dev->set_ecmp_model(ecmpmodel);
+            dev->Set_switchDelay(NanoSeconds(switch_delay));
+            dev->SetMtu(m_mtu);
+            dev->SetAddress(Mac48Address::Allocate());
+            ApplyBridgePfcWatermarks(dev);
+            switches.Get(i)->AddDevice(dev);
+            ExternalSwitchDevices.push_back(dev);
+        }
+
+        PointToPointHelper normalHelper;
+        normalHelper.SetDeviceAttribute("DataRate", StringValue(normallink_rate));
+        normalHelper.SetChannelAttribute("Delay", StringValue(normallink_delay));
+        normalHelper.SetQueue("ns3::PppRoundRobinQueue",
+                              "MaxPacketsPerQueue", StringValue(DropTailQueue_size),
+                              "NumQueues", StringValue(DropTailQueue_num));
+        normalHelper.SetDeviceAttribute("Mtu", UintegerValue(m_mtu));
+
+        PointToPointHelper nvlinkHelper;
+        nvlinkHelper.SetDeviceAttribute("DataRate", StringValue(nvlink_rate));
+        nvlinkHelper.SetChannelAttribute("Delay", StringValue(nvlink_delay));
+        nvlinkHelper.SetQueue("ns3::PppRoundRobinQueue",
+                              "MaxPacketsPerQueue", StringValue(DropTailQueue_size),
+                              "NumQueues", StringValue(DropTailQueue_num));
+        nvlinkHelper.SetDeviceAttribute("Mtu", UintegerValue(m_mtu));
+
+        auto getExternalNode = [&](uint32_t nodeId) -> Ptr<Node> {
+            if (ExternalTopologyIsGpu(spec, nodeId)) {
+                return hosts.Get(nodeId);
+            }
+            return switches.Get(ExternalTopologySwitchIndex(spec, nodeId));
+        };
+
+        auto attachExternalPort = [&](uint32_t nodeId, const Ptr<NetDevice>& dev) {
+            if (ExternalTopologyIsGpu(spec, nodeId)) {
+                const uint32_t gpuId = nodeId;
+                ExternalBridgeDevices[gpuId]->AddBridgePort(dev);
+                GpuExternalIoLayout& ioLayout = EnsureGpuExternalIoLayout(gpuId);
+                ioLayout.externalRailIfIndices.push_back(dev->GetIfIndex());
+            } else {
+                const uint32_t switchIndex = ExternalTopologySwitchIndex(spec, nodeId);
+                ExternalSwitchDevices[switchIndex]->AddBridgePort(dev);
+            }
+        };
+
+        for (const auto& linkSpec : spec.externalLinks) {
+            const uint32_t a = linkSpec.first;
+            const uint32_t b = linkSpec.second;
+            NodeContainer link(getExternalNode(a), getExternalNode(b));
+            NetDeviceContainer devs = normalHelper.Install(link);
+            attachExternalPort(a, devs.Get(0));
+            attachExternalPort(b, devs.Get(1));
+        }
+
+        for (const auto& linkSpec : spec.internalLinks) {
+            const uint32_t a = linkSpec.first;
+            const uint32_t b = linkSpec.second;
+            NodeContainer link(hosts.Get(a), hosts.Get(b));
+            NetDeviceContainer devs = nvlinkHelper.Install(link);
+            SubNetDevices[a]->AddBridgePort(devs.Get(0));
+            SubNetDevices[b]->AddBridgePort(devs.Get(1));
+        }
+
+        for (uint32_t gpuindex = 0; gpuindex < numGPUs; ++gpuindex) {
+            NormalizeGpuMacsToBridge(hosts.Get(gpuindex), SubNetDevices[gpuindex]);
+        }
+        FinalizeAllGpuEndpointMacsFromInnerBridge(numGPUs);
+
+        NS_LOG_INFO("[EXTERNAL_TOPO][BUILD]"
+                    << " file=" << external_topology_file
+                    << " gpus=" << numGPUs
+                    << " switches=" << switch_num
+                    << " externalLinks=" << spec.externalLinks.size()
+                    << " internalLinks=" << spec.internalLinks.size());
+
+        PacketSocketHelper packetSocketHelper;
+        packetSocketHelper.Install(hosts);
+        InstallGpuWarmupClients(hosts, numGPUs);
+        InstallGpuSendFlowApps(hosts, numGPUs);
+    }
     
     //fullmesh和torus改了没测试过
     //fullmesh
@@ -2552,7 +3031,7 @@ void SetupNetwork(){
 
 void printlearnstate(){
     NS_LOG_INFO("--------- 打印所有 主机 的地址 ---------");
-    if (Topology_model==0 or Topology_model==1 or Topology_model==5){
+    if (Topology_model==0 or Topology_model==1 or Topology_model==5 or Topology_model==6){
         for (auto dev : SubNetDevices) dev->Print_LocalMacAddress();
     }
 
@@ -2571,6 +3050,10 @@ void printlearnstate(){
     if (Topology_model==5){//HPN
         for (auto dev : SpineDevices) dev->PrintLearnedState();
         for (auto dev : LeafDevices) dev->PrintLearnedState();
+        for (auto dev : ExternalBridgeDevices) dev->PrintLearnedState();
+    }
+    if (Topology_model==6){//External
+        for (auto dev : ExternalSwitchDevices) dev->PrintLearnedState();
         for (auto dev : ExternalBridgeDevices) dev->PrintLearnedState();
     }
     if (Topology_model==2){//FullMesh

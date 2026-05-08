@@ -62,6 +62,10 @@ extern uint32_t numHosts,gpus_per_server,Topology_model;
 
 ns3::FlowSendMode check_out_or_iner(int src,int dst){//0表示在外部，1表示内部,3表示显示制定nvswitch,4表示无条件送原地址,5表示送本地交换机
   if (Topology_model==2 or Topology_model==3) return FlowSendMode::Internal;
+  if (Topology_model==6) {
+    return IsExternalTopologyInternalPair(src, dst) ? FlowSendMode::Internal
+                                                   : FlowSendMode::External;
+  }
   if (src>numHosts or dst>numHosts) return FlowSendMode::External;//疑似错误源目，无条件外送
   else if (src/gpus_per_server == dst/gpus_per_server) return FlowSendMode::Internal;
        else return FlowSendMode::External;
