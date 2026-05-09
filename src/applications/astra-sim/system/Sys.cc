@@ -32,7 +32,9 @@ LICENSE file in the root directory of this source tree.
 
 #include <algorithm>
 #include <cmath>
+#include <fstream>
 #include <numeric>
+#include <string>
 
 MockNccl::MockNcclGroup* GlobalGroup = nullptr;
 
@@ -88,16 +90,21 @@ Sys::~Sys() {
   for (auto ci : all_to_all_implementation_per_dimension) {
     delete ci;
   }
-  if (scheduler_unit != nullptr)
+  if (scheduler_unit != nullptr) {
     delete scheduler_unit;
-  if (vLevels != nullptr)
+  }
+  if (vLevels != nullptr) {
     delete vLevels;
-  if (memBus != nullptr)
+  }
+  if (memBus != nullptr) {
     delete memBus;
-  if (workload != nullptr)
+  }
+  if (workload != nullptr) {
     delete workload;
-  if (offline_greedy != nullptr)
+  }
+  if (offline_greedy != nullptr) {
     delete offline_greedy;
+  }
   bool shouldExit = true;
   
   for(int i = 0; i < num_gpus; ++ i) {
@@ -2174,8 +2181,8 @@ void Sys::handleEvent(void* arg) {
             node->pending_sends[std::make_pair(sendhd->receiverNodeId, sendhd->tag)]
                 .size() == 0) {
 
-      node->is_there_pending_sends[std::make_pair(
-          sendhd->receiverNodeId, sendhd->tag)] = false;
+      node->is_there_pending_sends.erase(
+          std::make_pair(sendhd->receiverNodeId, sendhd->tag));
       
       if(node->event_queue.find(Sys::boostedTick())==node->event_queue.end())
         if ((node->finished_workloads == 1 && node->event_queue.size() == 0 && node->pending_sends.size() == 0) ||

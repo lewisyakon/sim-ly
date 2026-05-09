@@ -1,163 +1,150 @@
 # RoCE 当前状态
 
-这份文档只回答四个问题：
+最近修改：2026-04-23
 
-1. 当前分支里的 RoCE 到底已经做了什么
-2. 最近一次真实运行验证了什么
-3. 当前还缺什么
-4. 为什么调度改造先停在这里
+记录时间：2026-04-23
 
-## 1. 当前版本已经完成的内容
+这份文档只回答当前工作区里 RoCE 实现已经做到哪一步，以及最近一次本地日志能证明什么。过往阶段性计划请不要从这里反推当前状态。
 
-当前分支的定位是：
+## 1. 当前版本的准确定位
 
-- `Astra-Sim + 3P` 仍然是主业务流程
-- RoCE 作为旁路语义层接入
-- `ACT` 已明确回归为纯业务控制报文
-- `RoCE enable` 时，发送入口已改成：
-  - 先入 `RoceTxScheduler`
-  - 再按 QP / 类别调度出网
+当前版本已经完成本轮 RoCE 主路径解耦：
 
-当前已经具备：
+1. `sendflowclient`
+   - Astra-Sim facade
+   - 3P 业务语义
+   - 负责把上层业务请求交给 RoCE transport/port 层
 
-1. 轻量 `QP / QPN / PSN / opcode / user phase`
-2. per-QP work queue
-3. 控制类优先
-4. 数据类按活跃 QP 轮询
-5. DATA 逐 slice 出网
-6. transport ACK
-7. 每 QP 在途窗口 `transportWindowPackets`
-8. 每 QP 一个 oldest-unacked 定时器
-9. recovery 模式
-10. ACK 高优先级
-11. bounded reorder window 与 overflow 处理
-12. ACK 侧带累计确认语义
-13. 接收侧 future packet 的缓冲与按序释放
-14. 自动 ACK timeout 基线推导
+2. `RoceTransportEngine`
+   - 逻辑层
+   - `flow/lane -> qpn`
+   - `REQUEST / DATA / ACT -> opcode / txClass`
+   - 不负责 packet、ACK、重传和 port 调度
 
-## 2. 最近一次讨论后已经定死的口径
+3. `RdmaPortEngine`
+   - port-bound RoCE runtime
+   - `QP / SQ / RQ / CQ` 的最小运行时模型
+   - packetize、ACK、retransmission、reorder
+   - pause-aware 端口准入和 per-qid inflight 限制
 
-这一轮讨论后，下面这些边界已经固定：
+4. GPU 端点 bridge 模型
+   - `innerBridge + optional externalBridge`
+   - 外侧 bridge 可启用 `TerminalLearningOnly`
+   - 只学表、不承担 transit 转发
 
-1. 对外只讲 `SEND + WRITE`
-   - `READ` 可以继续留在枚举和代码入口里，但不再作为对外能力表述
-2. `ACT` 继续只是业务控制报文
-   - 不再回到 transport ACK 语义
-3. `post_send / post_recv` 是本地动作
-   - 不是网络中的“post 包”
-4. QP 的目标结构应显式包含 `SQ / RQ / CQ`
-   - 当前代码还没有做到这一点
-5. legacy 与 RoCE 的字节口径不同
-   - legacy：`datasize = 以太网 payload 总预算`
-   - RoCE：每包真实额外开销只扣可见 RoCE 头，其他仿真控制信息仍隐藏在业务区里
-6. ACK / 重传 / 有限乱序窗口属于 RoCE 层，不再推给底层以太网层
+也就是说，当前 RoCE 主路径已经不再依赖旧的 `sendflowclient` 内部 fallback。真正的 packet runtime 已经下沉到挂在 `PointToPointNetDevice` 上的 `RdmaPortEngine`。
 
-## 3. 最近一次真实运行结论
+## 2. 当前已经完成的内容
 
-使用：
+当前代码里可以直接确认的能力包括：
+
+1. `REQUEST / DATA / ACT` 三条逻辑 lane
+2. `flow + lane -> qpn`
+3. port-bound `QpRuntime`
+4. 最小 `SQ`
+5. 最小 `RQ`
+6. 最小 `CQ`
+7. `Control > Data` 调度
+8. send-side packetization
+9. `RoceSimHeader` 生成
+10. 按 opcode 计算可见 RoCE 头开销
+11. RX reorder buffer
+12. transport ACK
+13. ACK retire outstanding
+14. per-QP retransmission timer
+15. pending retransmission / recovery
+16. 真正重发成功时才 `retry++`
+17. pause-aware 发送准入
+18. per-qid inflight packet 限制
+19. send/recv completion 记录
+20. QP 空闲后的 runtime 状态释放
+21. `innerBridge + externalBridge` 端点布局
+22. 外侧 bridge 的 `TerminalLearningOnly` 行为
+23. `FlowIo` 与 bridge/PFC 的本地 pause 映射
+
+对应的主要代码位置是：
+
+- [rdma-port-engine.h](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/model/rdma-port-engine.h)
+- [rdma-port-engine.cc](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/model/rdma-port-engine.cc)
+- [roce-transport-engine.cc](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/model/roce-transport-engine.cc)
+- [roce-sim-header.cc](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/model/roce-sim-header.cc)
+
+## 3. 最新真实验证
+
+当前仓里最近一次小模型 `ROCE=true` 运行使用的是：
 
 - [config.json](/home/lja/sim-ly/sim-ly/simconfig/config.json)
 - [microAllReduce.txt](/home/lja/sim-ly/sim-ly/simworkload/microAllReduce.txt)
+- [simulation.log](/home/lja/sim-ly/sim-ly/simulation.log)
 
-最近一次真实运行的结论是：
+这次日志降级后，不再打印完整 `FLOW_TX_DONE / FLOW_RX_DONE` 明细；因此这里不再沿用旧文档里的 `TX_DONE=48 / RX_DONE=48` 口径。
 
-1. workload 能真实下发发送
-2. `RoCE` 路径真实激活
-3. transport ACK 活跃工作
-4. 没有看到 `RTX_TIMEOUT / RTX_SEND / RTX_DROP`
-5. 全部事务流都完成
+当前日志能直接确认：
 
-这次运行里可直接确认的结果：
+1. `REQ_DONE = 144`
+2. `total send count = 144`
+3. `total events = 1171473`
+4. `last FLOW_TX_DONE since_workload_start(us) = 15562.8`
+5. `network drained since_workload_start(us) = 15563.1`
 
-- `total send count = 192`
-- `total events = 1135708`
-- `ACK_RX = 77760`
-- `ACK_TX = 77760`
-- `REQ_DONE = 192`
-- `RX_DONE = 192`
-- `TX_DONE = 192`
-- `RTX_TIMEOUT = 0`
-- `RTX_SEND = 0`
-- `RTX_DROP = 0`
+对应日志：
 
-这轮现象说明：
+- [simulation.log:1186](/home/lja/sim-ly/sim-ly/simulation.log#L1186)
+- [simulation.log:1187](/home/lja/sim-ly/sim-ly/simulation.log#L1187)
+- [simulation.log:1189](/home/lja/sim-ly/sim-ly/simulation.log#L1189)
+- [simulation.log:1190](/home/lja/sim-ly/sim-ly/simulation.log#L1190)
 
-- 当前 workload + 队列参数下，transport 层已经足够稳定，没有触发 timeout retransmission。
-- 这不能证明“重传路径永远正确”，但能说明当前结构修复后，ACK / 窗口 / 优先级这条链路已经不再自然制造重传风暴。
+同时，当前日志没有搜到这些异常项：
 
-最近进一步把 `transport_window_packets` 提高到接近当前 workload 的“近似一次性发送”上限时，也没有重新出现真实丢包和 retransmission，但总完成时间会明显变长。当前更合理的解释是：
+- `[ROCE][RQ][FULL]`
+- `[ROCE][CQ][OVERFLOW]`
+- `[ROCE][RTX]`
+- `REORDER_OVERFLOW`
+- `flow remap detected`
+- `QP rejected`
+- `opcode mismatch`
+- `phase mismatch`
+- `Callback not found`
+- `without expected count setup`
 
-1. `PFC` 与 external path backpressure 已经能在硬丢包前接住压力
-2. ACK sideband 化后，不会再把反向有序控制流状态机带偏
-3. 更大的 sender window 会提高注入强度，增加排队与 pause/resume 周期
-4. 因此系统现在更像是进入了“无丢包但更高排队/更高回压”的性能区间，而不是再次进入 correctness 失败区间
+因此至少可以确认：
 
-## 4. 最近一轮现象的一个重要解释
+1. 当前小模型上功能闭环是通的。
+2. RoCE 主路径没有在最近的内存探针清理和 CSV 关闭后被打断。
+3. 由于当前日志级别降低，不能再用旧的 TX/RX 逐条明细结论做精确收发计数。
 
-最近把队列长度从 `2000 -> 350 -> 200` 逐步缩小时，仍然没有明显看到新的丢包和重传。
+## 4. 当前保留的简化
 
-当前更合理的解释不是“队列大小完全不重要”，而是：
+当前仍不是完整 verbs 级 RNIC 模型。更准确地说，它是服务网络仿真的 `RC-like` RoCE 近似模型。
 
-1. `transportWindowPackets` 已经对每个 QP 的在途流量形成了强 admission control
-2. ACK 高优先级后，窗口释放更快
-3. ACK sideband 化后，不再被反向 reorder window 卡住
-4. oldest-unacked 单 timer 把早期那种 timeout 风暴切掉了
-5. future packet 不再直接上送业务层，累计 ACK 行为更稳定
-6. external path 现在按下游 RRQ 子队列阈值做 backpressure，不再出现“下游先炸、上游还在塞”的错位
+当前仍保留这些简化：
 
-因此在当前这组 workload 下，更主导整体行为的已经是 transport 层的“类滑动窗口”，而不是设备队列长度本身。
+1. `CQ` 仍是 `QpRuntime` 内的 completion 队列，不是独立对象体系。
+2. completion 目前还没有成为上层完成语义的唯一驱动，`TX_DONE` 仍由 3P 的 `ACT` 闭环触发。
+3. `RQ` 是最小 receive slot 模型，不是完整 `post_recv`/RNR 语义。
+4. `SRQ` 没有实现。
+5. QP bringup 被自动压缩为 `Reset -> Init -> RTR -> RTS`。
+6. 端点侧已经支持 `innerBridge/externalBridge` 分离和 external rail 清单，但每个 work 仍只会绑定一个物理 egress port；真正的多 rail striping 还没有进入主逻辑。
+7. 主路径不是现实中常见的 `RoCEv2 over UDP/IP`，而是自定义二层 RoCE-like transport。
+8. 还没有完整 `ECN/CNP/DCQCN` 拥塞控制闭环。
 
-## 5. 当前明确还没有完成的内容
+## 5. 当前最重要的风险提示
 
-当前版本还不能宣称为完整 RC transport，缺口主要在：
+功能闭环和“现实 RoCE 网络行为足够像”不是一回事。当前版本已经比早期 stage 1 更接近 transport 行为，但大规模 AI 集群里的尾延迟、PFC 活跃度、ECMP/ECN/DCQCN 行为，仍然不能只靠这一次小模型日志下结论。
 
-1. 真正的 `SQ / RQ / CQ`
-2. `SEND` 所需的 `RQ` 资源模型
-3. retransmission 更深地并入统一 scheduler
-4. 更真实的 receiver-side `RQ` 资源模型
-5. `sq_depth/rq_depth` 与 scheduler / backpressure 的更深绑定
-6. CQ 驱动发送推进
-7. 动态 RTO
-8. 事务完成统计与 transport 完整性的更严格绑定
-9. 更完整的累计 ACK / recovery 策略细化
+这次最新日志里的时间口径是：
 
-## 6. 当前为什么还没看到理想的多 QP 数据 RR
+- `last FLOW_TX_DONE = 15562.8 us`
+- `network drained = 15563.1 us`
 
-当前 `RoceTxScheduler` 的 RR 逻辑已经存在，但最近一次真实运行里没有看到理想的交替发送，原因主要有两点：
+这和旧文档中的早期小模型时间不是同一次验证。后续比较时应使用 workload、配置和日志级别都一致的一组实验，不要把不同阶段的小模型结果直接混在一起。
 
-1. 同一 sender 的多个 `DATA` work 进入 scheduler 的时机仍然偏串行
-2. `sendflowclient` 这层会在零延迟里连续 dispatch slice，把一个 QP 的多个 slice 很快提交给下层
+## 6. 现在最值得继续审的点
 
-因此当前更准确的说法是：
+如果后面继续审实现，我建议优先看：
 
-- 已经有“QP 级发送入口调度”
-- 但还没有把“QP 级 wire-time 发送仲裁”做实
-
-## 7. 当前决策
-
-当前决定是：
-
-- 先把版本停在这里
-- 不继续为了“把 RR 做得更像 NIC”而深入改底层设备
-
-原因很直接：
-
-1. 接收侧乱序问题已经修到可接受
-2. 再往下做调度需要明显更多底层改动
-3. 当前收益不足以覆盖改动代价
-
-后续如果重新讨论这件事，请直接看：
-
-- [roce-future-scheduling-options.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-future-scheduling-options.md)
-- [roce-phase2-design.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-phase2-design.md)
-
-## 8. 建议阅读顺序
-
-如果你是回头再看这个分支，建议顺序如下：
-
-1. 先看这份当前状态文档
-2. 再看 [roce-workflow.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-workflow.md)
-3. 然后看 [roce-scheduler-stage1.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-scheduler-stage1.md)
-4. 如果要看最近这轮 `ACK / 窗口 / 重传 / 重排` 的具体改动，先看 [roce-transport-reliability.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-transport-reliability.md)
-5. 如果要继续做协议能力补全，再看 [roce-phase2-design.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-phase2-design.md)
-6. 需要比较 UB 或继续谈 QP，再看 [roce-qp-and-transport.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-qp-and-transport.md)
+1. 当前 `RQ` 模型是否需要进一步接近真实 posted receive / RNR。
+2. `CQ` 是否需要从内部统计队列升级成上层可消费的完成语义接口。
+3. `transportWindowPackets`、per-qid inflight 和 PFC backpressure 的耦合是否会在大规模拓扑中制造过强限速。
+4. 多出端口场景未来如何把 `LogicalQp` 映射到多个 `PortQpRuntime`。
+5. 是否需要补 `RoCEv2 / UDP/IP / ECN / CNP / DCQCN` 这一层，以提高与现实 AI 集群网络行为的匹配度。

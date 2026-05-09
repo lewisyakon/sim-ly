@@ -36,6 +36,7 @@ notify_receiver_receive_data(int sender_node, int receiver_node,
   AstraSim::StreamBaseline* owner = global_sys->running_list.front();
   AstraSim::RecvPacketEventHadndlerData *ehd = new AstraSim::RecvPacketEventHadndlerData(owner, AstraSim::EventType::PacketReceived, flowTag);
   owner->consume(ehd);
+  delete ehd;
 }
 
 static void 
@@ -52,6 +53,7 @@ notify_sender_sending_finished(int sender_node, int receiver_node,
     send_ehd->flowTag = flowTag;
   NcclLog->writeLog(NcclLogLevel::DEBUG,"notify_sender_sending_finished_test src %d dst %d channe_id %d flow_id %d",flowTag.sender_node,flowTag.receiver_node,flowTag.channel_id,flowTag.channel_id);
   owner->sendcallback(send_ehd);                       
+  delete send_ehd;
 }
 
 static void 
@@ -121,4 +123,3 @@ void send_flow(int src, int dst, uint64_t maxPacketCount,
       flowtag.chunk_id);
   #endif
 }
-

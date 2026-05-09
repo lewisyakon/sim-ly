@@ -201,7 +201,11 @@ PointToPointNetDevice::GetTypeId()
                             "Callback triggered when queue drops below the lowwatermark "
                             "send resume",
                             MakeTraceSourceAccessor(&PointToPointNetDevice::m_lowWatermarkCallback),
-                            "ns3::TracedCallback");
+                            "ns3::TracedCallback")
+            .AddTraceSource("QueuePauseState",
+                            "Callback triggered when a specific transmit queue enters or exits pause.",
+                            MakeTraceSourceAccessor(&PointToPointNetDevice::m_queuePauseStateTrace),
+                            "ns3::TracedCallback::Uint32Bool");
                                  
     return tid;
 }
@@ -511,10 +515,12 @@ PointToPointNetDevice::Receive(Ptr<Packet> packet)
                 if (rrQueue)
                 {
                     rrQueue->PauseSubQueue(pauseQid);
+                    m_queuePauseStateTrace(pauseQid, true);
                 }
                 else
                 {
                     m_isPaused = true;
+                    m_queuePauseStateTrace(0, true);
                 }
                 return ;
             }
@@ -531,10 +537,12 @@ PointToPointNetDevice::Receive(Ptr<Packet> packet)
                 if (rrQueue)
                 {
                     rrQueue->ResumeSubQueue(pauseQid);
+                    m_queuePauseStateTrace(pauseQid, false);
                 }
                 else
                 {
                     m_isPaused = false;
+                    m_queuePauseStateTrace(0, false);
                 }
                 TryStartNextTransmission();
                 return ;

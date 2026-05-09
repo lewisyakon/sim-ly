@@ -139,7 +139,6 @@ class Workload : Callable {
   static int get_layer_numbers(std::string workload_input);
   CSVWriter* detailed;
   CSVWriter* end_to_end;
-  CSVWriter* dimension_utilization;
   std::string path;
   std::string run_name;
   int stat_row;

@@ -20,13 +20,6 @@ enum class ThreePhaseState : uint8_t {
 // 只跟踪阶段推进，不控制发送时序。
 class RoceThreePhaseFsm {
 public:
-  struct RuntimeStats {
-    uint64_t stateCount = 0;
-    uint64_t requestIssuedCount = 0;
-    uint64_t dataIssuedCount = 0;
-    uint64_t completedCount = 0;
-  };
-
   RoceThreePhaseFsm() = default;
 
   // 配置注入（主要用到 enable/dataUseWrite）。
@@ -44,7 +37,6 @@ public:
   // 查询接口。
   ThreePhaseState GetState(const RoceFlowKey& key) const;
   bool IsCompleted(const RoceFlowKey& key) const;
-  RuntimeStats GetRuntimeStats() const;
 
   // 配置透传：是否启用 + DATA 阶段默认 opcode 选择。
   bool IsEnabled() const;

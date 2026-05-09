@@ -10,6 +10,9 @@ LICENSE file in the root directory of this source tree.
 #include "astra-sim/system/AstraNetworkAPI.hh"
 #include "astra-sim/system/RecvPacketEventHadndlerData.hh"
 #include <cctype>
+#include <fstream>
+#include <sstream>
+#include <string>
 
 // ===== PP forward token (p2p) =====
 namespace {
@@ -179,9 +182,6 @@ Workload::~Workload() {
   if (detailed != nullptr) {
     delete detailed;
   }
-  if (dimension_utilization != nullptr) {
-    delete dimension_utilization;
-  }
   for (int i = 0; i < SIZE; i++) {
     delete layers[i];
   }
@@ -225,7 +225,6 @@ Workload::Workload(
 
   end_to_end = nullptr;
   detailed = nullptr;
-  dimension_utilization = nullptr;
   this->path = path;
   this->stat_row = stat_row;
   this->seprate_log = seprate_log;
@@ -238,14 +237,13 @@ Workload::Workload(
   this->registered_for_finished_streams = false;
   #ifndef PHY_MTP
   if (generator->id == 0 && seprate_log) {
+    // lja delete: CSV stats are disabled for this simulator path.
     /*ly delete*/
     /*
     std::cout << "stat path: " << path << " ,total rows: " << total_rows
               << " ,stat row: " << stat_row << std::endl;
     detailed = new CSVWriter(path, "detailed_"+std::to_string(generator->total_nodes)+".csv");
     end_to_end = new CSVWriter(path, "EndToEnd.csv");
-    dimension_utilization =
-        new CSVWriter(path, run_name + "_dimension_utilization_"+std::to_string(generator->npu_offset)+".csv");
     if (stat_row == 0) {
       initialize_stat_files();
     }
@@ -373,28 +371,6 @@ void Workload::report() {
   std::cout << "all passes finished at time: " << Sys::boostedTick()
             << ", id of first layer: " << layers[0]->id << std::endl;
   generator->NI->pass_front_end_report(astraSimDataAPI);
-  /*
-  #ifdef NS3_MTP 
-  if (this->seprate_log) {
-    std::list<std::list<std::pair<uint64_t, double>>> dims;
-    for (int i = 0; i < generator->scheduler_unit->usage.size(); i++) {
-      dims.push_back(
-          generator->scheduler_unit->usage[i].report_percentage(10000));
-    }
-    dimension_utilization->finalize_csv(dims);
-  }
-  #endif
-  #ifdef NS3_MPI 
-  if (this->seprate_log) {
-    std::list<std::list<std::pair<uint64_t, double>>> dims;
-    for (int i = 0; i < generator->scheduler_unit->usage.size(); i++) {
-      dims.push_back(
-          generator->scheduler_unit->usage[i].report_percentage(10000));
-    }
-    dimension_utilization->finalize_csv(dims);
-  }
-  #endif
-  */
 }
 void Workload::check_for_sim_end() {
   if (pass_counter == TOTAL_PASS) {

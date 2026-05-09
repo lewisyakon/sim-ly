@@ -1,98 +1,119 @@
-# Min-Hop Mac Learning RoCE 文档索引
+# Min-Hop Mac Learning 文档索引
 
-本文档集记录当前分支中 RoCE 旁路集成的设计、配置和代码行为，重点服务下面三个目标：
+最近修改：2026-05-07
 
-1. 解释当前版本到底“已经做了什么”。
-2. 说明它与 legacy 3P、与 UB 的关系。
-3. 为后续把 QP 从语义层推进到发送调度层提供稳定参考。
+这组文档现在以“当前代码已经实现成什么样”为中心，不再按早期阶段性原型来描述。当前文档分成两部分：
 
-## 当前状态
+- RoCE runtime 主路径、可靠性和日志
+- GPU 端点的 bridge / 外部口 / PFC 边界
 
-当前版本的定位是：
+## 当前一句话结论
 
-- `Astra-Sim + 3P` 仍然是主业务流程。
-- RoCE 已经作为旁路语义层接入。
-- 已支持轻量 `QP / QPN / PSN / opcode / user phase`。
-- 当前对外能力口径收敛为 `SEND + WRITE`，`READ` 只保留代码入口，不再作为对外能力描述。
-- `ACT` 已被明确还原为纯业务控制报文，不再承担可靠传输 ACK/completion 含义。
-- `RoCE enable` 时，若 `EnsureQpReadyToSend()` 后 QP 仍不可发，会直接报错，不再回退 legacy。
-- `RoCE enable` 时，发送入口已经改成：
-  - 先入 `RoceTxScheduler`
-  - 再按 QP / 类别调度出网
-- 当前已经有：
-  - per-QP work queue
-  - 控制类优先
-  - 数据类按 QP 轮询
-  - 逐 slice 出网
-  - bounded reorder window 与 overflow 处理
-  - transport ACK
-  - ACK 侧带累计确认语义
-  - 每 QP 在途窗口
-  - oldest-unacked 单定时器
-  - recovery 模式
-  - ACK 高优先级
-  - 自动 ACK timeout 基线
+当前版本里：
 
-当前还没有完成的部分：
+- `sendflowclient` 是上层 facade 和 3P 业务层。
+- `RoceTransportEngine` 是逻辑层，只负责 `flow/lane -> qpn`、`WR/work` 准备、3P FSM。
+- `RdmaPortEngine` 是真正的 RoCE 运行时核心，挂在每个 `PointToPointNetDevice` 上，负责端口绑定后的 `QP/SQ/RQ/CQ`、packetize、ACK、重传、reorder、pause-aware 调度。
+- GPU 端点现在统一成“内侧 bridge + 可选外侧 bridge”的模型；外侧 bridge 可以只学表、不承担 transit 转发。
 
-- 真正的 `SQ / RQ / CQ`
-- `sq_depth/rq_depth` 与 scheduler / backpressure 的更深绑定
-- 更完整的 CQ 驱动发送推进
-- retransmission 更深地并入统一 scheduler
-- 动态 RTO
-- 事务完成统计与 transport 完整性的更严格绑定
-- 更完整的累计 ACK / recovery 策略细化
+也就是说，RoCE 主路径已经不再依赖旧的 `sendflowclient` 内部 fallback。
 
-## 文档导航
+## 最新验证
+
+当前仓里最近一次小模型 `ROCE=true` 实测来自：
+
+- [config.json](/home/lja/sim-ly/sim-ly/simconfig/config.json)
+- [microAllReduce.txt](/home/lja/sim-ly/sim-ly/simworkload/microAllReduce.txt)
+- [simulation.log](/home/lja/sim-ly/sim-ly/simulation.log)
+
+本次日志降级后，不再打印完整 `FLOW_TX_DONE / FLOW_RX_DONE` 明细；因此这里不再沿用旧文档里的 `TX_DONE=48 / RX_DONE=48` 口径。
+
+本次实测可直接确认：
+
+- `REQ_DONE = 144`
+- `total send count = 144`
+- `total events = 1171473`
+- `last FLOW_TX_DONE since_workload_start(us) = 15562.8`
+- `network drained since_workload_start(us) = 15563.1`
+
+对应日志：
+
+- [simulation.log:1186](/home/lja/sim-ly/sim-ly/simulation.log#L1186)
+- [simulation.log:1187](/home/lja/sim-ly/sim-ly/simulation.log#L1187)
+- [simulation.log:1189](/home/lja/sim-ly/sim-ly/simulation.log#L1189)
+- [simulation.log:1190](/home/lja/sim-ly/sim-ly/simulation.log#L1190)
+
+同时没有搜到这些异常项：
+
+- `[ROCE][RQ][FULL]`
+- `[ROCE][CQ][OVERFLOW]`
+- `[ROCE][RTX]`
+- `REORDER_OVERFLOW`
+- `flow remap detected`
+- `QP rejected`
+- `opcode mismatch`
+- `phase mismatch`
+- `Callback not found`
+- `without expected count setup`
+
+## 阅读顺序
 
 1. [roce-current-status.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-current-status.md)
-   - 当前版本到底停在哪
-   - 最近一次真实运行验证了什么
-   - 当前为什么决定先不继续深挖调度
+   - 当前版本已经完成了什么
+   - 最新运行验证了什么
+   - 现在还保留了哪些简化
 
-2. [roce-config-and-logs.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-config-and-logs.md)
-   - `roce` JSON 配置项
-   - `[ROCE][CFG] / [ACTIVE] / [TX] / [RX]` 日志解释
-   - 配置在代码里如何接入
+2. [topology-endpoint-bridge-model.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/topology-endpoint-bridge-model.md)
+   - 当前 GPU 端点为什么拆成 inner/external bridge
+   - `TerminalLearningOnly` 到底做什么
+   - FlowIo、bridge、PFC 现在分别落在哪一层
 
-3. [roce-workflow.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-workflow.md)
-   - 一条 P2P 流从 Astra-Sim 下放到 `my_entry`
-   - `sendflowclient` 如何发 REQUEST / DATA / ACT
-   - 接收侧如何解析 3P 头和 RoCE 头
-   - callback 如何回到 Astra-Sim
+3. [external-topology-v1.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/external-topology-v1.md)
+   - 外部拓扑文本文件 v1 的格式和合法性规则
+   - GPU rank / 交换机编号 / 外网和内网链路的语义
+   - external topology 构建器必须保留哪些 GPU 标准组件
 
-4. [roce-scheduler-stage1.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-scheduler-stage1.md)
-   - RoCE 包如何入队
-   - 调度器如何从队列中选择下一个 slice
-   - 当前阶段的控制优先与数据 RR 规则
-   - 当前阶段还没有做哪些 transport 能力
+4. [roce-reality-gap-review.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-reality-gap-review.md)
+   - 当前实现和现实 RoCE 的差距到底在哪里
+   - 哪些差距会影响大规模网络行为
+   - 哪些是必须补、建议补、可以暂缓
 
-5. [roce-qp-and-transport.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-qp-and-transport.md)
-   - QP 的定义、组成和 QPN 含义
-   - 一个 NIC 上为什么会有多个 QP
-   - 当前项目的轻量 QP 到底负责什么
-   - UB 已实现哪些 transport 能力
-   - `post_send/post_recv` 与 `SQ/RQ/CQ` 的正确口径
+5. [memory-leak-investigation.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/memory-leak-investigation.md)
+   - 本轮内存增长问题的根因
+   - CSV dimension utilization 为什么会制造超大中间结构
+   - 当前关闭 CSV 和清理临时内存探针后的验证口径
 
-6. [roce-phase2-design.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-phase2-design.md)
-   - 会议后收敛出的下一阶段设计口径
-   - `SEND/WRITE`、`SQ/RQ/CQ`、RoCE 可见头、ACK/重传、有限乱序窗口
+6. [roce-class-architecture.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-class-architecture.md)
+   - 每个 RoCE 类分别负责什么
+   - 类之间怎样耦合、怎样传参
+   - 从外部调用时暴露什么接口
+   - 整体已经支持什么功能
 
-7. [roce-transport-reliability.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-transport-reliability.md)
-   - 最近几轮 `ACK / 窗口 / 重传 / 重排 / ACK 优先级 / 自动 timeout` 的具体实现
-   - 这些改动分别落在哪些文件
-   - 为什么现在缩小队列也不一定能复现丢包和重传
+7. [roce-workflow.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-workflow.md)
+   - 一条流从 Astra-Sim 下发后，怎样经过 transport、bridge、port、QP，最终从物理口发出去
+   - 接收时怎样回到 ingress `RdmaPortEngine`
+   - ACK、reorder、completion 分别在哪里发生
 
-8. [roce-future-scheduling-options.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-future-scheduling-options.md)
-   - 未来两类候选调度方案
-   - 为什么当前先不实现
+8. [roce-transport-reliability.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-transport-reliability.md)
+   - ACK、重传、窗口、reorder 当前落在哪里
+   - 哪些可靠性能力已经从 `sendflowclient` 下沉到 `RdmaPortEngine`
 
-## 阅读建议
+9. [roce-config-and-logs.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-config-and-logs.md)
+   - 配置项解释
+   - 日志口径解释
 
-- 如果你想先知道当前分支到底做到哪，先看 `roce-current-status.md`。
-- 如果你要先改配置或看日志，再看 `roce-config-and-logs.md`。
-- 如果你要理解现在代码是怎么跑的，再看 `roce-workflow.md`。
-- 如果你要看包入队后怎么出队，再看 `roce-scheduler-stage1.md`。
-- 如果你要快速回顾最近几轮 `ACK / 窗口 / 重传 / 重排` 的落地代码，再看 `roce-transport-reliability.md`。
-- 如果你要继续做协议能力补全，先看 `roce-phase2-design.md`。
-- 如果你以后要重新讨论更深的发送调度，再看 `roce-qp-and-transport.md` 和 `roce-future-scheduling-options.md`。
+10. [roce-qp-and-transport.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-qp-and-transport.md)
+   - 现实中的 `QP / port / CQ / SRQ`
+   - 它们在当前仿真里的映射
+
+11. [roce-future-scheduling-options.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-future-scheduling-options.md)
+   - 如果后续继续提高 port 调度真实性，可以考虑哪些方案
+   - 为什么当前暂时不继续改调度层
+
+## 历史文档
+
+下面这些文档已经移到 `archive/`，应主要按“演化过程参考”来看，而不是“当前实现说明”：
+
+- [archive/README.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/archive/README.md)
+- [archive/roce-phase2-design.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/archive/roce-phase2-design.md)
+- [archive/roce-scheduler-stage1.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/archive/roce-scheduler-stage1.md)

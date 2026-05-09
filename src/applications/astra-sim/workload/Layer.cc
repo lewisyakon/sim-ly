@@ -12,15 +12,15 @@ LICENSE file in the root directory of this source tree.
 #include "astra-sim/system/calbusbw.h"
 // #endif
 
+#include <fstream>
+#include <sstream>
+#include <string>
+
 #ifdef NS3_MPI
 #include "ns3/mpi-interface.h"
 #include <mpi.h>
 using namespace ns3;
 #endif
-
-
-
-
 namespace AstraSim {
 namespace {
 bool ShouldLogLayerCompletion(const Layer* layer) {
@@ -393,9 +393,9 @@ LayerData Layer::report(
     vector<double>& total_ig_time,
     double& pre_bubble_time,
     double& DP_comm,
-    double& DP_EP_comm,
-    double& Expose_TP_comm,
-    double& Expose_EP_comm) {
+              double& DP_EP_comm,
+              double& Expose_TP_comm,
+              double& Expose_EP_comm) {
   LayerData layerData;
   take_stream_stats_average();
   int TP_size = workload->model_parallel_npu_group;
@@ -607,8 +607,8 @@ LayerData Layer::report(
     double& DP_comm,
     double& DP_EP_comm,
     double& Expose_TP_comm,
-    double& Expose_EP_comm,
-    bool seprate_log) {
+              double& Expose_EP_comm,
+              bool seprate_log) {
   LayerData layerData;
   take_stream_stats_average();
   int TP_size = workload->model_parallel_npu_group;
@@ -815,6 +815,7 @@ LayerData Layer::report(
       data = keys + "\n" + values;
       /*ly delete*/
       // EndToEnd->write_res(data);
+    /* lja delete: CSV/EndToEnd report output is disabled in this simulator path.
     if(param->net_work_param.visual){
       std::string chart_path = EndToEnd->path;
       std::ofstream htmlFile(chart_path + "chart.html");
@@ -876,6 +877,7 @@ LayerData Layer::report(
       htmlFile.close();
       std::cout << "HTML file created" << std::endl;
     }
+    */
 
       
     }

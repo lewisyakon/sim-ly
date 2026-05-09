@@ -190,6 +190,7 @@ class PointToPointNetDevice : public NetDevice
 
     TracedCallback<> m_highWatermarkCallback;
     TracedCallback<uint32_t> m_lowWatermarkCallback;
+    TracedCallback<uint32_t, bool> m_queuePauseStateTrace;
 
     void AddPauseCount(uint32_t increment);
     void SubPauseCount(uint32_t decrement);

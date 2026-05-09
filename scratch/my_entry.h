@@ -40,7 +40,6 @@
 #endif
 #include <map>
 #include"astra-sim/system/MockNcclQps.h"
-#include "astra-sim/system/MockNcclLog.h"
 #include "ns3/flow-io.h"
 
 using namespace ns3;
@@ -62,8 +61,15 @@ extern uint32_t numHosts,gpus_per_server,Topology_model;
 
 ns3::FlowSendMode check_out_or_iner(int src,int dst){//0表示在外部，1表示内部,3表示显示制定nvswitch,4表示无条件送原地址,5表示送本地交换机
   if (Topology_model==2 or Topology_model==3) return FlowSendMode::Internal;
-  if (src>numHosts or dst>numHosts) return FlowSendMode::External;//疑似错误源目，无条件外送
-  else if (src/gpus_per_server == dst/gpus_per_server) return FlowSendMode::Internal;
+  if (Topology_model==6) {
+    return IsExternalTopologyInternalPair(src, dst) ? FlowSendMode::Internal
+                                                   : FlowSendMode::External;
+  }
+  if (src < 0 || dst < 0) return FlowSendMode::External;//疑似错误源目，无条件外送
+  const uint32_t srcRank = static_cast<uint32_t>(src);
+  const uint32_t dstRank = static_cast<uint32_t>(dst);
+  if (srcRank>numHosts or dstRank>numHosts) return FlowSendMode::External;//疑似错误源目，无条件外送
+  else if (srcRank/gpus_per_server == dstRank/gpus_per_server) return FlowSendMode::Internal;
        else return FlowSendMode::External;
 }
 
@@ -71,17 +77,10 @@ void SendFlow(int src, int dst, uint64_t maxPacketCount,
 void (*msg_handler)(void *fun_arg), void *fun_arg, int tag, AstraSim::sim_request *request) {
   // NS_LOG_INFO("[SendFlow]: now_rank="<<MpiInterface::GetSystemId()<<" src_rank="<<(nodetable[src]->GetSystemId()>>16)<<" tag="<<tag<<" src="<<src<<" dst="<<dst<<" size="<<maxPacketCount);
 
-  MockNcclLog*NcclLog = MockNcclLog::getInstance();
   uint64_t real_PacketCount = maxPacketCount;
-  
-  int flow_id = request->flowTag.current_flow_id;
   // bool nvls_on = request->flowTag.nvls_on;
 
   if(real_PacketCount == 0) real_PacketCount = 1;
-    // MockNcclLog* NcclLog = MockNcclLog::getInstance();
-    // NcclLog->writeLog(NcclLogLevel::DEBUG," [Packet sending event]  %dSendFlow to  %d channelid:  %d flow_id  %d srcip  %d dstip  %d size:  %llu at the tick:  %d",src,dst,tag,flow_id,serverAddress[src],serverAddress[dst],maxPacketCount,AstraSim::Sys::boostedTick());
-    // NcclLog->writeLog(NcclLogLevel::DEBUG," request->flowTag [Packet sending event]  %dSendFlow to  %d tag_id:  %d flow_id  %d srcip  %d dstip  %d size:  %llu at the tick:  %d",request->flowTag.sender_node,request->flowTag.receiver_node,request->flowTag.tag_id,request->flowTag.current_flow_id,serverAddress[src],serverAddress[dst],maxPacketCount,AstraSim::Sys::boostedTick());
-  
   if(real_PacketCount == 1023)
   {
     Ptr<sendflowclient> clientHelper=nodeapptable[src];
@@ -97,25 +96,21 @@ void (*msg_handler)(void *fun_arg), void *fun_arg, int tag, AstraSim::sim_reques
     AstraSim::SendPacketEventHandlerData* ehd = (AstraSim::SendPacketEventHandlerData*) fun_arg;
     // AstraSim::RecvPacketEventHadndlerData* ehd = (AstraSim::RecvPacketEventHadndlerData*) fun_arg;
     ehd->flowTag=request->flowTag;
-    clientHelper->set_sendfunc(request->flowTag.tag_id,src,dst,{msg_handler,fun_arg});
-    clientHelper->write_flowtag(request->flowTag.tag_id,src,dst,*request); 
+    const int flowTagId = request->flowTag.tag_id;
+    clientHelper->set_sendfunc(flowTagId,src,dst,{msg_handler,fun_arg});
+    clientHelper->write_flowtag(flowTagId,src,dst,*request); 
 
     
     
     clientHelper = nodeapptable[src];
     clientHelper->TriggerSendTo_now(nodeaddresstable[dst], real_PacketCount,
-      request->flowTag.tag_id, src, dst, check_out_or_iner(src,dst));
+      flowTagId, src, dst, check_out_or_iner(src,dst));
 
   }
-
-  // NcclLog->writeLog(NcclLogLevel::DEBUG,"waiting_to_notify_receiver  current_flow_id  %d src  %d dst  %d count  %d",request->flowTag.current_flow_id,src,dst,waiting_to_notify_receiver[std::make_pair(request->flowTag.tag_id,std::make_pair(src,dst))]);
 }
 
 
 int main1() {
-  clock_t begint, endt;
-  begint = clock();
-
   SetConfig();
   SetupNetwork();
 
@@ -123,13 +118,9 @@ int main1() {
   fflush(stdout);
   NS_LOG_INFO("Run Simulation.");
 
-  endt = clock();
   return 0;
 }
 int main1(string network_conf) {
-  clock_t begint, endt;
-  begint = clock();
-
   if (!ReadConf(network_conf)){
     SetConfig();
   } 
@@ -140,7 +131,6 @@ int main1(string network_conf) {
   fflush(stdout);
   NS_LOG_INFO("Run Simulation.");
 
-  endt = clock();
   return 0;
 }
 #endif

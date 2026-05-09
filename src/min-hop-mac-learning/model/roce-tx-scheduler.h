@@ -7,6 +7,7 @@
 #include <set>
 
 #include "3PHeader.h"
+#include "FlowTagHeader.h"
 #include "flow-io.h"
 #include "ns3/address.h"
 #include "roce-sim-types.h"
@@ -27,10 +28,15 @@ struct RoceTxWorkItem {
   Address dest;
   FlowSendMode sendMode = FlowSendMode::External;
   int mindex = 0;
+  RoceOpcode opcode = RoceOpcode::Send;
+  RoceUserPhase userPhase = RoceUserPhase::None;
   uint64_t totalBytes = 0;
   uint64_t remainingBytes = 0;
   uint64_t packetIndex = 0;
   uint64_t totalPackets = 1;
+  uint32_t controlPacketBytes = 0;
+  bool hasFlowTagHeader = false;
+  FlowTagHeader flowTagHeader;
   RoceTxClass txClass = RoceTxClass::Data;
 };
 
@@ -43,10 +49,15 @@ struct RoceTxSlice {
   Address dest;
   FlowSendMode sendMode = FlowSendMode::External;
   int mindex = 0;
+  RoceOpcode opcode = RoceOpcode::Send;
+  RoceUserPhase userPhase = RoceUserPhase::None;
   uint64_t totalBytes = 0;
   uint32_t sliceBytes = 0;
   uint64_t packetIndex = 0;
   uint64_t totalPackets = 1;
+  uint32_t controlPacketBytes = 0;
+  bool hasFlowTagHeader = false;
+  FlowTagHeader flowTagHeader;
   bool isLastSlice = false;
   RoceTxClass txClass = RoceTxClass::Data;
 };
@@ -62,9 +73,10 @@ public:
 
   bool Enqueue(const RoceTxWorkItem& item);
   bool HasPendingWork() const;
-  bool HasPendingWorkForQp(const RoceQpKey& qpKey) const;
   uint64_t GetPendingWorkCount() const;
-  void DropQp(const RoceQpKey& qpKey);
+  uint64_t GetPendingWorkCount(const RoceQpKey& qpKey) const;
+  uint64_t GetWorkQueueCount() const;
+  uint64_t GetActiveQpCount(RoceTxClass txClass) const;
 
   bool PickNextSlice(uint32_t maxSliceBytes,
                      const std::set<RoceQpKey>* blockedQps,

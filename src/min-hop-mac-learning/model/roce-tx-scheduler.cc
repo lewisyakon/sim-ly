@@ -59,46 +59,28 @@ RoceTxScheduler::HasPendingWork() const {
   return m_pendingWorkCount != 0;
 }
 
-bool
-RoceTxScheduler::HasPendingWorkForQp(const RoceQpKey& qpKey) const {
-  auto it = m_workQueues.find(qpKey);
-  if (it == m_workQueues.end()) {
-    return false;
-  }
-  for (const auto& work : it->second) {
-    if (work.remainingBytes != 0) {
-      return true;
-    }
-  }
-  return false;
-}
-
 uint64_t
 RoceTxScheduler::GetPendingWorkCount() const {
   return m_pendingWorkCount;
 }
 
-void
-RoceTxScheduler::DropQp(const RoceQpKey& qpKey) {
+uint64_t
+RoceTxScheduler::GetPendingWorkCount(const RoceQpKey& qpKey) const {
   auto it = m_workQueues.find(qpKey);
-  if (it != m_workQueues.end()) {
-    while (!it->second.empty()) {
-      it->second.pop_front();
-      if (m_pendingWorkCount != 0) {
-        --m_pendingWorkCount;
-      }
-    }
-    m_workQueues.erase(it);
+  if (it == m_workQueues.end()) {
+    return 0;
   }
+  return static_cast<uint64_t>(it->second.size());
+}
 
-  auto dropFromActive = [&qpKey](std::deque<RoceQpKey>* active) {
-    if (active == nullptr) {
-      return;
-    }
-    active->erase(std::remove(active->begin(), active->end(), qpKey), active->end());
-  };
-  dropFromActive(&m_controlActiveQps);
-  dropFromActive(&m_dataActiveQps);
+uint64_t
+RoceTxScheduler::GetWorkQueueCount() const {
+  return static_cast<uint64_t>(m_workQueues.size());
+}
+
+uint64_t
+RoceTxScheduler::GetActiveQpCount(RoceTxClass txClass) const {
+  return static_cast<uint64_t>(ActiveQps_(txClass).size());
 }
 
 bool
@@ -162,10 +144,15 @@ RoceTxScheduler::PickFromClass_(RoceTxClass txClass,
     out->dest = work.dest;
     out->sendMode = work.sendMode;
     out->mindex = work.mindex;
+    out->opcode = work.opcode;
+    out->userPhase = work.userPhase;
     out->totalBytes = work.totalBytes;
     out->sliceBytes = sliceBytes;
     out->packetIndex = work.packetIndex;
     out->totalPackets = work.totalPackets;
+    out->controlPacketBytes = work.controlPacketBytes;
+    out->hasFlowTagHeader = work.hasFlowTagHeader;
+    out->flowTagHeader = work.flowTagHeader;
     out->txClass = work.txClass;
 
     work.remainingBytes -= sliceBytes;

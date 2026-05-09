@@ -1,9 +1,9 @@
 #include "flow-io.h"
 
-#include "PppRoundRobinQueue.h"
 #include "3PHeader.h"
+#include "rdma-dispatch-tag.h"
+#include "rdma-port-engine.h"
 #include "ns3/hop-count-header.h"
-#include "pause-header.h"
 #include "ns3/boolean.h"
 #include "ns3/log.h"
 #include "ns3/mac48-address.h"
@@ -27,8 +27,22 @@ NS_OBJECT_ENSURE_REGISTERED(FlowIo);
 
 namespace {
 // Non-owning registry: avoid reference cycles/re-entrancy during global destruction.
-std::unordered_map<uint32_t, FlowIo*> g_flowIoRegistryByNodeId;
-std::mutex g_flowIoRegistryMutex;
+std::unordered_map<uint32_t, FlowIo*>&
+FlowIoRegistryByNodeId()
+{
+  // This registry is a process-lifetime non-owning index. Astra-Sim can finish
+  // from inside the simulation loop, so relying on shared-library static
+  // destruction is fragile and has caused shutdown-time heap corruption.
+  static auto* registry = new std::unordered_map<uint32_t, FlowIo*>();
+  return *registry;
+}
+
+std::mutex&
+FlowIoRegistryMutex()
+{
+  static auto* mutex = new std::mutex();
+  return *mutex;
+}
 
 struct FlowIoDropStats
 {
@@ -39,13 +53,10 @@ struct FlowIoDropStats
 };
 
 FlowIoDropStats g_flowIoDropStats;
-std::mutex g_flowIoDropStatsMutex;
-constexpr uint64_t kApproxSchedulerEventBytes = 128;
 
 void
 PrintFlowIoDropSummary()
 {
-  std::lock_guard<std::mutex> lock(g_flowIoDropStatsMutex);
   NS_LOG_UNCOND("[DROP][SUMMARY][FLOWIO] bufOverflowPkts="
                 << g_flowIoDropStats.bufferOverflowDrops
                 << " bufOverflowBytes="
@@ -62,7 +73,6 @@ PrintFlowIoDropSummary()
 void
 EnsureFlowIoDropSummaryScheduled()
 {
-  std::lock_guard<std::mutex> lock(g_flowIoDropStatsMutex);
   if (!g_flowIoDropStats.summaryScheduled)
   {
     g_flowIoDropStats.summaryScheduled = true;
@@ -90,7 +100,7 @@ FlowIo::GetTypeId()
                         MakeTimeChecker())
           .AddAttribute("MaxBufferedPackets",
                         "Maximum buffered packets in FlowIo before dropping new packets.",
-                        UintegerValue(200000),
+                        UintegerValue(20000000),
                         MakeUintegerAccessor(&FlowIo::m_maxBufferedPackets),
                         MakeUintegerChecker<uint32_t>())
           .AddAttribute("NumTxQueues",
@@ -109,11 +119,19 @@ FlowIo::PauseNodeQueue(Ptr<Node> node, uint32_t queueId)
   {
     return;
   }
-  std::lock_guard<std::mutex> lock(g_flowIoRegistryMutex);
-  auto it = g_flowIoRegistryByNodeId.find(node->GetId());
-  if (it != g_flowIoRegistryByNodeId.end() && it->second)
+  FlowIo* io = nullptr;
   {
-    it->second->PauseTxQueue(queueId);
+    std::lock_guard<std::mutex> guard(FlowIoRegistryMutex());
+    auto& registry = FlowIoRegistryByNodeId();
+    auto it = registry.find(node->GetId());
+    if (it != registry.end())
+    {
+      io = it->second;
+    }
+  }
+  if (io)
+  {
+    io->PauseTxQueue(queueId);
   }
 }
 
@@ -124,11 +142,19 @@ FlowIo::ResumeNodeQueue(Ptr<Node> node, uint32_t queueId)
   {
     return;
   }
-  std::lock_guard<std::mutex> lock(g_flowIoRegistryMutex);
-  auto it = g_flowIoRegistryByNodeId.find(node->GetId());
-  if (it != g_flowIoRegistryByNodeId.end() && it->second)
+  FlowIo* io = nullptr;
   {
-    it->second->ResumeTxQueue(queueId);
+    std::lock_guard<std::mutex> guard(FlowIoRegistryMutex());
+    auto& registry = FlowIoRegistryByNodeId();
+    auto it = registry.find(node->GetId());
+    if (it != registry.end())
+    {
+      io = it->second;
+    }
+  }
+  if (io)
+  {
+    io->ResumeTxQueue(queueId);
   }
 }
 
@@ -208,26 +234,6 @@ FlowIo::EnsureQueueState()
   {
     m_pausedTxQueues.assign(m_numTxQueues, false);
   }
-  if (m_externalIngressQueues.size() != m_numTxQueues)
-  {
-    m_externalIngressQueues.assign(m_numTxQueues, {});
-  }
-  if (m_externalHoldQueues.size() != m_numTxQueues)
-  {
-    m_externalHoldQueues.assign(m_numTxQueues, {});
-  }
-  if (m_externalIngressPaused.size() != m_numTxQueues)
-  {
-    m_externalIngressPaused.assign(m_numTxQueues, false);
-  }
-  if (m_externalIngressBackpressured.size() != m_numTxQueues)
-  {
-    m_externalIngressBackpressured.assign(m_numTxQueues, false);
-  }
-  if (m_externalIngressRrIndex >= m_numTxQueues)
-  {
-    m_externalIngressRrIndex = 0;
-  }
 }
 
 uint32_t
@@ -300,30 +306,6 @@ FlowIo::ResumeTxQueue(uint32_t queueId)
   }
 }
 
-bool
-FlowIo::IsSendPathPaused(const Address& dest, FlowSendMode mode) const
-{
-  if (m_numTxQueues == 0)
-  {
-    return false;
-  }
-  const uint32_t qid = ClassifyQueueId(dest) % m_numTxQueues;
-
-  // External 路径的 pause 由 externalIngressPaused/hold 队列体现。
-  if (mode == FlowSendMode::External && m_bindMode != RxBindMode::BridgeOnly)
-  {
-    const bool ingressPaused =
-        qid < m_externalIngressPaused.size() && m_externalIngressPaused[qid];
-    const bool hasHeldPackets =
-        qid < m_externalHoldQueues.size() && !m_externalHoldQueues[qid].empty();
-    const bool backpressured =
-        qid < m_externalIngressBackpressured.size() && m_externalIngressBackpressured[qid];
-    return ingressPaused || hasHeldPackets || backpressured;
-  }
-
-  return qid < m_pausedTxQueues.size() && m_pausedTxQueues[qid];
-}
-
 void
 FlowIo::Start(const SocketRxCallback& cb)
 {
@@ -383,8 +365,8 @@ FlowIo::Start(const SocketRxCallback& cb)
   }
 
   {
-    std::lock_guard<std::mutex> lock(g_flowIoRegistryMutex);
-    g_flowIoRegistryByNodeId[m_node->GetId()] = this;
+    std::lock_guard<std::mutex> guard(FlowIoRegistryMutex());
+    FlowIoRegistryByNodeId()[m_node->GetId()] = this;
   }
 }
 
@@ -395,23 +377,16 @@ FlowIo::Stop()
   {
     Simulator::Cancel(m_drainEvent);
   }
-  if (m_externalIngressDrainEvent.IsRunning())
-  {
-    Simulator::Cancel(m_externalIngressDrainEvent);
-  }
   m_txBuffer.clear();
-  m_externalIngressQueues.clear();
-  m_externalHoldQueues.clear();
-  m_externalIngressPaused.clear();
-  m_externalIngressBackpressured.clear();
 
   if (m_node)
   {
-    std::lock_guard<std::mutex> lock(g_flowIoRegistryMutex);
-    auto it = g_flowIoRegistryByNodeId.find(m_node->GetId());
-    if (it != g_flowIoRegistryByNodeId.end() && it->second == this)
+    std::lock_guard<std::mutex> guard(FlowIoRegistryMutex());
+    auto& registry = FlowIoRegistryByNodeId();
+    auto it = registry.find(m_node->GetId());
+    if (it != registry.end() && it->second == this)
     {
-      g_flowIoRegistryByNodeId.erase(it);
+      registry.erase(it);
     }
   }
 
@@ -424,65 +399,6 @@ FlowIo::Stop()
   }
   m_socks.clear();
   m_sock2dev.clear();
-}
-
-FlowIo::DebugBufferStats
-FlowIo::GetDebugBufferStats() const
-{
-  DebugBufferStats stats;
-  for (const auto& item : m_txBuffer)
-  {
-    stats.txBufferedPackets++;
-    stats.txBufferedApproxBytes += sizeof(BufferedTx);
-    if (item.pkt)
-    {
-      const uint64_t payloadBytes = item.pkt->GetSize();
-      stats.txBufferedBytes += payloadBytes;
-      stats.txBufferedApproxBytes += payloadBytes;
-    }
-  }
-  for (const auto& q : m_externalIngressQueues)
-  {
-    for (const auto& item : q)
-    {
-      stats.externalIngressPackets++;
-      stats.externalIngressApproxBytes += sizeof(ExternalBufferedTx);
-      if (item.pkt)
-      {
-        const uint64_t payloadBytes = item.pkt->GetSize();
-        stats.externalIngressBytes += payloadBytes;
-        stats.externalIngressApproxBytes += payloadBytes;
-      }
-    }
-  }
-  for (const auto& q : m_externalHoldQueues)
-  {
-    for (const auto& item : q)
-    {
-      stats.externalHoldPackets++;
-      stats.externalHoldApproxBytes += sizeof(ExternalBufferedTx);
-      if (item.pkt)
-      {
-        const uint64_t payloadBytes = item.pkt->GetSize();
-        stats.externalHoldBytes += payloadBytes;
-        stats.externalHoldApproxBytes += payloadBytes;
-      }
-    }
-  }
-  stats.totalBufferedPackets = stats.txBufferedPackets +
-                               stats.externalIngressPackets +
-                               stats.externalHoldPackets;
-  stats.totalBufferedBytes = stats.txBufferedBytes +
-                             stats.externalIngressBytes +
-                             stats.externalHoldBytes;
-  stats.totalBufferedApproxBytes = stats.txBufferedApproxBytes +
-                                   stats.externalIngressApproxBytes +
-                                   stats.externalHoldApproxBytes;
-  stats.drainEventPending = m_drainEvent.IsPending() ? 1 : 0;
-  stats.externalIngressDrainEventPending = m_externalIngressDrainEvent.IsPending() ? 1 : 0;
-  stats.pendingEvents = stats.drainEventPending + stats.externalIngressDrainEventPending;
-  stats.pendingEventApproxBytes = stats.pendingEvents * kApproxSchedulerEventBytes;
-  return stats;
 }
 
 bool
@@ -512,6 +428,44 @@ FlowIo::SendOnDevice(uint32_t devIndex, const Address& dest, Ptr<Packet> pkt)
   // Keep caller packet immutable across retries (NetDevice may mutate headers).
   int ret = sock->SendTo(pkt->Copy(), 0, ps);
   return (ret >= 0);
+}
+
+bool
+FlowIo::TrySubmitViaRdmaPortEngine(uint32_t devIndex, const Address& dest, Ptr<Packet> pkt)
+{
+  if (!m_node || !pkt || devIndex >= m_node->GetNDevices())
+  {
+    return false;
+  }
+
+  RdmaDispatchTag tag;
+  if (!pkt->PeekPacketTag(tag))
+  {
+    return false;
+  }
+
+  Ptr<PointToPointNetDevice> p2p = DynamicCast<PointToPointNetDevice>(m_node->GetDevice(devIndex));
+  if (!p2p)
+  {
+    return false;
+  }
+
+  Ptr<RdmaPortEngine> engine = p2p->GetObject<RdmaPortEngine>();
+  if (!engine)
+  {
+    return false;
+  }
+
+  if (!PacketSocketAddress::IsMatchingType(dest))
+  {
+    return false;
+  }
+
+  PacketSocketAddress ps = PacketSocketAddress::ConvertFrom(dest);
+  return engine->SubmitFromFlowIo(p2p->GetAddress(),
+                                  ps.GetPhysicalAddress(),
+                                  m_proto,
+                                  pkt);
 }
 
 bool
@@ -546,18 +500,10 @@ FlowIo::EnqueueBuffered(uint32_t devIndex, uint32_t queueId, const Address& dest
   if (m_txBuffer.size() >= m_maxBufferedPackets)
   {
     EnsureFlowIoDropSummaryScheduled();
+    ++g_flowIoDropStats.bufferOverflowDrops;
+    g_flowIoDropStats.bufferOverflowDropBytes += pkt->GetSize();
     uint32_t nodeId = m_node ? m_node->GetId() : UINT32_MAX;
-    uint64_t nodeDrops = 0;
-    uint64_t totalDrops = 0;
-    uint64_t totalDropBytes = 0;
-    {
-      std::lock_guard<std::mutex> lock(g_flowIoDropStatsMutex);
-      ++g_flowIoDropStats.bufferOverflowDrops;
-      g_flowIoDropStats.bufferOverflowDropBytes += pkt->GetSize();
-      nodeDrops = ++g_flowIoDropStats.perNodeBufferOverflowDrops[nodeId];
-      totalDrops = g_flowIoDropStats.bufferOverflowDrops;
-      totalDropBytes = g_flowIoDropStats.bufferOverflowDropBytes;
-    }
+    uint64_t nodeDrops = ++g_flowIoDropStats.perNodeBufferOverflowDrops[nodeId];
 
     static uint64_t sOverflowLogCount = 0;
     if (sOverflowLogCount < 20 || (sOverflowLogCount % 1000) == 0)
@@ -568,8 +514,8 @@ FlowIo::EnqueueBuffered(uint32_t devIndex, uint32_t queueId, const Address& dest
                     << " totalBuf=" << m_txBuffer.size()
                     << " maxBuf=" << m_maxBufferedPackets
                     << " pktSize=" << pkt->GetSize()
-                    << " totalDropPkts=" << totalDrops
-                    << " totalDropBytes=" << totalDropBytes
+                    << " totalDropPkts=" << g_flowIoDropStats.bufferOverflowDrops
+                    << " totalDropBytes=" << g_flowIoDropStats.bufferOverflowDropBytes
                     << " nodeDropPkts=" << nodeDrops);
     }
     ++sOverflowLogCount;
@@ -597,392 +543,12 @@ FlowIo::EnqueueBuffered(uint32_t devIndex, uint32_t queueId, const Address& dest
   ++sEnqueueLogCount;
 }
 
-uint32_t
-FlowIo::GetExternalIngressMaxPacketsPerQueue() const
-{
-  if (!m_node || m_outDev >= m_node->GetNDevices())
-  {
-    return 100;
-  }
-
-  Ptr<PointToPointNetDevice> p2p = DynamicCast<PointToPointNetDevice>(m_node->GetDevice(m_outDev));
-  if (!p2p)
-  {
-    return 100;
-  }
-
-  Ptr<Queue<Packet>> queue = p2p->GetQueue();
-  if (!queue)
-  {
-    return 100;
-  }
-
-  Ptr<PppRoundRobinQueue<Packet>> rrQueue = DynamicCast<PppRoundRobinQueue<Packet>>(queue);
-  if (rrQueue && rrQueue->GetMaxPacketsPerQueue() > 0)
-  {
-    return rrQueue->GetMaxPacketsPerQueue();
-  }
-
-  return 100;
-}
-
-bool
-FlowIo::GetExternalEgressQueueState(uint32_t queueId,
-                                    uint32_t& queueLen,
-                                    uint32_t& maxPerQueue) const
-{
-  queueLen = 0;
-  maxPerQueue = 0;
-
-  if (!m_node || m_outDev >= m_node->GetNDevices())
-  {
-    return false;
-  }
-
-  Ptr<PointToPointNetDevice> p2p = DynamicCast<PointToPointNetDevice>(m_node->GetDevice(m_outDev));
-  if (!p2p)
-  {
-    return false;
-  }
-
-  Ptr<Queue<Packet>> queue = p2p->GetQueue();
-  if (!queue)
-  {
-    return false;
-  }
-
-  Ptr<PppRoundRobinQueue<Packet>> rrQueue = DynamicCast<PppRoundRobinQueue<Packet>>(queue);
-  if (!rrQueue)
-  {
-    return false;
-  }
-
-  maxPerQueue = rrQueue->GetMaxPacketsPerQueue();
-  if (maxPerQueue == 0)
-  {
-    return false;
-  }
-
-  const uint32_t numQueues = rrQueue->GetNumQueues();
-  if (numQueues == 0)
-  {
-    return false;
-  }
-
-  queueLen = rrQueue->GetSubQueueLength(queueId % numQueues);
-  return true;
-}
-
-uint32_t
-FlowIo::GetExternalHoldPacketCount() const
-{
-  uint32_t total = 0;
-  for (const auto& q : m_externalHoldQueues)
-  {
-    total += static_cast<uint32_t>(q.size());
-  }
-  return total;
-}
-
-bool
-FlowIo::HasPendingExternalIngressWork() const
-{
-  for (const auto& q : m_externalIngressQueues)
-  {
-    if (!q.empty())
-    {
-      return true;
-    }
-  }
-  for (const auto& q : m_externalHoldQueues)
-  {
-    if (!q.empty())
-    {
-      return true;
-    }
-  }
-  return false;
-}
-
-bool
-FlowIo::RefreshExternalIngressPauseState(uint32_t queueId, bool anticipateEnqueue)
-{
-  EnsureQueueState();
-  if (queueId >= m_externalIngressPaused.size())
-  {
-    return false;
-  }
-
-  uint32_t queueLen = 0;
-  uint32_t maxPerQueue = 0;
-  if (!GetExternalEgressQueueState(queueId, queueLen, maxPerQueue))
-  {
-    return m_externalIngressPaused[queueId];
-  }
-
-  if (anticipateEnqueue)
-  {
-    ++queueLen;
-  }
-
-  const double ratio = static_cast<double>(queueLen) / static_cast<double>(maxPerQueue);
-  if (!m_externalIngressPaused[queueId] && ratio >= g_pfcHighWatermark)
-  {
-    m_externalIngressPaused[queueId] = true;
-    if (queueId < m_externalIngressBackpressured.size())
-    {
-      m_externalIngressBackpressured[queueId] = true;
-    }
-    if (IsPfcFullLogEnabled())
-    {
-      NS_LOG_UNCOND("[PFC][THRESH][EXTERNAL][PAUSE] node="
-                    << (m_node ? m_node->GetId() : 0)
-                    << " qid=" << queueId
-                    << " rrqLen=" << queueLen
-                    << " maxPerQueue=" << maxPerQueue
-                    << " ratio=" << ratio);
-    }
-  }
-  else if (m_externalIngressPaused[queueId] && ratio <= g_pfcLowWatermark)
-  {
-    m_externalIngressPaused[queueId] = false;
-    if (queueId < m_externalIngressBackpressured.size() &&
-        m_externalIngressQueues[queueId].empty() &&
-        m_externalHoldQueues[queueId].empty())
-    {
-      m_externalIngressBackpressured[queueId] = false;
-    }
-    if (IsPfcFullLogEnabled())
-    {
-      NS_LOG_UNCOND("[PFC][THRESH][EXTERNAL][RESUME] node="
-                    << (m_node ? m_node->GetId() : 0)
-                    << " qid=" << queueId
-                    << " rrqLen=" << queueLen
-                    << " maxPerQueue=" << maxPerQueue
-                    << " ratio=" << ratio);
-    }
-  }
-
-  return m_externalIngressPaused[queueId];
-}
-
-void
-FlowIo::EnqueueExternalIngress(uint32_t queueId, const Address& dest, Ptr<Packet> pkt)
-{
-  EnsureQueueState();
-  const uint32_t qid = queueId % m_numTxQueues;
-  const uint32_t maxPerQueue = GetExternalIngressMaxPacketsPerQueue();
-
-  if (m_externalIngressQueues[qid].size() >= maxPerQueue)
-  {
-    if (qid < m_externalIngressBackpressured.size())
-    {
-      m_externalIngressBackpressured[qid] = true;
-    }
-    ++m_externalIngressDrops;
-    m_externalIngressDropBytes += pkt->GetSize();
-    static uint64_t sExternalIngressDropLogCount = 0;
-    if (sExternalIngressDropLogCount < 20 || (sExternalIngressDropLogCount % 1000) == 0)
-    {
-      NS_LOG_UNCOND("[DROP][FLOWIO][EXT_INGRESS_FULL] node="
-                    << (m_node ? m_node->GetId() : 0)
-                    << " dev=" << m_outDev
-                    << " qid=" << qid
-                    << " len=" << m_externalIngressQueues[qid].size()
-                    << " maxPerQueue=" << maxPerQueue
-                    << " pktSize=" << pkt->GetSize()
-                    << " totalDrops=" << m_externalIngressDrops
-                    << " totalDropBytes=" << m_externalIngressDropBytes);
-    }
-    ++sExternalIngressDropLogCount;
-    return;
-  }
-
-  m_externalIngressQueues[qid].push_back({qid, dest, pkt->Copy()});
-  const double backlogRatio =
-      maxPerQueue > 0
-          ? static_cast<double>(m_externalIngressQueues[qid].size()) /
-                static_cast<double>(maxPerQueue)
-          : 0.0;
-  if (qid < m_externalIngressBackpressured.size() && backlogRatio >= g_pfcHighWatermark)
-  {
-    m_externalIngressBackpressured[qid] = true;
-  }
-  (void)RefreshExternalIngressPauseState(qid, false);
-}
-
-void
-FlowIo::EnqueueExternalHold(uint32_t queueId, const Address& dest, Ptr<Packet> pkt)
-{
-  EnsureQueueState();
-  const uint32_t qid = queueId % m_numTxQueues;
-
-  if (GetExternalHoldPacketCount() >= m_maxBufferedPackets)
-  {
-    EnsureFlowIoDropSummaryScheduled();
-    {
-      std::lock_guard<std::mutex> lock(g_flowIoDropStatsMutex);
-      ++g_flowIoDropStats.bufferOverflowDrops;
-      g_flowIoDropStats.bufferOverflowDropBytes += pkt->GetSize();
-    }
-    ++m_externalHoldDrops;
-    m_externalHoldDropBytes += pkt->GetSize();
-    static uint64_t sExternalHoldDropLogCount = 0;
-    if (sExternalHoldDropLogCount < 20 || (sExternalHoldDropLogCount % 1000) == 0)
-    {
-      NS_LOG_UNCOND("[DROP][FLOWIO][EXT_HOLD_OVERFLOW] node="
-                    << (m_node ? m_node->GetId() : 0)
-                    << " dev=" << m_outDev
-                    << " qid=" << qid
-                    << " totalHold=" << GetExternalHoldPacketCount()
-                    << " maxHold=" << m_maxBufferedPackets
-                    << " pktSize=" << pkt->GetSize()
-                    << " totalDrops=" << m_externalHoldDrops
-                    << " totalDropBytes=" << m_externalHoldDropBytes);
-    }
-    ++sExternalHoldDropLogCount;
-    return;
-  }
-
-  m_externalHoldQueues[qid].push_back({qid, dest, pkt->Copy()});
-}
-
-void
-FlowIo::TryRefillExternalIngress(uint32_t queueId)
-{
-  EnsureQueueState();
-  const uint32_t qid = queueId % m_numTxQueues;
-  if (RefreshExternalIngressPauseState(qid, false) || m_externalHoldQueues[qid].empty())
-  {
-    return;
-  }
-
-  const uint32_t maxPerQueue = GetExternalIngressMaxPacketsPerQueue();
-  if (m_externalIngressQueues[qid].size() >= maxPerQueue)
-  {
-    return;
-  }
-
-  ExternalBufferedTx item = std::move(m_externalHoldQueues[qid].front());
-  m_externalHoldQueues[qid].pop_front();
-  m_externalIngressQueues[qid].push_back(std::move(item));
-  (void)RefreshExternalIngressPauseState(qid, false);
-}
-
 void
 FlowIo::ScheduleDrain()
 {
   if (!m_drainEvent.IsRunning())
   {
     m_drainEvent = Simulator::Schedule(m_retryInterval, &FlowIo::DrainBuffered, this);
-  }
-}
-
-void
-FlowIo::ScheduleExternalIngressDrain(bool delayed)
-{
-  if (m_externalIngressDrainEvent.IsRunning())
-  {
-    if (!delayed)
-    {
-      Simulator::Cancel(m_externalIngressDrainEvent);
-      m_externalIngressDrainEvent = Simulator::ScheduleNow(&FlowIo::DrainExternalIngress, this);
-    }
-    return;
-  }
-
-  if (delayed)
-  {
-    m_externalIngressDrainEvent = Simulator::Schedule(m_retryInterval, &FlowIo::DrainExternalIngress, this);
-  }
-  else
-  {
-    m_externalIngressDrainEvent = Simulator::ScheduleNow(&FlowIo::DrainExternalIngress, this);
-  }
-}
-
-void
-FlowIo::DrainExternalIngress()
-{
-  EnsureQueueState();
-  if (!HasPendingExternalIngressWork() || m_numTxQueues == 0)
-  {
-    return;
-  }
-
-  bool blocked = false;
-  uint32_t budget = 4096;
-  uint32_t visited = 0;
-  uint32_t sent = 0;
-
-  while (budget-- > 0 && visited < m_numTxQueues)
-  {
-    const uint32_t qid = m_externalIngressRrIndex % m_numTxQueues;
-    m_externalIngressRrIndex = (m_externalIngressRrIndex + 1) % m_numTxQueues;
-    ++visited;
-
-    TryRefillExternalIngress(qid);
-    if (m_externalIngressQueues[qid].empty())
-    {
-      continue;
-    }
-
-    if (RefreshExternalIngressPauseState(qid, true))
-    {
-      blocked = true;
-      continue;
-    }
-
-    ExternalBufferedTx item = m_externalIngressQueues[qid].front();
-    if (!SendOnDevice(m_outDev, item.dest, item.pkt))
-    {
-      blocked = true;
-      if (qid < m_externalIngressBackpressured.size())
-      {
-        m_externalIngressBackpressured[qid] = true;
-      }
-      static uint64_t sExtBlockedLogCount = 0;
-      if (sExtBlockedLogCount < 200 || (sExtBlockedLogCount % 10000) == 0)
-      {
-        NS_LOG_INFO("[FLOWIO][EXTQ][BLOCKED] node=" << (m_node ? m_node->GetId() : 0)
-                    << " dev=" << m_outDev
-                    << " qid=" << qid
-                    << " ingressLen=" << m_externalIngressQueues[qid].size()
-                    << " holdLen=" << m_externalHoldQueues[qid].size()
-                    << " retryInUs=" << m_retryInterval.GetMicroSeconds());
-      }
-      ++sExtBlockedLogCount;
-      break;
-    }
-
-    m_externalIngressQueues[qid].pop_front();
-    ++sent;
-    (void)RefreshExternalIngressPauseState(qid, false);
-    TryRefillExternalIngress(qid);
-    if (qid < m_externalIngressBackpressured.size() &&
-        !m_externalIngressPaused[qid] &&
-        m_externalIngressQueues[qid].empty() &&
-        m_externalHoldQueues[qid].empty())
-    {
-      m_externalIngressBackpressured[qid] = false;
-    }
-    visited = 0;
-  }
-
-  if (sent > 0)
-  {
-    static uint64_t sExtDrainLogCount = 0;
-    if (sExtDrainLogCount < 200 || (sExtDrainLogCount % 10000) == 0)
-    {
-      NS_LOG_INFO("[FLOWIO][EXTQ][DRAIN] sent=" << sent
-                  << " pending=" << HasPendingExternalIngressWork());
-    }
-    ++sExtDrainLogCount;
-  }
-
-  if (HasPendingExternalIngressWork())
-  {
-    ScheduleExternalIngressDrain(blocked);
   }
 }
 
@@ -1091,17 +657,8 @@ FlowIo::Send(const Address& dest,
   EnsureQueueState();
   uint32_t qid = ClassifyQueueId(dest);
 
-  if (mode == FlowSendMode::External && m_bindMode != RxBindMode::BridgeOnly)
+  if (TrySubmitViaRdmaPortEngine(dev, dest, pkt))
   {
-    if (m_externalIngressPaused[qid] || !m_externalHoldQueues[qid].empty())
-    {
-      EnqueueExternalHold(qid, dest, pkt);
-    }
-    else
-    {
-      EnqueueExternalIngress(qid, dest, pkt);
-    }
-    ScheduleExternalIngressDrain(false);
     return;
   }
 

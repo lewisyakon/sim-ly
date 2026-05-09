@@ -93,20 +93,17 @@ class MinHopBridgeNetDevice : public NetDevice
 
     struct IngressQueueSnapshot
     {
-        bool isLocalInjectionQueue = false;
         uint32_t portIndex;
         Mac48Address portMac;
         uint32_t maxPacketsPerQueue;
-        uint32_t totalPackets = 0;
-        uint32_t priorityPackets = 0;
-        uint32_t subQueuePackets = 0;
-        uint64_t priorityBytes = 0;
-        uint64_t subQueueBytes = 0;
-        uint64_t approxBytes = 0;
         std::vector<uint32_t> subQueueLengths;
         std::vector<uint64_t> subQueueDropPackets;
     };
     std::vector<IngressQueueSnapshot> GetIngressQueueSnapshots() const;
+    std::vector<Ptr<NetDevice>> GetLocalInjectionEgressCandidates(const Address& dst);
+    Ptr<NetDevice> ResolveLocalInjectionEgressPort(const Address& src,
+                                                   const Address& dst,
+                                                   uint64_t uidHint = 0);
     
   protected:
     void DoDispose() override;
@@ -174,7 +171,12 @@ class MinHopBridgeNetDevice : public NetDevice
 
     bool Learn(Mac48Address source, Ptr<NetDevice> port, uint8_t hopCount);
     std::vector<Ptr<NetDevice>> GetLearnedState(Mac48Address source);
-    Ptr<NetDevice> ecmp(std::vector<Ptr<NetDevice> > outports, Mac48Address src,  Mac48Address dst, uint64_t uid);
+    Ptr<NetDevice> ecmp(std::vector<Ptr<NetDevice> > outports,
+                        Mac48Address src,
+                        Mac48Address dst,
+                        uint64_t uid,
+                        uint32_t flowTag = 0,
+                        bool hasFlowTag = false);
 
     /** A map of MAC address to learned state. */
     std::map<Mac48Address, std::vector<LearnedState> > m_learnState;
@@ -189,6 +191,7 @@ class MinHopBridgeNetDevice : public NetDevice
     PromiscReceiveCallback m_promiscRxCallback;
     Time m_expirationTime;
     bool m_enableLearning;
+    bool m_terminalLearningOnly;
 
     double m_highWatermark;
     double m_lowWatermark;

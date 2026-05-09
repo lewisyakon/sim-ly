@@ -25,22 +25,21 @@
 #include "ns3/csma-module.h"
 #include "ns3/internet-module.h"
 #include "ns3/network-module.h"
-#include "ns3/node-list.h"
-#include "ns3/point-to-point-net-device.h"
-#include "ns3/min-hop-bridge-net-device.h"
-#include "ns3/PppRoundRobinQueue.h"
 #include "my_entry.h"
 #include <execinfo.h>
+#include <algorithm>
+#include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <numeric>
 #include <queue>
 #include <stdio.h>
 #include <string>
 #include <sstream>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 #include <chrono>
-#include <cstdint>
 #include <nlohmann/json.hpp>
 #ifdef NS3_MTP
 #include "ns3/mtp-module.h"
@@ -55,7 +54,7 @@
 using namespace std;
 using namespace ns3;
 
-extern std::map<std::pair<std::pair<int, int>,int>, AstraSim::ncclFlowTag> receiver_pending_queue;
+std::map<std::pair<std::pair<int, int>,int>, AstraSim::ncclFlowTag> receiver_pending_queue;
 extern uint32_t node_num, switch_num, link_num, trace_num, nvswitch_num, gpus_per_server;
 extern GPUType gpu_type;
 extern std::vector<int>NVswitchs;
@@ -71,7 +70,7 @@ namespace conf
 {
   uint32_t system = 0;
   uint32_t rank = 0;
-  uint32_t thread = 2;
+  uint32_t thread = 1;
   bool nullmsg = false;
 }; 
 
@@ -96,18 +95,6 @@ public:
   ~ASTRASimNetwork() {}
   int sim_comm_size(AstraSim::sim_comm comm, int *size) { return 0; }
   int sim_finish() {
-    for (auto it = nodeHash.begin(); it != nodeHash.end(); it++) {
-      pair<int, int> p = it->first;
-      if (p.second == 0) {
-        // std::cout << "sim_finish on sent, " << " Thread id: " << pthread_self() << std::endl;
-        // cout << "All data sent from node " << p.first << " is " << it->second
-        //      << "\n";
-      } else {
-        // std::cout << "sim_finish on received, " << " Thread id: " << pthread_self() << std::endl;
-        // cout << "All data received by node " << p.first << " is " << it->second
-        //      << "\n";
-      }
-    }
     // uint64_t eventCount = Simulator::GetEventCount();
     // NS_LOG_INFO(" * * * total events : " << eventCount );
     // NS_LOG_INFO("[Rendezvous]: recv="<<totRendezvousRecv<<" send="<<totRendezvousSend);
@@ -176,15 +163,6 @@ public:
     }
 
     dst += npu_offset;
-    task1 t;
-    t.src = rank;
-    t.dest = dst;
-    t.count = count;
-    t.type = 0;
-    t.fun_arg = fun_arg;
-    t.msg_handler = msg_handler;
-    AstraSim::RecvPacketEventHadndlerData* ehd = (AstraSim::RecvPacketEventHadndlerData*) t.fun_arg;
-
     tag=request->flowTag.tag_id;
     // NS_LOG_INFO(" * * * [sim send] tag="<<tag<<" src="<<rank<<" dst="<<dst);
     SendFlow(rank, dst, count, msg_handler, fun_arg, tag, request);
@@ -208,8 +186,6 @@ public:
     // std::unique_lock<std::mutex> lock(g_recvHashMutex);
     // // MtpInterface::explicitCriticalSection cs;
     // #endif
-    // MockNcclLog* NcclLog = MockNcclLog::getInstance();
-    AstraSim::ncclFlowTag flowTag = request->flowTag;
     src += npu_offset;
     task1 t;
     t.src = src;
@@ -218,8 +194,6 @@ public:
     t.type = 1;
     t.fun_arg = fun_arg;
     t.msg_handler = msg_handler;
-    int flow_id = request->flowTag.current_flow_id;
-
     // NcclLog->writeLog(NcclLogLevel::DEBUG,"[Receive event registration] src %d sim_recv on rank %d tag_id %d channdl id %d",src,rank,tag,ehd->flowTag.channel_id);
     AstraSim::RecvPacketEventHadndlerData* ehd = (AstraSim::RecvPacketEventHadndlerData*) t.fun_arg;
     tag=ehd->flowTag.tag_id;
@@ -229,14 +203,15 @@ public:
     if (clientHelper->check_recvhash(tag,src,rank)) {
       uint64_t count = clientHelper->get_recvhash(tag,src,rank);
       if (count == t.count) {
+        AstraSim::sim_request doneRequest = clientHelper->get_flowtag(tag,src,rank);
         clientHelper->erase_recvhash(tag,src,rank);
+        clientHelper->erase_flowtag(tag,src,rank);
         // #ifdef NS3_MTP
         // lock.unlock();
         // // cs.ExitSection();
         // #endif
-        ehd->flowTag=clientHelper->get_flowtag(tag,src,rank).flowTag;
+        ehd->flowTag=doneRequest.flowTag;
         t.msg_handler(t.fun_arg);
-        clientHelper->erase_flowtag(tag,src,rank);
         // NS_LOG_INFO("flowid= " << flow_id << " 接收确认 ");
         goto sim_recv_end_section;
       } else if (count > t.count) {
@@ -308,24 +283,43 @@ static int ParseAllGpusFromWorkloadHeader(const std::string& workload_path) {
 static std::string ResolveNetworkConfigPathFromArgv(int argc, char* argv[]) {
   std::string config_path = "simconfig/config.json";
   const std::string long_prefix = "--network_conf=";
+  const std::string long_dash_prefix = "--network-conf=";
+  const std::string short_prefix = "-c=";
+  const std::string compact_short_prefix = "-c";
+
   for (int i = 1; i < argc; ++i) {
     if (argv[i] == nullptr) {
       continue;
     }
     const std::string arg = argv[i];
-    if (arg == "-c" && (i + 1) < argc && argv[i + 1] != nullptr) {
+    if ((arg == "-c" || arg == "--network_conf" || arg == "--network-conf") &&
+        (i + 1) < argc && argv[i + 1] != nullptr) {
       config_path = argv[i + 1];
       ++i;
       continue;
     }
     if (arg.rfind(long_prefix, 0) == 0) {
       config_path = arg.substr(long_prefix.size());
+      continue;
+    }
+    if (arg.rfind(long_dash_prefix, 0) == 0) {
+      config_path = arg.substr(long_dash_prefix.size());
+      continue;
+    }
+    if (arg.rfind(short_prefix, 0) == 0) {
+      config_path = arg.substr(short_prefix.size());
+      continue;
+    }
+    if (arg.rfind(compact_short_prefix, 0) == 0 && arg.size() > compact_short_prefix.size()) {
+      config_path = arg.substr(compact_short_prefix.size());
+      continue;
     }
   }
-  return config_path;
+  return config_path.empty() ? "simconfig/config.json" : config_path;
 }
 
-static uint32_t ResolveThreadFromConfig(const std::string& config_path, uint32_t fallback) {
+static uint32_t ResolveThreadFromConfig(const std::string& config_path,
+                                        uint32_t fallback) {
   std::ifstream in(config_path);
   if (!in.is_open()) {
     return fallback;
@@ -355,6 +349,59 @@ static uint32_t ResolveThreadFromConfig(const std::string& config_path, uint32_t
   return fallback;
 }
 
+#ifdef NS3_MPI
+static bool IsUserShortOptionWithValue(char opt) {
+  return opt == 't' || opt == 'w' || opt == 'g' ||
+         opt == 's' || opt == 'n' || opt == 'c';
+}
+
+static std::vector<std::string> BuildNs3CommandLineArgs(int argc, char* argv[]) {
+  std::vector<std::string> args;
+  args.push_back((argc > 0 && argv[0] != nullptr) ? argv[0] : "");
+
+  for (int i = 1; i < argc; ++i) {
+    if (argv[i] == nullptr) {
+      continue;
+    }
+    const std::string arg = argv[i];
+
+    if (arg == "-h") {
+      continue;
+    }
+    if (arg.size() >= 2 && arg[0] == '-' && arg[1] != '-') {
+      const char opt = arg[1];
+      if (IsUserShortOptionWithValue(opt)) {
+        if (arg.size() == 2 && (i + 1) < argc) {
+          ++i;
+        }
+        continue;
+      }
+    }
+
+    const auto skipLongWithValue = [&](const std::string& name) -> bool {
+      if (arg == name) {
+        if ((i + 1) < argc) {
+          ++i;
+        }
+        return true;
+      }
+      return arg.rfind(name + "=", 0) == 0;
+    };
+    if (skipLongWithValue("--network_conf") ||
+        skipLongWithValue("--network-conf") ||
+        skipLongWithValue("--workload") ||
+        skipLongWithValue("--network_topo") ||
+        skipLongWithValue("--network-topo") ||
+        skipLongWithValue("--thread")) {
+      continue;
+    }
+
+    args.push_back(arg);
+  }
+  return args;
+}
+#endif
+
 static std::string ResolvePpScheduleFromConfig(const std::string& config_path) {
   std::ifstream in(config_path);
   if (!in.is_open()) {
@@ -376,6 +423,86 @@ static std::string ResolvePpScheduleFromConfig(const std::string& config_path) {
     }
   }
   return "gpipe";
+}
+
+struct Ns3ComponentLogSwitches {
+  bool sendFlowClient = true;
+  bool rdmaPortEngine = true;
+  bool genericSimulation = true;
+  bool minHopBridgeNetDevice = true;
+  bool pointToPointNetDevice = true;
+  bool pppRoundRobinQueue = true;
+};
+
+static void SetBoolFromJsonIfPresent(const nlohmann::json& obj,
+                                     const char* key,
+                                     bool* target) {
+  if (target == nullptr || key == nullptr) {
+    return;
+  }
+  if (!obj.contains(key) || !obj[key].is_boolean()) {
+    return;
+  }
+  *target = obj[key].get<bool>();
+}
+
+static Ns3ComponentLogSwitches LoadNs3ComponentLogSwitches(const std::string& config_path) {
+  Ns3ComponentLogSwitches switches;
+  std::ifstream in(config_path);
+  if (!in.is_open()) {
+    return switches;
+  }
+
+  nlohmann::json j;
+  try {
+    in >> j;
+  } catch (...) {
+    return switches;
+  }
+
+  if (!j.contains("logging") || !j["logging"].is_object()) {
+    return switches;
+  }
+  const auto& logging = j["logging"];
+  if (!logging.contains("ns3_components") || !logging["ns3_components"].is_object()) {
+    return switches;
+  }
+  const auto& components = logging["ns3_components"];
+
+  SetBoolFromJsonIfPresent(components, "send_flow_client", &switches.sendFlowClient);
+  SetBoolFromJsonIfPresent(components, "rdma_port_engine", &switches.rdmaPortEngine);
+  SetBoolFromJsonIfPresent(components, "generic_simulation", &switches.genericSimulation);
+  SetBoolFromJsonIfPresent(components,
+                           "min_hop_bridge_net_device",
+                           &switches.minHopBridgeNetDevice);
+  SetBoolFromJsonIfPresent(components,
+                           "point_to_point_net_device",
+                           &switches.pointToPointNetDevice);
+  SetBoolFromJsonIfPresent(components,
+                           "ppp_round_robin_queue",
+                           &switches.pppRoundRobinQueue);
+  return switches;
+}
+
+static void EnableNs3ComponentLogs(const Ns3ComponentLogSwitches& switches) {
+  if (switches.sendFlowClient) {
+    LogComponentEnable("SendFlowClient", LOG_LEVEL_INFO);
+  }
+  if (switches.rdmaPortEngine) {
+    LogComponentEnable("RdmaPortEngine", LOG_LEVEL_INFO);
+  }
+  if (switches.genericSimulation) {
+    LogComponentEnable("GENERIC_SIMULATION", LOG_LEVEL_INFO);
+  }
+  if (switches.minHopBridgeNetDevice) {
+    LogComponentEnable("MinHopBridgeNetDevice", LOG_LEVEL_INFO);
+  }
+  if (switches.pointToPointNetDevice) {
+    LogComponentEnable("PointToPointNetDevice", LOG_LEVEL_INFO);
+  }
+  if (switches.pppRoundRobinQueue) {
+    LogComponentEnable("PppRoundRobinQueue", LOG_LEVEL_INFO);
+  }
 }
 
 static int user_param_prase(int argc,char * argv[],struct user_param* user_param){
@@ -414,16 +541,14 @@ static int user_param_prase(int argc,char * argv[],struct user_param* user_param
 void Initialize(int argc, char * argv[])
 {
     #ifdef NS3_MPI
-    std::string networkConfCliArg;
     CommandLine cmd;
+    std::string networkConfCliArg;
     // parse mtp/mpi options
     cmd.AddValue("system", "Number of logical processes in MTP manual partition", conf::system);
     cmd.AddValue("nullmsg", "Enable null message algorithm", conf::nullmsg);
-    // Keep custom config args visible to ns-3 CommandLine so -c/--network_conf
-    // does not fail before user_param_prase() handles it.
     cmd.AddValue("network_conf", "Path to network config JSON", networkConfCliArg);
     cmd.AddValue("c", "Alias for network_conf", networkConfCliArg);
-    cmd.Parse(argc, argv);
+    cmd.Parse(BuildNs3CommandLineArgs(argc, argv));
 
     MtpInterface::Enable(conf::thread);
     MpiInterface::Enable(&argc, &argv);
@@ -439,27 +564,6 @@ void GetGlobalStart()
   global_start = std::chrono::high_resolution_clock::now();
 }
 
-/*
-mpirun \
-  --wdir /mnt/nfs/cloud/hybrid \
-  --launch-agent "/usr/local/bin/mpi-docker-agent /usr/bin/orted" \
-  -np 1 --host lab206:1 --map-by ppr:1:node:PE=1 --bind-to none /bin/hostname : \
-  -np 1 --host lab254:1 --map-by ppr:1:node:PE=1 --bind-to none /bin/hostname : \
-  -np 2 --host lab188:2 --map-by ppr:2:node:PE=2 --bind-to none /bin/hostname
-
-mpirun \
-  --wdir /mnt/nfs/cloud/hybrid \
-  --launch-agent "/usr/local/bin/mpi-docker-agent /usr/bin/orted" \
-  --mca btl_tcp_if_include ztkse63itn \
-  --mca oob_tcp_if_include ztkse63itn \
-  -np 1 --host lab206:1 --map-by ppr:1:node:PE=32 --bind-to none \
-  /mnt/nfs/cloud/hybrid/build/scratch/ns3.44-my_AstraSimNetwork-default : \
-  -np 1 --host lab254:1 --map-by ppr:1:node:PE=32 --bind-to none \
-  /mnt/nfs/cloud/hybrid/build/scratch/ns3.44-my_AstraSimNetwork-default : \
-  -np 2 --host lab188:2 --map-by ppr:2:node:PE=64 --bind-to none \
-  /mnt/nfs/cloud/hybrid/build/scratch/ns3.44-my_AstraSimNetwork-default
-*/
-
 int main(int argc, char *argv[]) {
   const std::string startup_config = ResolveNetworkConfigPathFromArgv(argc, argv);
   conf::thread = ResolveThreadFromConfig(startup_config, conf::thread);
@@ -471,29 +575,48 @@ int main(int argc, char *argv[]) {
   #endif
 
   struct user_param user_param;
-  // MockNcclLog::set_log_name("SimAI.log");
-  // MockNcclLog* NcclLog = MockNcclLog::getInstance();
-  // NcclLog->writeLog(NcclLogLevel::INFO," init SimAI.log ");
   if(user_param_prase(argc,argv,&user_param)){
     return 0;
   }
   
-  network_config = user_param.network_conf.empty() ? "simconfig/config.json"
+  network_config = user_param.network_conf.empty() ? startup_config
                                                    : user_param.network_conf;
-  // Enable SendFlowClient logs before network/app construction so [ROCE][CFG]
-  // emitted during SetRoceConfig is visible in simulation.log.
-  // LogComponentEnable("SendFlowClient",LOG_LEVEL_INFO);
-  // AsciiTraceHelper ascii;
-  // std::string simulationLogPath = "simulation.log";
-  // #ifdef NS3_MPI
-  // if (conf::rank != 0) {
-  //   simulationLogPath = "simulation.rank" + std::to_string(conf::rank) + ".log";
-  // }
-  // #endif
-  // Ptr<OutputStreamWrapper> stream = ascii.CreateFileStream(simulationLogPath);
-  // std::streambuf* oldbuf = std::clog.rdbuf(stream->GetStream()->rdbuf());
-  // const std::ios_base::fmtflags oldClogFlags = std::clog.flags();
-  // std::clog << std::unitbuf;
+  const RuntimeLogConfig runtimeLogCfg = LoadRuntimeLogConfig(network_config);
+  const Ns3ComponentLogSwitches ns3LogSwitches =
+      LoadNs3ComponentLogSwitches(network_config);
+  const std::string simulationLogPath =
+      ResolveRuntimeLogPath(runtimeLogCfg.dir, runtimeLogCfg.simulationLog);
+  const std::string ncclLogPath =
+      ResolveRuntimeLogPath(runtimeLogCfg.dir, runtimeLogCfg.ncclLog);
+  if (!simulationLogPath.empty() && !EnsureParentDirectoryForFile(simulationLogPath))
+  {
+    std::cerr << "[LOGGING] failed to create parent directory for simulation log: "
+              << simulationLogPath << "\n";
+    return 1;
+  }
+  if (!ncclLogPath.empty() && !EnsureParentDirectoryForFile(ncclLogPath))
+  {
+    std::cerr << "[LOGGING] failed to create parent directory for NCCL log: "
+              << ncclLogPath << "\n";
+    return 1;
+  }
+  MockNcclLog::set_log_name(ncclLogPath);
+  MockNcclLog* NcclLog = MockNcclLog::getInstance();
+  NcclLog->writeLog(NcclLogLevel::INFO," init %s ", ncclLogPath.c_str());
+  // Enable all configured ns-3 log components in one place before construction
+  // so early startup logs (e.g., [ROCE][CFG]) are visible in simulation.log.
+  EnableNs3ComponentLogs(ns3LogSwitches);
+  AsciiTraceHelper ascii;
+  Ptr<OutputStreamWrapper> stream = ascii.CreateFileStream(simulationLogPath);
+  std::streambuf* oldbuf = std::clog.rdbuf(stream->GetStream()->rdbuf());
+  const std::ios_base::fmtflags oldClogFlags = std::clog.flags();
+  std::clog << std::unitbuf;
+  auto restoreClog = [&]() {
+    std::clog.flush();
+    std::clog.flags(oldClogFlags);
+    std::clog.rdbuf(oldbuf);
+    stream = nullptr;
+  };
 
   AstraSim::Workload::SetDefaultPPScheduleByString(
       ResolvePpScheduleFromConfig(network_config));
@@ -504,6 +627,7 @@ int main(int argc, char *argv[]) {
     {
       std::cerr << "[MACTABLE] load failed from directory: " << mactable_load_dir
                 << ", aborting to avoid running with incomplete preloaded state.\n";
+      restoreClog();
       return 1;
     }
   }
@@ -516,6 +640,7 @@ int main(int argc, char *argv[]) {
     std::cerr << "[ConfigMismatch] workload all_gpus=" << workload_all_gpus
               << " but topology GPUs=" << gpu_num << ".\n";
     std::cerr << "[Hint] For FatTree k=4: GPUs = 16 * gpus_per_server.\n";
+    restoreClog();
     return 1;
   }
 
@@ -528,17 +653,6 @@ int main(int argc, char *argv[]) {
     node2nvswitch[i] = i;
     NVswitchs.push_back(i);
   }
-
-  // LogComponentEnable("OnOffApplication", LOG_LEVEL_INFO);
-  // LogComponentEnable("PacketSink", LOG_LEVEL_INFO);
-  // LogComponentEnable("GENERIC_SIMULATION", LOG_LEVEL_ERROR);
-  // LogComponentEnable("MinHopBridgeNetDevice", LOG_LEVEL_INFO);
-  // LogComponentEnable("PointToPointNetDevice", LOG_LEVEL_INFO);
-  // LogComponentEnable("PppRoundRobinQueue", LOG_LEVEL_INFO);
-  // LogComponentEnable("HybridSimulatorImpl",LOG_LEVEL_INFO);
-  // LogComponentEnable("MtpInterface",LOG_LEVEL_INFO);
-  // LogComponentEnable("GrantedTimeWindowMpiInterface",LOG_LEVEL_INFO);
-  // LogComponentEnable("LogicalProcess", LOG_LEVEL_INFO);
 
   std::vector<ASTRASimNetwork *> networks(nodes_num, nullptr);
   std::vector<AstraSim::Sys *> systems(nodes_num, nullptr);
@@ -612,7 +726,7 @@ int main(int argc, char *argv[]) {
       }
   });
 
-  if (!mactable_load_enable)
+  if (mactable_dump_enable)
   {
     ns3::Time dumpTime = ns3::Seconds(warmupSeconds) - ns3::NanoSeconds(1);
     if (dumpTime < ns3::Seconds(0))
@@ -620,7 +734,7 @@ int main(int argc, char *argv[]) {
       dumpTime = ns3::Seconds(0);
     }
     ns3::Simulator::Schedule(dumpTime, []() {
-      DumpBridgeMacTablesToDirectory(mactable_load_dir);
+      DumpBridgeMacTablesToDirectory(mactable_dump_dir);
     });
   }
 
@@ -635,21 +749,49 @@ int main(int argc, char *argv[]) {
     GetGlobalStart();
   });  
   #endif
-
   // ns3::Simulator::Schedule(ns3::Seconds(190), [nodes_num,systems](){
   //     printlearnstate();
   // });
 
-  // std::cout << "simulator run " << std::endl;
+  std::cout << "simulator run " << std::endl;
   Simulator::Stop(Seconds(2000000000));
   Simulator::Run(); 
 
   uint64_t eventCount = Simulator::GetEventCount();
+  const uint64_t lastNetworkActivityTimeFs = GetLastNetworkActivityTimeFs();
+  const uint64_t lastFlowTxDoneTimeFs = GetLastFlowTxDoneTimeFs();
+  const uint64_t workloadStartTimeFs =
+      static_cast<uint64_t>(warmupSeconds) * 1000000000000000ULL;
+  auto emitMainMetric = [](const std::string& msg) {
+    NS_LOG_INFO(msg);
+    std::cout << msg << std::endl;
+  };
+  auto buildTimeMetric = [workloadStartTimeFs](const std::string& label, uint64_t absTimeFs) {
+    const uint64_t relativeTimeFs =
+        absTimeFs >= workloadStartTimeFs ? (absTimeFs - workloadStartTimeFs) : 0;
+    const double absTimeNs = static_cast<double>(absTimeFs) / 1e6;
+    const double absTimeUs = static_cast<double>(absTimeFs) / 1e9;
+    const double absTimeMs = static_cast<double>(absTimeFs) / 1e12;
+    const double relativeTimeNs = static_cast<double>(relativeTimeFs) / 1e6;
+    const double relativeTimeUs = static_cast<double>(relativeTimeFs) / 1e9;
+    const double relativeTimeMs = static_cast<double>(relativeTimeFs) / 1e12;
+    std::ostringstream oss;
+    oss << "[main] " << label
+        << " abs_time(ns)=" << absTimeNs
+        << " abs_time(us)=" << absTimeUs
+        << " abs_time(ms)=" << absTimeMs
+        << " since_workload_start(ns)=" << relativeTimeNs
+        << " since_workload_start(us)=" << relativeTimeUs
+        << " since_workload_start(ms)=" << relativeTimeMs;
+    return oss.str();
+  };
   // NS_LOG_INFO(" * * * total events : " << eventCount );
   // NS_LOG_INFO("[Rendezvous]: recv="<<totRendezvousRecv<<" send="<<totRendezvousSend);
 
   #ifdef NS3_MPI
   uint64_t eventCounts[mx_sys], sendCounts[mx_sys];
+  uint64_t networkActivityTimes[mx_sys];
+  uint64_t flowTxDoneTimes[mx_sys];
   MPI_Gather(&eventCount,
           1,
           MPI_UNSIGNED_LONG_LONG,
@@ -666,17 +808,42 @@ int main(int argc, char *argv[]) {
           MPI_UNSIGNED_LONG_LONG,
           0,
           MpiInterface::GetCommunicator());
+  MPI_Gather(&lastNetworkActivityTimeFs,
+          1,
+          MPI_UNSIGNED_LONG_LONG,
+          networkActivityTimes,
+          1,
+          MPI_UNSIGNED_LONG_LONG,
+          0,
+          MpiInterface::GetCommunicator());
+  MPI_Gather(&lastFlowTxDoneTimeFs,
+          1,
+          MPI_UNSIGNED_LONG_LONG,
+          flowTxDoneTimes,
+          1,
+          MPI_UNSIGNED_LONG_LONG,
+          0,
+          MpiInterface::GetCommunicator());
 
   if(MpiInterface::GetSystemId() == 0){
-    // NS_LOG_INFO("[main] total send count="<<std::accumulate(sendCounts, sendCounts + conf::system, 0ULL));
-    // NS_LOG_INFO("[main] total events="<<std::accumulate(eventCounts, eventCounts + conf::system, 0ULL));
+    NS_LOG_INFO("[main] total send count="<<std::accumulate(sendCounts, sendCounts + conf::system, 0ULL));
+    NS_LOG_INFO("[main] total events="<<std::accumulate(eventCounts, eventCounts + conf::system, 0ULL));
+    const uint64_t maxNetworkActivityTimeFs =
+        *std::max_element(networkActivityTimes, networkActivityTimes + conf::system);
+    const uint64_t maxFlowTxDoneTimeFs =
+        *std::max_element(flowTxDoneTimes, flowTxDoneTimes + conf::system);
+    emitMainMetric(buildTimeMetric("network drained", maxNetworkActivityTimeFs));
+    emitMainMetric(buildTimeMetric("last FLOW_TX_DONE", maxFlowTxDoneTimeFs));
+  }
+  #elif NS3_MTP
+  {
+    emitMainMetric(buildTimeMetric("network drained", lastNetworkActivityTimeFs));
+    emitMainMetric(buildTimeMetric("last FLOW_TX_DONE", lastFlowTxDoneTimeFs));
   }
   #endif
-  (void)eventCount;
 
   global_end = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(global_end - global_start);
-  (void)duration;
   #ifdef NS3_MPI
   if(MpiInterface::GetSystemId() == 0)
   {
@@ -696,14 +863,11 @@ int main(int argc, char *argv[]) {
   #ifdef NS3_MPI
   MpiInterface::Disable();
   #elif NS3_MTP
-  // NS_LOG_INFO("[main] total send count="<<totRendezvousSend);
-  // NS_LOG_INFO("[main] total events="<<eventCount);
+  NS_LOG_INFO("[main] total send count="<<totRendezvousSend);
+  NS_LOG_INFO("[main] total events="<<eventCount);
   #endif
   
-  // std::clog.flush();
-  // std::clog.flags(oldClogFlags);
-  // std::clog.rdbuf(oldbuf);   // 恢复到原始 buffer（非常关键）
-  // stream = nullptr;          // 释放 OutputStreamWrapper（可选，确保先恢复再销毁）
+  restoreClog();
   
   return 0;
 }

@@ -57,6 +57,7 @@ vcpkg/
 /mactable/
 /mactable_test*/
 
+<<<<<<< HEAD
 # Ignore archive packages placed in the repository root
 /*.zip
 /*.7z
@@ -68,3 +69,7 @@ vcpkg/
 /*.tbz2
 /*.tar.xz
 /*.txz
+=======
+# Local AI skill worktrees
+/qiushi-skill/
+>>>>>>> roce-midstage
