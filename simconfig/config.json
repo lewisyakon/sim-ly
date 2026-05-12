@@ -1,5 +1,5 @@
 {
-  "workloadpath": "simworkload/microAllReduce.txt",
+  "workloadpath": "simworkload/128_test.txt",
   "thread": 1,
   "gpu_type": "A100",                
   "nvswitch_per_server": 1,
@@ -21,41 +21,42 @@
 
   "logging": {
     "dir": "simlog",
-    "simulation_log": "microAllReduce.log",
-    "nccl_log": "microAllReduce.log",
+    "simulation_log": "128_test.log",
+    "nccl_log": "128_test.log",
     "log_levels": {
-      "roce": "off",
-      "pfc": "off"
+      "roce": "all",
+      "pfc": "all"
     },
     "ns3_components": {
-      "send_flow_client": false,
-      "rdma_port_engine": false,
-      "generic_simulation": false,
-      "min_hop_bridge_net_device": false,
-      "point_to_point_net_device": false,
-      "ppp_round_robin_queue": false
+      "send_flow_client": true,
+      "rdma_port_engine": true,
+      "generic_simulation": true,
+      "min_hop_bridge_net_device": true,
+      "point_to_point_net_device": true,
+      "ppp_round_robin_queue": true
     }
   },
 
   "mactable": {
     "load_enable": false,
-    "dump_enable": true,
-    "dir": "mactable"
+    "dump_enable": false,
+    "dir": ""
   },
 
   "pfc": {
-    "drop_tail_queue_size": "500",
+    "drop_tail_queue_size": "5000000",
     "drop_tail_queue_num": "16",
     "high_watermark": 0.8,
-    "low_watermark": 0.2
+    "low_watermark": 0.2,
+    "not_head_retry_ns": 1
   },
 
   "topology": {
     "model": "fattree",
     "file": "simtopo/external-fattree-k4-gpu4-fullmesh.topo",
-    "k": 4,
+    "k": 8,
     "subnet_model": 0,              
-    "subnet_k": 16,                             
+    "subnet_k": 1,                             
     "hostperleaf": 2,                            
     "switch_delay_ns_override": 100 
   },
@@ -67,8 +68,8 @@
     "sq_depth": 1024,
     "rq_depth": 1024,
     "transport_ack_enable": true,
-    "transport_window_packets": 32,
-    "reorder_window_packets": 4,
+    "transport_window_packets": 500000,
+    "reorder_window_packets": 400000,
     "ack_timeout_mode": "auto",
     "ack_timeout_factor": 8.0,
     "ack_timeout_ns": 50000,

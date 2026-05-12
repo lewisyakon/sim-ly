@@ -143,6 +143,11 @@ MinHopBridgeNetDevice::GetTypeId()
                           DoubleValue(0.2),
                           MakeDoubleAccessor(&MinHopBridgeNetDevice::m_lowWatermark),
                           MakeDoubleChecker<double>(0.0, 1.0))
+            .AddAttribute("NotHeadRetryDelay",
+                          "Retry delay used when an ingress packet is blocked by a higher-priority head packet.",
+                          TimeValue(NanoSeconds(1)),
+                          MakeTimeAccessor(&MinHopBridgeNetDevice::m_notHeadRetryDelay),
+                          MakeTimeChecker())
             .AddAttribute("ExpirationTime",
                           "Time it takes for learned MAC state entry to expire.",
                           TimeValue(Seconds(99999)),
@@ -160,6 +165,7 @@ MinHopBridgeNetDevice::MinHopBridgeNetDevice()
       m_terminalLearningOnly(false),
       m_highWatermark(0.8),
       m_lowWatermark(0.2),
+      m_notHeadRetryDelay(NanoSeconds(1)),
       m_nextIngressPacketToken(0),
       m_ingressQueueDrops(0),
       m_ingressQueueDropBytes(0),
@@ -382,6 +388,16 @@ MinHopBridgeNetDevice::ScheduleIngressDrainRetry(Ptr<NetDevice> incomingPort,
                                                  Ptr<Packet> packet)
 {
     Time retryDelay = (m_switchDelay.IsStrictlyPositive() ? m_switchDelay : MicroSeconds(1));
+    ScheduleIngressDrainEvent(incomingPort, packetToken, packet, retryDelay);
+}
+
+void
+MinHopBridgeNetDevice::ScheduleIngressNotHeadRetry(Ptr<NetDevice> incomingPort,
+                                                   uint64_t packetToken,
+                                                   Ptr<Packet> packet)
+{
+    Time retryDelay =
+        (m_notHeadRetryDelay.IsStrictlyPositive() ? m_notHeadRetryDelay : NanoSeconds(1));
     ScheduleIngressDrainEvent(incomingPort, packetToken, packet, retryDelay);
 }
 
@@ -690,7 +706,7 @@ MinHopBridgeNetDevice::DrainIngressQueue(Ptr<NetDevice> incomingPort,
     }
     if (PeekPointer(head) != PeekPointer(packet))
     {
-        ScheduleIngressDrainRetry(incomingPort, packetToken, packet);
+        ScheduleIngressNotHeadRetry(incomingPort, packetToken, packet);
         return;
     }
 

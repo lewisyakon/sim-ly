@@ -152,6 +152,9 @@ class MinHopBridgeNetDevice : public NetDevice
     void ScheduleIngressDrainRetry(Ptr<NetDevice> incomingPort,
                                    uint64_t packetToken,
                                    Ptr<Packet> packet);
+    void ScheduleIngressNotHeadRetry(Ptr<NetDevice> incomingPort,
+                                     uint64_t packetToken,
+                                     Ptr<Packet> packet);
     void DrainIngressQueue(Ptr<NetDevice> incomingPort, uint64_t packetToken, Ptr<Packet> packet);
     bool HasAvailableUnicastPath(Ptr<NetDevice> incomingPort, Mac48Address dst);
     bool HasAvailableFloodPath(Ptr<NetDevice> incomingPort, Mac48Address dst);
@@ -201,6 +204,7 @@ class MinHopBridgeNetDevice : public NetDevice
 
     double m_highWatermark;
     double m_lowWatermark;
+    Time m_notHeadRetryDelay;
     uint64_t m_nextIngressPacketToken;
     std::map<Ptr<NetDevice>, std::set<uint32_t>> m_pausedIngressQueueIds;
     // Map ingress sub-queue -> upstream egress sub-queue id used in PAUSE/RESUME frames.

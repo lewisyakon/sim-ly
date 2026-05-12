@@ -68,6 +68,7 @@ std::string mactable_load_dir;
 std::string mactable_dump_dir;
 double pfc_high_watermark;
 double pfc_low_watermark;
+uint64_t pfc_not_head_retry_ns;
 uint32_t node_num, switch_num, link_num, trace_num, nvswitch_num, gpus_per_server,
             nvswitch_per_server,numGPUs;
 uint32_t Topology_model,subnet_model,subnet_k,numHosts,switch_delay;
@@ -213,6 +214,7 @@ ApplyBridgePfcWatermarks(const Ptr<MinHopBridgeNetDevice>& dev)
 {
     dev->SetAttribute("PfcHighWatermark", DoubleValue(pfc_high_watermark));
     dev->SetAttribute("PfcLowWatermark", DoubleValue(pfc_low_watermark));
+    dev->SetAttribute("NotHeadRetryDelay", TimeValue(NanoSeconds(pfc_not_head_retry_ns)));
 }
 
 static inline bool
@@ -1575,6 +1577,7 @@ bool ReadConf(std::string network_conf)
   auto effective_floadtime_bak  = effective_floadtime;
   auto pfc_high_watermark_bak   = pfc_high_watermark;
   auto pfc_low_watermark_bak    = pfc_low_watermark;
+  auto pfc_not_head_retry_ns_bak = pfc_not_head_retry_ns;
   auto external_topology_file_bak = external_topology_file;
   auto external_topology_spec_bak = g_externalTopologySpec;
   bool mactable_load_switch_seen = false;
@@ -1614,6 +1617,7 @@ bool ReadConf(std::string network_conf)
     effective_floadtime = effective_floadtime_bak;
     pfc_high_watermark = pfc_high_watermark_bak;
     pfc_low_watermark = pfc_low_watermark_bak;
+    pfc_not_head_retry_ns = pfc_not_head_retry_ns_bak;
     external_topology_file = external_topology_file_bak;
     g_externalTopologySpec = external_topology_spec_bak;
   };
@@ -1709,6 +1713,10 @@ bool ReadConf(std::string network_conf)
     if (JHas(pf, "log_level"))
     {
       g_pfcLogLevel = ParsePfcLogLevel(pf["log_level"]);
+    }
+    if (JHas(pf, "not_head_retry_ns"))
+    {
+      pfc_not_head_retry_ns = pf["not_head_retry_ns"].get<uint64_t>();
     }
   }
 
@@ -2001,6 +2009,10 @@ bool ReadConf(std::string network_conf)
       std::min(g_roce_cfg.reorderWindowPackets, g_roce_cfg.transportWindowPackets);
   g_pfcHighWatermark = pfc_high_watermark;
   g_pfcLowWatermark = pfc_low_watermark;
+  if (pfc_not_head_retry_ns == 0)
+  {
+    pfc_not_head_retry_ns = 1;
+  }
   RefreshRoceAckTimeoutFromNetworkConfig();
   return true;
 }
@@ -2046,6 +2058,7 @@ void SetConfig(){
     mactable_dump_dir="mactable";
     pfc_high_watermark=0.8;
     pfc_low_watermark=0.2;
+    pfc_not_head_retry_ns=1;
     g_pfcHighWatermark = pfc_high_watermark;
     g_pfcLowWatermark = pfc_low_watermark;
 
