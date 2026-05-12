@@ -73,3 +73,6 @@ vcpkg/
 # Local AI skill worktrees
 /qiushi-skill/
 >>>>>>> roce-midstage
+
+/simconfig/
+/simlog/

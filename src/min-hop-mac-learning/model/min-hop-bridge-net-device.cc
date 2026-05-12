@@ -160,6 +160,7 @@ MinHopBridgeNetDevice::MinHopBridgeNetDevice()
       m_terminalLearningOnly(false),
       m_highWatermark(0.8),
       m_lowWatermark(0.2),
+      m_nextIngressPacketToken(0),
       m_ingressQueueDrops(0),
       m_ingressQueueDropBytes(0),
       m_forwardSendFailDrops(0),
@@ -340,17 +341,19 @@ MinHopBridgeNetDevice::EnqueueIngressPacket(Ptr<NetDevice> incomingPort,
     {
         drainDelay = m_switchDelay;
     }
-    ScheduleIngressDrainEvent(incomingPort, ingressPacket->GetUid(), drainDelay);
+    uint64_t packetToken = ++m_nextIngressPacketToken;
+    ScheduleIngressDrainEvent(incomingPort, packetToken, ingressPacket, drainDelay);
     return true;
 }
 
 void
 MinHopBridgeNetDevice::ScheduleIngressDrainEvent(Ptr<NetDevice> incomingPort,
-                                                 uint64_t packetUid,
+                                                 uint64_t packetToken,
+                                                 Ptr<Packet> packet,
                                                  Time delay)
 {
     auto& portEvents = m_ingressRetryEvents[incomingPort];
-    auto& ev = portEvents[packetUid];
+    auto& ev = portEvents[packetToken];
     if (!ev.IsPending())
     {
         if (delay.IsStrictlyPositive())
@@ -359,23 +362,27 @@ MinHopBridgeNetDevice::ScheduleIngressDrainEvent(Ptr<NetDevice> incomingPort,
                                      &MinHopBridgeNetDevice::DrainIngressQueue,
                                      this,
                                      incomingPort,
-                                     packetUid);
+                                     packetToken,
+                                     packet);
         }
         else
         {
             ev = Simulator::ScheduleNow(&MinHopBridgeNetDevice::DrainIngressQueue,
                                         this,
                                         incomingPort,
-                                        packetUid);
+                                        packetToken,
+                                        packet);
         }
     }
 }
 
 void
-MinHopBridgeNetDevice::ScheduleIngressDrainRetry(Ptr<NetDevice> incomingPort, uint64_t packetUid)
+MinHopBridgeNetDevice::ScheduleIngressDrainRetry(Ptr<NetDevice> incomingPort,
+                                                 uint64_t packetToken,
+                                                 Ptr<Packet> packet)
 {
     Time retryDelay = (m_switchDelay.IsStrictlyPositive() ? m_switchDelay : MicroSeconds(1));
-    ScheduleIngressDrainEvent(incomingPort, packetUid, retryDelay);
+    ScheduleIngressDrainEvent(incomingPort, packetToken, packet, retryDelay);
 }
 
 bool
@@ -652,12 +659,14 @@ MinHopBridgeNetDevice::HasAvailableFloodPath(Ptr<NetDevice> incomingPort, Mac48A
 }
 
 void
-MinHopBridgeNetDevice::DrainIngressQueue(Ptr<NetDevice> incomingPort, uint64_t packetUid)
+MinHopBridgeNetDevice::DrainIngressQueue(Ptr<NetDevice> incomingPort,
+                                         uint64_t packetToken,
+                                         Ptr<Packet> packet)
 {
     auto portEventsIt = m_ingressRetryEvents.find(incomingPort);
     if (portEventsIt != m_ingressRetryEvents.end())
     {
-        auto eventIt = portEventsIt->second.find(packetUid);
+        auto eventIt = portEventsIt->second.find(packetToken);
         if (eventIt != portEventsIt->second.end())
         {
             portEventsIt->second.erase(eventIt);
@@ -679,9 +688,9 @@ MinHopBridgeNetDevice::DrainIngressQueue(Ptr<NetDevice> incomingPort, uint64_t p
     {
         return;
     }
-    if (head->GetUid() != packetUid)
+    if (PeekPointer(head) != PeekPointer(packet))
     {
-        ScheduleIngressDrainRetry(incomingPort, packetUid);
+        ScheduleIngressDrainRetry(incomingPort, packetToken, packet);
         return;
     }
 
@@ -780,7 +789,7 @@ MinHopBridgeNetDevice::DrainIngressQueue(Ptr<NetDevice> incomingPort, uint64_t p
                             << " TIME=" << Simulator::Now().GetFemtoSeconds());
             }
             ++sNoPathRetryLogCount;
-            ScheduleIngressDrainRetry(incomingPort, packetUid);
+            ScheduleIngressDrainRetry(incomingPort, packetToken, packet);
             return;
         }
     }

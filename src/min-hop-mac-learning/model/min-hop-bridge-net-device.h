@@ -145,9 +145,14 @@ class MinHopBridgeNetDevice : public NetDevice
                               const Address& dst,
                               PacketType packetType,
                               bool addSwitchDelay = true);
-    void ScheduleIngressDrainEvent(Ptr<NetDevice> incomingPort, uint64_t packetUid, Time delay);
-    void ScheduleIngressDrainRetry(Ptr<NetDevice> incomingPort, uint64_t packetUid);
-    void DrainIngressQueue(Ptr<NetDevice> incomingPort, uint64_t packetUid);
+    void ScheduleIngressDrainEvent(Ptr<NetDevice> incomingPort,
+                                   uint64_t packetToken,
+                                   Ptr<Packet> packet,
+                                   Time delay);
+    void ScheduleIngressDrainRetry(Ptr<NetDevice> incomingPort,
+                                   uint64_t packetToken,
+                                   Ptr<Packet> packet);
+    void DrainIngressQueue(Ptr<NetDevice> incomingPort, uint64_t packetToken, Ptr<Packet> packet);
     bool HasAvailableUnicastPath(Ptr<NetDevice> incomingPort, Mac48Address dst);
     bool HasAvailableFloodPath(Ptr<NetDevice> incomingPort, Mac48Address dst);
     bool IsEgressQueueCongested(Ptr<NetDevice> egressPort, Mac48Address dst, bool anticipateEnqueue);
@@ -196,6 +201,7 @@ class MinHopBridgeNetDevice : public NetDevice
 
     double m_highWatermark;
     double m_lowWatermark;
+    uint64_t m_nextIngressPacketToken;
     std::map<Ptr<NetDevice>, std::set<uint32_t>> m_pausedIngressQueueIds;
     // Map ingress sub-queue -> upstream egress sub-queue id used in PAUSE/RESUME frames.
     std::map<Ptr<NetDevice>, std::map<uint32_t, uint32_t>> m_ingressPauseUpstreamQueueIds;
