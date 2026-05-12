@@ -145,8 +145,9 @@ class MinHopBridgeNetDevice : public NetDevice
                               const Address& dst,
                               PacketType packetType,
                               bool addSwitchDelay = true);
-    void ScheduleIngressDrainRetry(Ptr<NetDevice> incomingPort);
-    void DrainIngressQueue(Ptr<NetDevice> incomingPort);
+    void ScheduleIngressDrainEvent(Ptr<NetDevice> incomingPort, uint64_t packetUid, Time delay);
+    void ScheduleIngressDrainRetry(Ptr<NetDevice> incomingPort, uint64_t packetUid);
+    void DrainIngressQueue(Ptr<NetDevice> incomingPort, uint64_t packetUid);
     bool HasAvailableUnicastPath(Ptr<NetDevice> incomingPort, Mac48Address dst);
     bool HasAvailableFloodPath(Ptr<NetDevice> incomingPort, Mac48Address dst);
     bool IsEgressQueueCongested(Ptr<NetDevice> egressPort, Mac48Address dst, bool anticipateEnqueue);
@@ -200,7 +201,7 @@ class MinHopBridgeNetDevice : public NetDevice
     std::map<Ptr<NetDevice>, std::map<uint32_t, uint32_t>> m_ingressPauseUpstreamQueueIds;
     std::map<Ptr<NetDevice>, std::map<uint32_t, bool>> m_egressQueueCongested;
     std::map<Ptr<NetDevice>, Ptr<PppRoundRobinQueue<Packet>>> m_ingressQueues;
-    std::map<Ptr<NetDevice>, EventId> m_ingressRetryEvents;
+    std::map<Ptr<NetDevice>, std::map<uint64_t, EventId>> m_ingressRetryEvents;
     uint64_t m_ingressQueueDrops;
     uint64_t m_ingressQueueDropBytes;
     void sendPauseFrameToUpstream(Ptr<NetDevice> ingressPort, uint32_t queueId, bool pause);

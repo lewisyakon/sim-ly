@@ -1,5 +1,5 @@
 {
-  "workloadpath": "simworkload/16384_workload.txt",
+  "workloadpath": "simworkload/128_test.txt",
   "thread": 32,
   "gpu_type": "A100",                
   "nvswitch_per_server": 1,
@@ -21,8 +21,8 @@
 
   "logging": {
     "dir": "simlog",
-    "simulation_log": "16384_workload.log",
-    "nccl_log": "16384_workload.log",
+    "simulation_log": "128_test.log",
+    "nccl_log": "128_test.log",
     "log_levels": {
       "roce": "off",
       "pfc": "off"
@@ -38,13 +38,13 @@
   },
 
   "mactable": {
-    "load_enable": true,
-    "dump_enable": false,
-    "dir": "mactable/topo-fattree_k-16_subnet-2_subnetk-16_gpusper-16_nvsper-1-python"
+    "load_enable": false,
+    "dump_enable": true,
+    "dir": "mactable"
   },
 
   "pfc": {
-    "drop_tail_queue_size": "500",
+    "drop_tail_queue_size": "500000",
     "drop_tail_queue_num": "16",
     "high_watermark": 0.8,
     "low_watermark": 0.2
@@ -53,8 +53,8 @@
   "topology": {
     "model": "fattree",
     "file": "simtopo/external-fattree-k4-gpu4-fullmesh.topo",
-    "k": 16,
-    "subnet_model": 2,              
+    "k": 4,
+    "subnet_model": 0,              
     "subnet_k": 16,                             
     "hostperleaf": 2,                            
     "switch_delay_ns_override": 100 
@@ -67,8 +67,8 @@
     "sq_depth": 1024,
     "rq_depth": 1024,
     "transport_ack_enable": true,
-    "transport_window_packets": 32,
-    "reorder_window_packets": 4,
+    "transport_window_packets": 500000,
+    "reorder_window_packets": 400000,
     "ack_timeout_mode": "auto",
     "ack_timeout_factor": 8.0,
     "ack_timeout_ns": 50000,

@@ -202,11 +202,14 @@ MinHopBridgeNetDevice::DoDispose()
                       << " ingressRemain=" << ingressRemain);
     }
     m_ingressQueues.clear();
-    for (auto& retryEvent : m_ingressRetryEvents)
+    for (auto& portEvents : m_ingressRetryEvents)
     {
-        if (retryEvent.second.IsPending())
+        for (auto& retryEvent : portEvents.second)
         {
-            Simulator::Cancel(retryEvent.second);
+            if (retryEvent.second.IsPending())
+            {
+                Simulator::Cancel(retryEvent.second);
+            }
         }
     }
     m_ingressRetryEvents.clear();
@@ -332,38 +335,47 @@ MinHopBridgeNetDevice::EnqueueIngressPacket(Ptr<NetDevice> incomingPort,
         UpdateIngressPauseStateOnEnqueue(incomingPort, Mac48Address::ConvertFrom(dst));
     }
 
-    auto& ev = m_ingressRetryEvents[incomingPort];
+    Time drainDelay = Seconds(0);
+    if (addSwitchDelay && m_switchDelay.IsStrictlyPositive())
+    {
+        drainDelay = m_switchDelay;
+    }
+    ScheduleIngressDrainEvent(incomingPort, ingressPacket->GetUid(), drainDelay);
+    return true;
+}
+
+void
+MinHopBridgeNetDevice::ScheduleIngressDrainEvent(Ptr<NetDevice> incomingPort,
+                                                 uint64_t packetUid,
+                                                 Time delay)
+{
+    auto& portEvents = m_ingressRetryEvents[incomingPort];
+    auto& ev = portEvents[packetUid];
     if (!ev.IsPending())
     {
-        if (addSwitchDelay && m_switchDelay.IsStrictlyPositive())
+        if (delay.IsStrictlyPositive())
         {
-            ev = Simulator::Schedule(m_switchDelay,
+            ev = Simulator::Schedule(delay,
                                      &MinHopBridgeNetDevice::DrainIngressQueue,
                                      this,
-                                     incomingPort);
+                                     incomingPort,
+                                     packetUid);
         }
         else
         {
             ev = Simulator::ScheduleNow(&MinHopBridgeNetDevice::DrainIngressQueue,
                                         this,
-                                        incomingPort);
+                                        incomingPort,
+                                        packetUid);
         }
     }
-    return true;
 }
 
 void
-MinHopBridgeNetDevice::ScheduleIngressDrainRetry(Ptr<NetDevice> incomingPort)
+MinHopBridgeNetDevice::ScheduleIngressDrainRetry(Ptr<NetDevice> incomingPort, uint64_t packetUid)
 {
-    auto& ev = m_ingressRetryEvents[incomingPort];
-    if (!ev.IsPending())
-    {
-        Time retryDelay = (m_switchDelay.IsStrictlyPositive() ? m_switchDelay : MicroSeconds(1));
-        ev = Simulator::Schedule(retryDelay,
-                                 &MinHopBridgeNetDevice::DrainIngressQueue,
-                                 this,
-                                 incomingPort);
-    }
+    Time retryDelay = (m_switchDelay.IsStrictlyPositive() ? m_switchDelay : MicroSeconds(1));
+    ScheduleIngressDrainEvent(incomingPort, packetUid, retryDelay);
 }
 
 bool
@@ -640,12 +652,20 @@ MinHopBridgeNetDevice::HasAvailableFloodPath(Ptr<NetDevice> incomingPort, Mac48A
 }
 
 void
-MinHopBridgeNetDevice::DrainIngressQueue(Ptr<NetDevice> incomingPort)
+MinHopBridgeNetDevice::DrainIngressQueue(Ptr<NetDevice> incomingPort, uint64_t packetUid)
 {
-    auto evIt = m_ingressRetryEvents.find(incomingPort);
-    if (evIt != m_ingressRetryEvents.end() && !evIt->second.IsPending())
+    auto portEventsIt = m_ingressRetryEvents.find(incomingPort);
+    if (portEventsIt != m_ingressRetryEvents.end())
     {
-        evIt->second = EventId();
+        auto eventIt = portEventsIt->second.find(packetUid);
+        if (eventIt != portEventsIt->second.end())
+        {
+            portEventsIt->second.erase(eventIt);
+        }
+        if (portEventsIt->second.empty())
+        {
+            m_ingressRetryEvents.erase(portEventsIt);
+        }
     }
 
     auto qIt = m_ingressQueues.find(incomingPort);
@@ -659,6 +679,11 @@ MinHopBridgeNetDevice::DrainIngressQueue(Ptr<NetDevice> incomingPort)
     {
         return;
     }
+    if (head->GetUid() != packetUid)
+    {
+        ScheduleIngressDrainRetry(incomingPort, packetUid);
+        return;
+    }
 
     Ptr<Packet> headCopy = head->Copy();
     PppHeader headIngressHeader;
@@ -666,26 +691,6 @@ MinHopBridgeNetDevice::DrainIngressQueue(Ptr<NetDevice> incomingPort)
     {
         NS_LOG_WARN("Ingress queue head missing synthetic PPP header; dropping head.");
         qIt->second->Dequeue();
-        if (qIt->second->GetNPackets() > 0)
-        {
-            auto& ev = m_ingressRetryEvents[incomingPort];
-            if (!ev.IsPending())
-            {
-                if (incomingPort && m_switchDelay.IsStrictlyPositive())
-                {
-                    ev = Simulator::Schedule(m_switchDelay,
-                                             &MinHopBridgeNetDevice::DrainIngressQueue,
-                                             this,
-                                             incomingPort);
-                }
-                else
-                {
-                    ev = Simulator::ScheduleNow(&MinHopBridgeNetDevice::DrainIngressQueue,
-                                                this,
-                                                incomingPort);
-                }
-            }
-        }
         return;
     }
 
@@ -775,7 +780,7 @@ MinHopBridgeNetDevice::DrainIngressQueue(Ptr<NetDevice> incomingPort)
                             << " TIME=" << Simulator::Now().GetFemtoSeconds());
             }
             ++sNoPathRetryLogCount;
-            ScheduleIngressDrainRetry(incomingPort);
+            ScheduleIngressDrainRetry(incomingPort, packetUid);
             return;
         }
     }
@@ -804,27 +809,6 @@ MinHopBridgeNetDevice::DrainIngressQueue(Ptr<NetDevice> incomingPort)
     Address dst = ingressHeader.GetDstMac();
     PacketType packetType = InferPacketTypeFromDst(dst, PacketType::PACKET_OTHERHOST);
     ScheduleReceive(incomingPort, p, protocol, src, dst, packetType);
-
-    if (qIt->second->GetNPackets() > 0)
-    {
-        auto& ev = m_ingressRetryEvents[incomingPort];
-        if (!ev.IsPending())
-        {
-            if (incomingPort && m_switchDelay.IsStrictlyPositive())
-            {
-                ev = Simulator::Schedule(m_switchDelay,
-                                         &MinHopBridgeNetDevice::DrainIngressQueue,
-                                         this,
-                                         incomingPort);
-            }
-            else
-            {
-                ev = Simulator::ScheduleNow(&MinHopBridgeNetDevice::DrainIngressQueue,
-                                            this,
-                                            incomingPort);
-            }
-        }
-    }
 }
 
 NetDevice::PacketType

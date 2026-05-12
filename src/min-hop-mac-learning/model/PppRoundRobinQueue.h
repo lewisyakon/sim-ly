@@ -536,6 +536,10 @@ PppRoundRobinQueue<Item>::Peek() const
   for (uint32_t i = 0; i < m_numQueues; ++i)
     {
       uint32_t currentIdx = (m_rrIndex + i) % m_numQueues;
+      if (currentIdx < m_pausedSubQueues.size() && m_pausedSubQueues[currentIdx])
+        {
+          continue;
+        }
       if (!m_subQueues[currentIdx].empty ())
         {
           // Return without popping/moving m_rrIndex
