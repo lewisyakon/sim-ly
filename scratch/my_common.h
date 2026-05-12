@@ -215,6 +215,32 @@ ApplyBridgePfcWatermarks(const Ptr<MinHopBridgeNetDevice>& dev)
     dev->SetAttribute("PfcLowWatermark", DoubleValue(pfc_low_watermark));
 }
 
+static inline bool
+ShouldBypassGpuExternalBridgeMacTable()
+{
+    return Topology_model == 0 || // FatTree
+           Topology_model == 1 || // Clos
+           Topology_model == 2 || // FullMesh
+           Topology_model == 3;   // Torus
+}
+
+static inline void
+ValidateBypassedGpuExternalBridgeMacTables()
+{
+    if (!ShouldBypassGpuExternalBridgeMacTable())
+    {
+        return;
+    }
+
+    for (const auto& dev : ExternalBridgeDevices)
+    {
+        NS_ASSERT_MSG(dev != nullptr, "null GPU external bridge");
+        NS_ASSERT_MSG(dev->GetNBridgePorts() <= 1,
+                      "GPU external bridge MAC learning is disabled only for "
+                      "single-port external bridges");
+    }
+}
+
 static inline Ptr<MinHopBridgeNetDevice>
 CreateGpuSubnetBridge(Ptr<Node> gpu, uint32_t intraMaxJump)
 {
@@ -237,6 +263,10 @@ CreateGpuExternalBridge(Ptr<Node> gpu)
     dev->Set_switchDelay(NanoSeconds(0));
     dev->SetMtu(m_mtu);
     dev->SetAttribute("TerminalLearningOnly", BooleanValue(true));
+    if (ShouldBypassGpuExternalBridgeMacTable())
+    {
+        dev->SetAttribute("EnableLearning", BooleanValue(false));
+    }
     ApplyBridgePfcWatermarks(dev);
     gpu->AddDevice(dev);
     return dev;
@@ -297,7 +327,7 @@ InstallGpuWarmupClients(NodeContainer& nodes, uint32_t gpuCount)
             client->SetAttribute("MaxPackets", UintegerValue(1));
             clientNode->AddApplication(client);
 
-            double startTime = 1.0 + (i * 0.2);
+            double startTime = 1.0 + (i * 0.01);
             ApplicationContainer clientApps(client);
             clientApps.Start(Seconds(startTime));
             clientApps.Stop(Seconds(GetEffectiveFloodTime()-1));
@@ -1029,6 +1059,36 @@ AppendScenarioTagIfMissing(const std::string& baseDir, const std::string& tag)
     return JoinPath(normalized, tag);
 }
 
+static inline std::string
+AppendScenarioVariantTagIfMissing(const std::string& baseDir,
+                                  const std::string& tag,
+                                  const std::string& variant)
+{
+    const std::string targetTag = variant.empty() ? tag : tag + "-" + variant;
+    if (baseDir.empty())
+    {
+        return JoinPath("mactable", targetTag);
+    }
+
+    std::string normalized = baseDir;
+    while (normalized.size() > 1 && normalized.back() == '/')
+    {
+        normalized.pop_back();
+    }
+
+    const std::string leaf = BasenameOnly(normalized);
+    if (leaf == targetTag)
+    {
+        return normalized;
+    }
+    if (leaf == tag || leaf.rfind(tag + "-", 0) == 0)
+    {
+        const std::string parent = DirnameOnly(normalized);
+        return parent.empty() ? targetTag : JoinPath(parent, targetTag);
+    }
+    return JoinPath(normalized, targetTag);
+}
+
 static inline bool
 PathExists(const std::string& path)
 {
@@ -1249,7 +1309,10 @@ CollectAllBridgeDevices()
     AppendBridgeVectorUnique(TestSwitchDevices, devices);
     AppendBridgeVectorUnique(ExternalSwitchDevices, devices);
     AppendBridgeVectorUnique(SubNetDevices, devices);
-    AppendBridgeVectorUnique(ExternalBridgeDevices, devices);
+    if (!ShouldBypassGpuExternalBridgeMacTable())
+    {
+        AppendBridgeVectorUnique(ExternalBridgeDevices, devices);
+    }
     return devices;
 }
 
@@ -1923,8 +1986,11 @@ bool ReadConf(std::string network_conf)
   if (mactable_load_enable || mactable_dump_enable)
   {
     const std::string mactableScenarioTag = BuildMacTableScenarioTag();
-    mactable_load_dir = AppendScenarioTagIfMissing(mactable_load_dir, mactableScenarioTag);
-    mactable_dump_dir = mactable_load_dir;
+    const std::string mactableBaseDir = mactable_load_dir;
+    mactable_load_dir =
+        AppendScenarioVariantTagIfMissing(mactableBaseDir, mactableScenarioTag, "python");
+    mactable_dump_dir =
+        AppendScenarioVariantTagIfMissing(mactableBaseDir, mactableScenarioTag, "flood");
   }
 
   effective_floadtime = mactable_load_enable ? 1 : floadtime;
@@ -3028,6 +3094,8 @@ void SetupNetwork(){
     if (Topology_model==4){
         
     }
+
+    ValidateBypassedGpuExternalBridgeMacTables();
 }
 
 

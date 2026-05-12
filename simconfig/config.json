@@ -1,6 +1,6 @@
 {
-  "workloadpath": "simworkload/1024_7B.txt",
-  "thread": 4,
+  "workloadpath": "simworkload/16384_workload.txt",
+  "thread": 32,
   "gpu_type": "A100",                
   "nvswitch_per_server": 1,
   "pp_schedule": "gpipe",
@@ -16,36 +16,36 @@
   },
 
   "workload": {
-    "floadtime_s": 20
+    "floadtime_s": 800
   },
 
   "logging": {
     "dir": "simlog",
-    "simulation_log": "1024_7B.log",
-    "nccl_log": "1024_7B.log",
+    "simulation_log": "16384_workload.log",
+    "nccl_log": "16384_workload.log",
     "log_levels": {
       "roce": "off",
       "pfc": "off"
     },
     "ns3_components": {
-      "send_flow_client": true,
-      "rdma_port_engine": true,
-      "generic_simulation": true,
-      "min_hop_bridge_net_device": true,
+      "send_flow_client": false,
+      "rdma_port_engine": false,
+      "generic_simulation": false,
+      "min_hop_bridge_net_device": false,
       "point_to_point_net_device": false,
       "ppp_round_robin_queue": false
     }
   },
 
   "mactable": {
-    "load_enable": false,
+    "load_enable": true,
     "dump_enable": false,
-    "dir": "mactable"
+    "dir": "mactable/topo-fattree_k-16_subnet-2_subnetk-16_gpusper-16_nvsper-1-python"
   },
 
   "pfc": {
-    "drop_tail_queue_size": "100",
-    "drop_tail_queue_num": "8",
+    "drop_tail_queue_size": "500",
+    "drop_tail_queue_num": "16",
     "high_watermark": 0.8,
     "low_watermark": 0.2
   },
@@ -53,9 +53,9 @@
   "topology": {
     "model": "fattree",
     "file": "simtopo/external-fattree-k4-gpu4-fullmesh.topo",
-    "k": 8,
+    "k": 16,
     "subnet_model": 2,              
-    "subnet_k": 8,                             
+    "subnet_k": 16,                             
     "hostperleaf": 2,                            
     "switch_delay_ns_override": 100 
   },

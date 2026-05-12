@@ -564,6 +564,27 @@ void GetGlobalStart()
   global_start = std::chrono::high_resolution_clock::now();
 }
 
+/*
+mpirun \
+  --wdir /mnt/nfs/cloud/hybrid \
+  --launch-agent "/usr/local/bin/mpi-docker-agent /usr/bin/orted" \
+  -np 1 --host lab206:1 --map-by ppr:1:node:PE=1 --bind-to none /bin/hostname : \
+  -np 1 --host lab254:1 --map-by ppr:1:node:PE=1 --bind-to none /bin/hostname : \
+  -np 2 --host lab188:2 --map-by ppr:2:node:PE=2 --bind-to none /bin/hostname
+
+mpirun \
+  --wdir /mnt/nfs/cloud/hybrid \
+  --launch-agent "/usr/local/bin/mpi-docker-agent /usr/bin/orted" \
+  --mca btl_tcp_if_include ztkse63itn \
+  --mca oob_tcp_if_include ztkse63itn \
+  -np 1 --host lab206:1 --map-by ppr:1:node:PE=16 --bind-to none \
+  /mnt/nfs/cloud/hybrid/build/scratch/ns3.44-my_AstraSimNetwork-default : \
+  -np 1 --host lab254:1 --map-by ppr:1:node:PE=16 --bind-to none \
+  /mnt/nfs/cloud/hybrid/build/scratch/ns3.44-my_AstraSimNetwork-default : \
+  -np 2 --host lab188:2 --map-by ppr:2:node:PE=32 --bind-to none \
+  /mnt/nfs/cloud/hybrid/build/scratch/ns3.44-my_AstraSimNetwork-default
+*/
+
 int main(int argc, char *argv[]) {
   const std::string startup_config = ResolveNetworkConfigPathFromArgv(argc, argv);
   conf::thread = ResolveThreadFromConfig(startup_config, conf::thread);
