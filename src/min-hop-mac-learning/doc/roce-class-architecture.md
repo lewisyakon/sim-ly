@@ -405,6 +405,8 @@ bridge 仍然负责：
 3. ECMP / flood
 4. 选择真实 `outPort`
 5. 在外侧终端 bridge 上执行“学习后丢弃 transit 包”
+6. 用每 ingress port 一个 aggregate queue 模拟 bridge ingress 有限缓冲和 `switch_delay`
+7. 根据 aggregate ingress queue / egress queue 水位传播 PFC pause/resume
 
 它和 RoCE 的耦合现在主要只有两点：
 
@@ -412,6 +414,15 @@ bridge 仍然负责：
 2. 接收时写入 `RdmaIngressPortTag`
 
 bridge 不维护 QP，不维护 ACK，不维护重传。`TerminalLearningOnly` 也只应该给外侧 bridge 用，而不是给所有 bridge 统一开启。
+
+当前 bridge ingress 不是一个按 qid 分裂的 `PppRoundRobinQueue`。它只做 aggregate 缓冲：
+
+1. 容量取对应物理 egress queue 的 `NumQueues * MaxPacketsPerQueue`。
+2. 包入队后生成独立 token。
+3. 每个 token 按自己的 `switch_delay` drain。
+4. qid 优先级、ACK 优先级和 per-qid pause-aware admission 由物理 egress queue / `RdmaPortEngine` 承担。
+
+旧的 `NotHeadRetryDelay` 和 `BridgeDiagEnable` 属性仍保留为配置兼容项，但当前不再影响 bridge ingress 调度，也不输出旧 residence 诊断。
 
 ## 4. 当前类之间怎样耦合
 

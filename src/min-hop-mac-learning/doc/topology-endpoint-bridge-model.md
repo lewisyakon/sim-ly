@@ -180,15 +180,34 @@ sendflowclient
 
 ### 7.1 bridge / 本地注入层
 
-`MinHopBridgeNetDevice` 会根据 ingress queue 和 egress queue 的水位做两类动作：
+`MinHopBridgeNetDevice` 会根据 ingress queue 和 egress queue 的水位做两类动作。
+
+当前 bridge ingress 缓冲模型是：
+
+1. 每个 ingress port 一个 aggregate queue。
+2. 这个 aggregate queue 的容量等于该端口对应物理 egress queue 的 `NumQueues * MaxPacketsPerQueue`。
+3. 包入队时只占用这个 aggregate queue 的一个计数，并记录独立 packet token。
+4. 包在经过 `switch_delay` 后按自己的 token drain，不再依赖 `PppRoundRobinQueue::Peek/Dequeue` 的队首选择。
+5. 如果 drain 时发现目标 egress 因 PFC 水位不可用，保留该 token 并按 `switch_delay` retry。
+
+这个模型的含义是：bridge ingress 只模拟“到达 bridge 后的处理延迟和有限缓冲”，不在 ingress 侧再次实现按优先级 qid 的调度。qid 优先级仍由物理 egress queue 和 RoCE port runtime 负责。
+
+PFC 动作分为：
 
 1. `LOCAL`
    - 当 `incomingPort == nullptr`，说明这是本地注入
    - bridge 通过 `FlowIo::PauseNodeQueue(...)` / `ResumeNodeQueue(...)` 控制节点本地软件发包队列
+   - aggregate ingress queue 达到高/低水位后，会对本地配置的全部 qid 执行 pause/resume
 
 2. `NONLOCAL`
    - 当包来自真实 ingress p2p 口
    - bridge 会构造 `PauseHeader` 并向上游物理口回发 pause/resume
+   - aggregate ingress queue 达到高/低水位后，会向上游物理口的各 qid 扇出 pause/resume
+
+历史兼容项：
+
+- `pfc.not_head_retry_ns` / `NotHeadRetryDelay` 仍可被配置，但当前是兼容 no-op。
+- `logging.bridge_diag` / `BridgeDiagEnable` 仍可被配置，但当前不再输出旧的 bridge residence 诊断。
 
 ### 7.2 物理口 / RoCE runtime 层
 
@@ -210,7 +229,7 @@ sendflowclient
 
 ### 8.1 `[BRIDGE][RETRY][NO_PATH]`
 
-这表示一个普通 forwarding bridge 的 ingress 队列头包当前找不到可用转发路径，因此不会立刻丢包，而是保留在 ingress queue 里等待后续 retry。
+这表示一个普通 forwarding bridge 的某个 ingress 包在完成 `switch_delay` 后，当前找不到可用转发路径，因此不会立刻丢包，而是保留在 ingress token 表里等待后续 retry。
 
 当前 `TerminalLearningOnly` 的一个修正点就是：
 

@@ -263,9 +263,17 @@ all passes finished at time: ...
 
 含义：
 
-- 普通 forwarding bridge 的 ingress 队列头包当前没有可用出路。
-- bridge 会保留该头包并安排 ingress drain retry，而不是立刻丢弃。
+- 普通 forwarding bridge 的某个 ingress 包在完成 `switch_delay` 后，当前没有可用出路。
+- bridge 会保留该包并安排 ingress drain retry，而不是立刻丢弃。
 - 当前 `TerminalLearningOnly` 的修正点之一，就是终端外侧 bridge 上的 transit 包不再走这条 retry 链。
+
+当前实现说明：
+
+- bridge ingress 不再使用按 qid 拆分的 `PppRoundRobinQueue` 作为缓冲。
+- 每个 ingress port 只有一个 aggregate queue，容量等于对应物理 egress queue 的 `NumQueues * MaxPacketsPerQueue`。
+- 每个包入队后分配一个独立 token，并按自己的 token 在 `switch_delay` 后 drain；不会因为其他 qid 的队首包而额外等待。
+- `pfc.not_head_retry_ns` / `NotHeadRetryDelay` 目前仅为兼容旧配置保留，不再参与 ingress 调度。
+- `logging.bridge_diag` / `BridgeDiagEnable` 目前也仅为兼容旧配置保留，不会输出旧的 bridge residence 诊断。
 
 #### `[BRIDGE][TERMINAL][DROP]`
 
@@ -286,6 +294,7 @@ all passes finished at time: ...
 
 - bridge 检测到本地注入队列达到高/低水位。
 - 当前动作是通过 `FlowIo::PauseNodeQueue(...)` / `ResumeNodeQueue(...)` 控制本地软件发送队列。
+- 阈值按 aggregate ingress queue 计算；触发后会对该 bridge 配置的所有上游 qid 执行 pause/resume。
 
 #### `[PFC][THRESH][NONLOCAL][PAUSE/RESUME]`
 
@@ -293,6 +302,7 @@ all passes finished at time: ...
 
 - bridge 检测到来自真实 ingress port 的队列达到高/低水位。
 - 当前动作是向上游物理口回发 `PauseHeader`。
+- 阈值同样按 aggregate ingress queue 计算；触发后会向上游物理口的各 qid 发送 pause/resume。
 
 ### 3.3 事务流日志
 

@@ -23,6 +23,7 @@
     "dir": "simlog",
     "simulation_log": "128_test.log",
     "nccl_log": "128_test.log",
+    "bridge_diag": true,
     "log_levels": {
       "roce": "all",
       "pfc": "all"
@@ -71,8 +72,8 @@
     "transport_window_packets": 500000,
     "reorder_window_packets": 400000,
     "ack_timeout_mode": "auto",
-    "ack_timeout_factor": 8.0,
-    "ack_timeout_ns": 50000,
+    "ack_timeout_factor": 10000.0,
+    "ack_timeout_ns": 10,
     "max_retransmissions": 8,
     "ether_type": "0x9999"
   }

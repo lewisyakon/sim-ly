@@ -64,6 +64,7 @@ int ecmpmodel,max_jump,floadtime,m_mtu;
 int effective_floadtime;
 bool mactable_load_enable;
 bool mactable_dump_enable;
+bool bridge_diag_enable;
 std::string mactable_load_dir;
 std::string mactable_dump_dir;
 double pfc_high_watermark;
@@ -215,6 +216,7 @@ ApplyBridgePfcWatermarks(const Ptr<MinHopBridgeNetDevice>& dev)
     dev->SetAttribute("PfcHighWatermark", DoubleValue(pfc_high_watermark));
     dev->SetAttribute("PfcLowWatermark", DoubleValue(pfc_low_watermark));
     dev->SetAttribute("NotHeadRetryDelay", TimeValue(NanoSeconds(pfc_not_head_retry_ns)));
+    dev->SetAttribute("BridgeDiagEnable", BooleanValue(bridge_diag_enable));
 }
 
 static inline bool
@@ -1572,6 +1574,7 @@ bool ReadConf(std::string network_conf)
   auto pfc_low_global_bak       = g_pfcLowWatermark;
   auto mactable_load_enable_bak = mactable_load_enable;
   auto mactable_dump_enable_bak = mactable_dump_enable;
+  auto bridge_diag_enable_bak   = bridge_diag_enable;
   auto mactable_load_dir_bak    = mactable_load_dir;
   auto mactable_dump_dir_bak    = mactable_dump_dir;
   auto effective_floadtime_bak  = effective_floadtime;
@@ -1612,6 +1615,7 @@ bool ReadConf(std::string network_conf)
     g_pfcLowWatermark = pfc_low_global_bak;
     mactable_load_enable = mactable_load_enable_bak;
     mactable_dump_enable = mactable_dump_enable_bak;
+    bridge_diag_enable = bridge_diag_enable_bak;
     mactable_load_dir = mactable_load_dir_bak;
     mactable_dump_dir = mactable_dump_dir_bak;
     effective_floadtime = effective_floadtime_bak;
@@ -1794,6 +1798,7 @@ bool ReadConf(std::string network_conf)
   if (j.contains("logging") && j["logging"].is_object())
   {
     const auto& lg = j["logging"];
+    JGetBool(lg, "bridge_diag", bridge_diag_enable);
     if (JHas(lg, "roce_log_level"))
     {
       g_roce_cfg.logLevel = ParseRoceLogLevel(lg["roce_log_level"]);
@@ -2054,6 +2059,7 @@ void SetConfig(){
     DropTailQueue_num="16";
     mactable_load_enable=false;
     mactable_dump_enable=false;
+    bridge_diag_enable=false;
     mactable_load_dir="mactable";
     mactable_dump_dir="mactable";
     pfc_high_watermark=0.8;
