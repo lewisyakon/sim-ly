@@ -23,6 +23,7 @@
 #include <mutex>
 #include <iostream>
 #include <iomanip>
+#include <limits>
 
 namespace ns3
 {
@@ -99,6 +100,17 @@ TryPrintFloodWindowSummaryOnce(bool printToStdout)
     {
         std::cout << oss.str() << std::endl;
     }
+}
+
+uint32_t
+StableMix32(uint32_t value)
+{
+    value ^= value >> 16;
+    value *= 0x7feb352dU;
+    value ^= value >> 15;
+    value *= 0x846ca68bU;
+    value ^= value >> 16;
+    return value;
 }
 } // namespace
 
@@ -1024,9 +1036,22 @@ MinHopBridgeNetDevice::ScheduleReceive(Ptr<NetDevice> incomingPort,
 
 void 
 MinHopBridgeNetDevice::set_ecmp_model(int model){
-    if (model>=0 and model<=2){
+    if (model>=0 and model<=3){
         ecmpmodel=model;
     }
+}
+
+void
+MinHopBridgeNetDevice::SetFatTreeEcmpContext(uint32_t k,
+                                             uint32_t gpusPerServer,
+                                             EcmpTopologyLayer layer,
+                                             uint32_t layerIndex)
+{
+    m_hasFatTreeEcmpContext = (k >= 2 && gpusPerServer > 0);
+    m_fatTreeK = k;
+    m_fatTreeGpusPerServer = gpusPerServer;
+    m_ecmpTopologyLayer = layer;
+    m_fatTreeLayerIndex = layerIndex;
 }
 
 void 
@@ -1049,7 +1074,11 @@ MinHopBridgeNetDevice::ecmp(std::vector<Ptr<NetDevice> > outPorts,
                             Mac48Address dst,
                             uint64_t uid,
                             uint32_t flowTag,
-                            bool hasFlowTag){
+                            bool hasFlowTag,
+                            uint32_t flowSrc,
+                            uint32_t flowDst,
+                            bool hasFlowTuple,
+                            uint32_t flowState){
     std::vector<Ptr<NetDevice>> candidatePorts;
     candidatePorts.reserve(outPorts.size());
     for (auto const& outPort : outPorts)
@@ -1120,6 +1149,204 @@ MinHopBridgeNetDevice::ecmp(std::vector<Ptr<NetDevice> > outPorts,
         uint32_t index = hash % candidatePorts.size();
         return candidatePorts[index];
     }
+    if (ecmpmodel==3){//DATA 按流喷洒；非 DATA 按 ecmpmodel=0 随机处理
+        std::ostringstream candidateOss;
+        std::ostringstream candidateSetOss;
+        std::vector<Mac48Address> candidateSetMacs;
+        candidateOss << "[";
+        for (size_t i = 0; i < candidatePorts.size(); ++i)
+        {
+            Mac48Address candidateMac = Mac48Address::ConvertFrom(candidatePorts[i]->GetAddress());
+            candidateSetMacs.push_back(candidateMac);
+            if (i > 0)
+            {
+                candidateOss << ",";
+            }
+            candidateOss << "{idx=" << i
+                         << ",if=" << candidatePorts[i]->GetIfIndex()
+                         << ",mac=" << candidateMac
+                         << "}";
+        }
+        candidateOss << "]";
+        std::sort(candidateSetMacs.begin(), candidateSetMacs.end());
+        for (size_t i = 0; i < candidateSetMacs.size(); ++i)
+        {
+            if (i > 0)
+            {
+                candidateSetOss << "|";
+            }
+            candidateSetOss << candidateSetMacs[i];
+        }
+        std::string candidateSetKey = candidateSetOss.str();
+
+        if (hasFlowTuple && flowState == static_cast<uint32_t>(ThreePHeader::DATA))
+        {
+            std::string balanceScope = "candidateSet";
+            std::string balanceDomainKey = candidateSetKey;
+            uint32_t dstPod = 0xffffffffu;
+            uint32_t dstEdge = 0xffffffffu;
+            if (m_hasFatTreeEcmpContext && m_fatTreeK >= 2 && m_fatTreeGpusPerServer > 0)
+            {
+                uint32_t serversPerPod = m_fatTreeK * m_fatTreeK / 4;
+                uint32_t edgesPerPod = m_fatTreeK / 2;
+                uint32_t serversPerEdge = m_fatTreeK / 2;
+                uint32_t dstServer = flowDst / m_fatTreeGpusPerServer;
+                if (serversPerPod > 0 && serversPerEdge > 0)
+                {
+                    dstPod = dstServer / serversPerPod;
+                    dstEdge = (dstServer % serversPerPod) / serversPerEdge;
+                    if (dstPod < m_fatTreeK && dstEdge < edgesPerPod)
+                    {
+                        std::ostringstream domainOss;
+                        domainOss << candidateSetKey;
+                        if (m_ecmpTopologyLayer == EcmpTopologyLayer::Edge)
+                        {
+                            balanceScope = "candidateSet+dstPod+dstEdge";
+                            domainOss << "|dstPod=" << dstPod << "|dstEdge=" << dstEdge;
+                        }
+                        else if (m_ecmpTopologyLayer == EcmpTopologyLayer::Aggregation)
+                        {
+                            balanceScope = "candidateSet+dstPod";
+                            domainOss << "|dstPod=" << dstPod;
+                        }
+                        balanceDomainKey = domainOss.str();
+                    }
+                }
+            }
+            FlowSprayKey key{balanceDomainKey, flowState, flowTag, flowSrc, flowDst};
+            auto learnedPort = m_flowSprayPorts.find(key);
+            auto candidateIt =
+                learnedPort == m_flowSprayPorts.end()
+                    ? candidatePorts.end()
+                    : std::find(candidatePorts.begin(), candidatePorts.end(), learnedPort->second);
+            if (candidateIt != candidatePorts.end())
+            {
+                uint32_t index =
+                    static_cast<uint32_t>(std::distance(candidatePorts.begin(), candidateIt));
+                NS_LOG_INFO("[ECMP][FLOW_SPRAY] bridge=" << m_address
+                            << " srcMac=" << src
+                            << " dstMac=" << dst
+                            << " flowState=" << flowState
+                            << " flowTuple=" << flowTag << ":" << flowSrc << ":" << flowDst
+                            << " action=data_reuse"
+                            << " selected={idx=" << index
+                            << ",if=" << learnedPort->second->GetIfIndex()
+                            << ",mac=" << Mac48Address::ConvertFrom(learnedPort->second->GetAddress())
+                            << "}"
+                            << " candidateCount=" << candidatePorts.size()
+                            << " candidates=" << candidateOss.str()
+                            << " candidateSet=" << candidateSetKey
+                            << " balanceScope=" << balanceScope
+                            << " balanceDomain=" << balanceDomainKey
+                            << " dstPod=" << dstPod
+                            << " dstEdge=" << dstEdge
+                            << " uid=" << uid
+                            << " timeFs=" << Simulator::Now().GetFemtoSeconds());
+                return learnedPort->second;
+            }
+
+            uint32_t& nextIndex = m_flowSprayNextPortByBalanceDomain[balanceDomainKey];
+            std::map<Mac48Address, uint32_t>& portLoads =
+                m_flowSprayPortLoadsByBalanceDomain[balanceDomainKey];
+            uint32_t tieOffset = nextIndex % candidatePorts.size();
+            if (m_hasFatTreeEcmpContext)
+            {
+                tieOffset = StableMix32(flowSrc ^ (flowDst << 8) ^ (flowTag << 16) ^
+                                        (m_fatTreeLayerIndex << 24)) %
+                            candidatePorts.size();
+            }
+            uint32_t index = 0;
+            uint32_t minLoad = std::numeric_limits<uint32_t>::max();
+            for (size_t n = 0; n < candidatePorts.size(); ++n)
+            {
+                uint32_t candidateIndex = (tieOffset + n) % candidatePorts.size();
+                Mac48Address candidateMac =
+                    Mac48Address::ConvertFrom(candidatePorts[candidateIndex]->GetAddress());
+                uint32_t load = 0;
+                auto loadIt = portLoads.find(candidateMac);
+                if (loadIt != portLoads.end())
+                {
+                    load = loadIt->second;
+                }
+                if (load < minLoad)
+                {
+                    minLoad = load;
+                    index = candidateIndex;
+                }
+            }
+            Ptr<NetDevice> outPort = candidatePorts[index];
+            Mac48Address selectedMac = Mac48Address::ConvertFrom(outPort->GetAddress());
+            uint32_t selectedLoadBefore = portLoads[selectedMac];
+            portLoads[selectedMac] = selectedLoadBefore + 1;
+            nextIndex = (index + 1) % candidatePorts.size();
+            std::ostringstream oldPortOss;
+            if (learnedPort == m_flowSprayPorts.end())
+            {
+                oldPortOss << "none";
+            }
+            else
+            {
+                oldPortOss << "if=" << learnedPort->second->GetIfIndex()
+                           << ",mac="
+                           << Mac48Address::ConvertFrom(learnedPort->second->GetAddress());
+            }
+            NS_LOG_INFO("[ECMP][FLOW_SPRAY] bridge=" << m_address
+                        << " srcMac=" << src
+                        << " dstMac=" << dst
+                        << " flowState=" << flowState
+                        << " flowTuple=" << flowTag << ":" << flowSrc << ":" << flowDst
+                        << " action=" << (learnedPort == m_flowSprayPorts.end() ? "data_new"
+                                                                                 : "data_reassign")
+                        << " oldPort=" << oldPortOss.str()
+                        << " selected={idx=" << index
+                        << ",if=" << outPort->GetIfIndex()
+                        << ",mac=" << selectedMac
+                        << "}"
+                        << " nextIndexForBalanceDomain=" << nextIndex
+                        << " tieOffset=" << tieOffset
+                        << " selectedLoadBefore=" << selectedLoadBefore
+                        << " selectedLoadAfter=" << portLoads[selectedMac]
+                        << " candidateCount=" << candidatePorts.size()
+                        << " candidates=" << candidateOss.str()
+                        << " candidateSet=" << candidateSetKey
+                        << " balanceScope=" << balanceScope
+                        << " balanceDomain=" << balanceDomainKey
+                        << " dstPod=" << dstPod
+                        << " dstEdge=" << dstEdge
+                        << " uid=" << uid
+                        << " timeFs=" << Simulator::Now().GetFemtoSeconds());
+            m_flowSprayPorts[key] = outPort;
+            return outPort;
+        }
+
+        auto nowsys = std::chrono::system_clock::now();
+        auto duration = nowsys.time_since_epoch();
+        uint64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
+        uint32_t seed = static_cast<uint32_t>(now);
+        uint32_t index = seed % candidatePorts.size();
+        Ptr<NetDevice> outPort = candidatePorts[index];
+        NS_LOG_INFO("[ECMP][FLOW_SPRAY] bridge=" << m_address
+                    << " srcMac=" << src
+                    << " dstMac=" << dst
+                    << " flowState=" << flowState
+                    << " flowTuple="
+                    << (hasFlowTuple ? (std::to_string(flowTag) + ":" +
+                                         std::to_string(flowSrc) + ":" +
+                                         std::to_string(flowDst))
+                                      : std::string("none"))
+                    << " action=non_data_model0"
+                    << " randomSeed=" << seed
+                    << " selected={idx=" << index
+                    << ",if=" << outPort->GetIfIndex()
+                    << ",mac=" << Mac48Address::ConvertFrom(outPort->GetAddress())
+                    << "}"
+                    << " candidateCount=" << candidatePorts.size()
+                    << " candidates=" << candidateOss.str()
+                    << " candidateSet=" << candidateSetKey
+                    << " uid=" << uid
+                    << " timeFs=" << Simulator::Now().GetFemtoSeconds());
+        return outPort;
+    }
     return candidatePorts.front();
 }
 
@@ -1160,7 +1387,11 @@ MinHopBridgeNetDevice::ForwardUnicast(Ptr<NetDevice> incomingPort,
             ecmpCandidates.push_back(port);
         }
         uint32_t flowTag = 0;
+        uint32_t flowSrc = 0;
+        uint32_t flowDst = 0;
+        uint32_t flowState = 0xffffffffu;
         bool hasFlowTag = false;
+        bool hasFlowTuple = false;
         Ptr<Packet> flowProbe = packet->Copy();
         HopCountHeader flowProbeHopHeader;
         ThreePHeader flowProbeTpHeader;
@@ -1170,11 +1401,24 @@ MinHopBridgeNetDevice::ForwardUnicast(Ptr<NetDevice> incomingPort,
         }
         if (flowProbe->PeekHeader(flowProbeTpHeader) > 0)
         {
+            flowState = static_cast<uint32_t>(flowProbeTpHeader.GetState());
             flowTag = flowProbeTpHeader.GetTag();
+            flowSrc = flowProbeTpHeader.GetSrc();
+            flowDst = flowProbeTpHeader.GetDst();
             hasFlowTag = true;
+            hasFlowTuple = true;
         }
         Ptr<NetDevice> realoutport =
-            ecmp(ecmpCandidates, src, dst, packet->GetUid(), flowTag, hasFlowTag);
+            ecmp(ecmpCandidates,
+                 src,
+                 dst,
+                 packet->GetUid(),
+                 flowTag,
+                 hasFlowTag,
+                 flowSrc,
+                 flowDst,
+                 hasFlowTuple,
+                 flowState);
 
         if (realoutport)
         {

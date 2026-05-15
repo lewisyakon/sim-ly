@@ -6,7 +6,7 @@
   "pp_schedule": "gpipe",
 
   "network": {
-    "ecmpmodel": 2,                  
+    "ecmpmodel": 3,                  
     "max_jump": 5,
     "mtu": 4096,
     "normallink_rate": "224Gbps",
@@ -21,8 +21,8 @@
 
   "logging": {
     "dir": "simlog",
-    "simulation_log": "128_test.log",
-    "nccl_log": "128_test.log",
+    "simulation_log": "128_random_test.log",
+    "nccl_log": "128_random_test.log",
     "bridge_diag": true,
     "log_levels": {
       "roce": "all",
@@ -39,9 +39,9 @@
   },
 
   "mactable": {
-    "load_enable": false,
+    "load_enable": true,
     "dump_enable": false,
-    "dir": ""
+    "dir": "mactable/topo-fattree_k-8_subnet-0_subnetk-1_gpusper-1_nvsper-1-python"
   },
 
   "pfc": {

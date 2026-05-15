@@ -2258,6 +2258,10 @@ void SetupNetwork(){
             Ptr<MinHopBridgeNetDevice> dev = CreateObject<MinHopBridgeNetDevice>();
             dev->set_maxjump(max_jump);
             dev->set_ecmp_model(ecmpmodel);
+            dev->SetFatTreeEcmpContext(k_fattree,
+                                       gpus_per_server,
+                                       MinHopBridgeNetDevice::EcmpTopologyLayer::Core,
+                                       i);
             dev->Set_switchDelay(NanoSeconds(switch_delay));
             dev->SetMtu(m_mtu);
             ApplyBridgePfcWatermarks(dev);
@@ -2268,6 +2272,10 @@ void SetupNetwork(){
             Ptr<MinHopBridgeNetDevice> dev = CreateObject<MinHopBridgeNetDevice>();
             dev->set_maxjump(max_jump);
             dev->set_ecmp_model(ecmpmodel);
+            dev->SetFatTreeEcmpContext(k_fattree,
+                                       gpus_per_server,
+                                       MinHopBridgeNetDevice::EcmpTopologyLayer::Aggregation,
+                                       i);
             dev->Set_switchDelay(NanoSeconds(switch_delay));
             dev->SetMtu(m_mtu);
             ApplyBridgePfcWatermarks(dev);
@@ -2278,6 +2286,10 @@ void SetupNetwork(){
             Ptr<MinHopBridgeNetDevice> dev = CreateObject<MinHopBridgeNetDevice>();
             dev->set_maxjump(max_jump);
             dev->set_ecmp_model(ecmpmodel);
+            dev->SetFatTreeEcmpContext(k_fattree,
+                                       gpus_per_server,
+                                       MinHopBridgeNetDevice::EcmpTopologyLayer::Edge,
+                                       i);
             dev->Set_switchDelay(NanoSeconds(switch_delay));
             dev->SetMtu(m_mtu);
             ApplyBridgePfcWatermarks(dev);

@@ -80,6 +80,17 @@ class MinHopBridgeNetDevice : public NetDevice
     
     void AddEntry(Mac48Address mac, const std::vector<uint32_t>& ports);
     void set_ecmp_model(int model);
+    enum class EcmpTopologyLayer : uint8_t
+    {
+        Unknown = 0,
+        Core = 1,
+        Aggregation = 2,
+        Edge = 3
+    };
+    void SetFatTreeEcmpContext(uint32_t k,
+                               uint32_t gpusPerServer,
+                               EcmpTopologyLayer layer,
+                               uint32_t layerIndex);
 
     void set_maxjump(int jump);
     
@@ -200,7 +211,41 @@ class MinHopBridgeNetDevice : public NetDevice
                         Mac48Address dst,
                         uint64_t uid,
                         uint32_t flowTag = 0,
-                        bool hasFlowTag = false);
+                        bool hasFlowTag = false,
+                        uint32_t flowSrc = 0,
+                        uint32_t flowDst = 0,
+                        bool hasFlowTuple = false,
+                        uint32_t flowState = 0xffffffffu);
+
+    struct FlowSprayKey
+    {
+        std::string balanceDomain;
+        uint32_t state = 0;
+        uint32_t tag = 0;
+        uint32_t src = 0;
+        uint32_t dst = 0;
+
+        bool operator<(const FlowSprayKey& other) const
+        {
+            if (balanceDomain != other.balanceDomain)
+            {
+                return balanceDomain < other.balanceDomain;
+            }
+            if (state != other.state)
+            {
+                return state < other.state;
+            }
+            if (tag != other.tag)
+            {
+                return tag < other.tag;
+            }
+            if (src != other.src)
+            {
+                return src < other.src;
+            }
+            return dst < other.dst;
+        }
+    };
 
     /** A map of MAC address to learned state. */
     std::map<Mac48Address, std::vector<LearnedState> > m_learnState;
@@ -243,8 +288,17 @@ class MinHopBridgeNetDevice : public NetDevice
 
     int ecmpmodel=0;
     //0 随机发送 
-    //1 hash
-    //2 best-fit
+    //1 packet hash
+    //2 flow hash
+    //3 DATA flow spray within a destination-aware balance domain; non-DATA uses model 0
+    std::map<std::string, uint32_t> m_flowSprayNextPortByBalanceDomain;
+    std::map<std::string, std::map<Mac48Address, uint32_t>> m_flowSprayPortLoadsByBalanceDomain;
+    std::map<FlowSprayKey, Ptr<NetDevice>> m_flowSprayPorts;
+    bool m_hasFatTreeEcmpContext = false;
+    uint32_t m_fatTreeK = 0;
+    uint32_t m_fatTreeGpusPerServer = 1;
+    EcmpTopologyLayer m_ecmpTopologyLayer = EcmpTopologyLayer::Unknown;
+    uint32_t m_fatTreeLayerIndex = 0;
 
     int maxjump=4;
 

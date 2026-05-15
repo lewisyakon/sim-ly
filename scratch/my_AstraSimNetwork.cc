@@ -565,12 +565,19 @@ void GetGlobalStart()
 }
 
 /*
+/*
+mpirun -np 4 --map-by ppr:4:node:PE=2 --bind-to none \
+  /mnt/nfs/cloud/sim-ly/build/scratch/ns3.44-my_AstraSimNetwork-default
+
 mpirun \
-  --wdir /mnt/nfs/cloud/hybrid \
+  --wdir /mnt/nfs/cloud/sim-ly \
   --launch-agent "/usr/local/bin/mpi-docker-agent /usr/bin/orted" \
-  -np 1 --host lab206:1 --map-by ppr:1:node:PE=1 --bind-to none /bin/hostname : \
-  -np 1 --host lab254:1 --map-by ppr:1:node:PE=1 --bind-to none /bin/hostname : \
-  -np 2 --host lab188:2 --map-by ppr:2:node:PE=2 --bind-to none /bin/hostname
+  --mca btl_tcp_if_include ztkse63itn \
+  --mca oob_tcp_if_include ztkse63itn \
+  -np 2 --host lab206:2 --map-by ppr:2:node:PE=2 --bind-to none \
+  /mnt/nfs/cloud/sim-ly/build/scratch/ns3.44-my_AstraSimNetwork-default : \
+  -np 2 --host lab254:2 --map-by ppr:2:node:PE=2 --bind-to none \
+  /mnt/nfs/cloud/sim-ly/build/scratch/ns3.44-my_AstraSimNetwork-default
 
 mpirun \
   --wdir /mnt/nfs/cloud/hybrid \
@@ -849,6 +856,9 @@ int main(int argc, char *argv[]) {
   if(MpiInterface::GetSystemId() == 0){
     NS_LOG_INFO("[main] total send count="<<std::accumulate(sendCounts, sendCounts + conf::system, 0ULL));
     NS_LOG_INFO("[main] total events="<<std::accumulate(eventCounts, eventCounts + conf::system, 0ULL));
+
+    std::cout<<"[main] total send count="<<std::accumulate(sendCounts, sendCounts + conf::system, 0ULL)<<"\n";
+    std::cout<<"[main] total events="<<std::accumulate(eventCounts, eventCounts + conf::system, 0ULL)<<"\n";
     const uint64_t maxNetworkActivityTimeFs =
         *std::max_element(networkActivityTimes, networkActivityTimes + conf::system);
     const uint64_t maxFlowTxDoneTimeFs =
