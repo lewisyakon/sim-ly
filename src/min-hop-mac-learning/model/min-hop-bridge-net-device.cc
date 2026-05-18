@@ -1036,7 +1036,7 @@ MinHopBridgeNetDevice::ScheduleReceive(Ptr<NetDevice> incomingPort,
 
 void 
 MinHopBridgeNetDevice::set_ecmp_model(int model){
-    if (model>=0 and model<=3){
+    if (model>=0 and model<=4){
         ecmpmodel=model;
     }
 }
@@ -1343,6 +1343,165 @@ MinHopBridgeNetDevice::ecmp(std::vector<Ptr<NetDevice> > outPorts,
                     << " candidateCount=" << candidatePorts.size()
                     << " candidates=" << candidateOss.str()
                     << " candidateSet=" << candidateSetKey
+                    << " uid=" << uid
+                    << " timeFs=" << Simulator::Now().GetFemtoSeconds());
+        return outPort;
+    }
+    if (ecmpmodel==4){//All-to-all 特化：按物理源目在 fat-tree 中固定拆分
+        std::ostringstream candidateOss;
+        candidateOss << "[";
+        for (size_t i = 0; i < candidatePorts.size(); ++i)
+        {
+            if (i > 0)
+            {
+                candidateOss << ",";
+            }
+            candidateOss << "{idx=" << i
+                         << ",if=" << candidatePorts[i]->GetIfIndex()
+                         << ",mac=" << Mac48Address::ConvertFrom(candidatePorts[i]->GetAddress())
+                         << "}";
+        }
+        candidateOss << "]";
+
+        uint32_t index = 0;
+        std::string action = "fallback_front";
+        uint32_t physicalSrc = flowSrc;
+        uint32_t physicalDst = flowDst;
+        if (hasFlowTuple &&
+            (flowState == static_cast<uint32_t>(ThreePHeader::ACT) ||
+             flowState == static_cast<uint32_t>(ThreePHeader::IDLE)))
+        {
+            physicalSrc = flowDst;
+            physicalDst = flowSrc;
+        }
+
+        uint32_t srcPod = 0xffffffffu;
+        uint32_t dstPod = 0xffffffffu;
+        uint32_t srcEdge = 0xffffffffu;
+        uint32_t dstEdge = 0xffffffffu;
+        uint32_t srcHostInEdge = 0xffffffffu;
+        uint32_t dstHostInEdge = 0xffffffffu;
+        uint32_t switchPod = 0xffffffffu;
+        uint32_t switchLocalIndex = 0xffffffffu;
+
+        if (candidatePorts.size() > 1)
+        {
+            bool usedFatTreeMapping = false;
+            if (hasFlowTuple && m_hasFatTreeEcmpContext && m_fatTreeK >= 2 &&
+                m_fatTreeGpusPerServer > 0)
+            {
+                uint32_t hostsPerEdge = m_fatTreeK / 2;
+                uint32_t edgesPerPod = m_fatTreeK / 2;
+                uint32_t serversPerPod = m_fatTreeK * m_fatTreeK / 4;
+                uint32_t srcServer = physicalSrc / m_fatTreeGpusPerServer;
+                uint32_t dstServer = physicalDst / m_fatTreeGpusPerServer;
+
+                if (hostsPerEdge > 0 && edgesPerPod > 0 && serversPerPod > 0)
+                {
+                    srcPod = srcServer / serversPerPod;
+                    dstPod = dstServer / serversPerPod;
+                    srcEdge = (srcServer % serversPerPod) / hostsPerEdge;
+                    dstEdge = (dstServer % serversPerPod) / hostsPerEdge;
+                    srcHostInEdge = srcServer % hostsPerEdge;
+                    dstHostInEdge = dstServer % hostsPerEdge;
+
+                    switch (m_ecmpTopologyLayer)
+                    {
+                    case EcmpTopologyLayer::Edge:
+                    {
+                        switchPod = m_fatTreeLayerIndex / edgesPerPod;
+                        switchLocalIndex = m_fatTreeLayerIndex % edgesPerPod;
+                        if (switchPod == srcPod && switchLocalIndex == srcEdge)
+                        {
+                            index = (srcPod + srcHostInEdge + dstPod) % candidatePorts.size();
+                            action = "edge_src_pod_host_dstpod";
+                        }
+                        else
+                        {
+                            index = dstHostInEdge % candidatePorts.size();
+                            action = "edge_dst_host";
+                        }
+                        usedFatTreeMapping = true;
+                        break;
+                    }
+                    case EcmpTopologyLayer::Aggregation:
+                    {
+                        switchPod = m_fatTreeLayerIndex / edgesPerPod;
+                        switchLocalIndex = m_fatTreeLayerIndex % edgesPerPod;
+                        if (switchPod == srcPod && switchPod != dstPod)
+                        {
+                            index = dstEdge % candidatePorts.size();
+                            action = "agg_up_dst_edge";
+                        }
+                        else if (switchPod == dstPod)
+                        {
+                            index = dstEdge % candidatePorts.size();
+                            action = "agg_down_dst_edge";
+                        }
+                        else
+                        {
+                            uint32_t h = StableMix32(physicalSrc ^ (physicalDst << 8) ^
+                                                     (flowTag << 16) ^
+                                                     (m_fatTreeLayerIndex << 24));
+                            index = h % candidatePorts.size();
+                            action = "agg_fallback_hash";
+                        }
+                        usedFatTreeMapping = true;
+                        break;
+                    }
+                    case EcmpTopologyLayer::Core:
+                    {
+                        index = dstPod % candidatePorts.size();
+                        action = "core_dst_pod";
+                        usedFatTreeMapping = true;
+                        break;
+                    }
+                    default:
+                        break;
+                    }
+                }
+            }
+
+            if (!usedFatTreeMapping)
+            {
+                uint32_t h = hasFlowTuple
+                                 ? StableMix32(physicalSrc ^ (physicalDst << 8) ^
+                                               (flowTag << 16) ^ (flowState << 24))
+                                 : StableMix32(static_cast<uint32_t>(uid) ^
+                                               static_cast<uint32_t>(uid >> 32));
+                index = h % candidatePorts.size();
+                action = hasFlowTuple ? "tuple_hash" : "uid_hash";
+            }
+        }
+
+        Ptr<NetDevice> outPort = candidatePorts[index];
+        NS_LOG_INFO("[ECMP][MODEL4]"
+                    << " bridge=" << m_address
+                    << " layer=" << static_cast<uint32_t>(m_ecmpTopologyLayer)
+                    << " layerIndex=" << m_fatTreeLayerIndex
+                    << " flowState=" << flowState
+                    << " flowTuple="
+                    << (hasFlowTuple ? (std::to_string(flowTag) + ":" +
+                                         std::to_string(flowSrc) + ":" +
+                                         std::to_string(flowDst))
+                                      : std::string("none"))
+                    << " physicalSrc=" << physicalSrc
+                    << " physicalDst=" << physicalDst
+                    << " srcPod=" << srcPod
+                    << " srcEdge=" << srcEdge
+                    << " srcHostInEdge=" << srcHostInEdge
+                    << " dstPod=" << dstPod
+                    << " dstEdge=" << dstEdge
+                    << " dstHostInEdge=" << dstHostInEdge
+                    << " switchPod=" << switchPod
+                    << " switchLocalIndex=" << switchLocalIndex
+                    << " action=" << action
+                    << " selected={idx=" << index
+                    << ",if=" << outPort->GetIfIndex()
+                    << ",mac=" << Mac48Address::ConvertFrom(outPort->GetAddress())
+                    << "}"
+                    << " candidateCount=" << candidatePorts.size()
+                    << " candidates=" << candidateOss.str()
                     << " uid=" << uid
                     << " timeFs=" << Simulator::Now().GetFemtoSeconds());
         return outPort;

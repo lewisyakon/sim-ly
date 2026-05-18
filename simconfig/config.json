@@ -6,7 +6,7 @@
   "pp_schedule": "gpipe",
 
   "network": {
-    "ecmpmodel": 3,                  
+    "ecmpmodel": 4,                  
     "max_jump": 5,
     "mtu": 4096,
     "normallink_rate": "224Gbps",

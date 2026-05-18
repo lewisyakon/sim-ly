@@ -291,6 +291,7 @@ class MinHopBridgeNetDevice : public NetDevice
     //1 packet hash
     //2 flow hash
     //3 DATA flow spray within a destination-aware balance domain; non-DATA uses model 0
+    //4 idealized deterministic all-to-all split for k-ary fat-tree experiments
     std::map<std::string, uint32_t> m_flowSprayNextPortByBalanceDomain;
     std::map<std::string, std::map<Mac48Address, uint32_t>> m_flowSprayPortLoadsByBalanceDomain;
     std::map<FlowSprayKey, Ptr<NetDevice>> m_flowSprayPorts;
