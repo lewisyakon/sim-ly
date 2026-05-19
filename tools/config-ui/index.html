@@ -1,0 +1,1179 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SIM 配置面板</title>
+  <style>
+    :root {
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --line: #d9dee7;
+      --text: #18202f;
+      --muted: #647084;
+      --accent: #1f6feb;
+      --accent-strong: #1557bd;
+      --danger: #b42318;
+      --warn: #9a6700;
+      --ok: #1a7f37;
+      --shadow: 0 8px 24px rgba(24, 32, 47, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+
+    button,
+    input,
+    select,
+    textarea {
+      font: inherit;
+      letter-spacing: 0;
+    }
+
+    .app {
+      display: grid;
+      grid-template-columns: 260px minmax(0, 1fr) 340px;
+      min-height: 100vh;
+    }
+
+    .sidebar {
+      border-right: 1px solid var(--line);
+      background: #111827;
+      color: #f8fafc;
+      padding: 20px 16px;
+    }
+
+    .brand {
+      margin-bottom: 22px;
+    }
+
+    .brand h1 {
+      margin: 0;
+      font-size: 20px;
+      line-height: 1.25;
+    }
+
+    .brand p {
+      margin: 8px 0 0;
+      color: #cbd5e1;
+      font-size: 13px;
+      line-height: 1.5;
+      word-break: break-word;
+    }
+
+    .nav {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .nav button {
+      width: 100%;
+      border: 0;
+      border-radius: 8px;
+      padding: 10px 12px;
+      color: #e5e7eb;
+      background: transparent;
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .nav button.active {
+      color: #ffffff;
+      background: #243044;
+    }
+
+    .main {
+      min-width: 0;
+      padding: 24px;
+      overflow: auto;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 18px;
+    }
+
+    .topbar h2 {
+      margin: 0;
+      font-size: 22px;
+      line-height: 1.25;
+    }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      justify-content: flex-end;
+    }
+
+    .btn {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 9px 13px;
+      background: var(--panel);
+      color: var(--text);
+      cursor: pointer;
+      min-height: 38px;
+    }
+
+    .btn.primary {
+      border-color: var(--accent);
+      background: var(--accent);
+      color: #ffffff;
+    }
+
+    .btn.primary:hover {
+      background: var(--accent-strong);
+    }
+
+    .btn:disabled {
+      cursor: not-allowed;
+      opacity: 0.6;
+    }
+
+    .content {
+      display: grid;
+      gap: 16px;
+    }
+
+    .section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .section-header {
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .section-header h3 {
+      margin: 0;
+      font-size: 16px;
+      line-height: 1.35;
+    }
+
+    .section-header p {
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .fields {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(240px, 1fr));
+      gap: 14px 18px;
+      padding: 18px;
+    }
+
+    .field {
+      min-width: 0;
+    }
+
+    .field.wide {
+      grid-column: 1 / -1;
+    }
+
+    .field label {
+      display: block;
+      margin-bottom: 6px;
+      font-weight: 650;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+
+    .field small {
+      display: block;
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    .field input[type="text"],
+    .field input[type="number"],
+    .field select,
+    .field textarea {
+      width: 100%;
+      min-height: 38px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 8px 10px;
+      background: #ffffff;
+      color: var(--text);
+    }
+
+    .field textarea {
+      min-height: 420px;
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+      line-height: 1.5;
+      resize: vertical;
+    }
+
+    .field input[readonly] {
+      background: #f3f5f8;
+      color: #455064;
+    }
+
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-height: 38px;
+    }
+
+    .toggle-row input {
+      width: 18px;
+      height: 18px;
+    }
+
+    .aside {
+      border-left: 1px solid var(--line);
+      background: #fbfcfe;
+      padding: 24px 18px;
+      overflow: auto;
+    }
+
+    .summary-block {
+      background: #ffffff;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      margin-bottom: 14px;
+    }
+
+    .summary-block h3 {
+      margin: 0 0 10px;
+      font-size: 15px;
+    }
+
+    .metric {
+      display: flex;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 7px 0;
+      border-top: 1px solid #edf0f5;
+      font-size: 13px;
+    }
+
+    .metric:first-of-type {
+      border-top: 0;
+    }
+
+    .metric span:first-child {
+      color: var(--muted);
+    }
+
+    .metric span:last-child {
+      font-weight: 650;
+      text-align: right;
+      word-break: break-word;
+    }
+
+    .notice {
+      border-left: 4px solid var(--accent);
+      background: #eef5ff;
+      padding: 10px 12px;
+      color: #16345f;
+      font-size: 13px;
+      line-height: 1.5;
+      margin-bottom: 10px;
+    }
+
+    .notice.warn {
+      border-left-color: var(--warn);
+      background: #fff8e6;
+      color: #5f3b00;
+    }
+
+    .notice.error {
+      border-left-color: var(--danger);
+      background: #fff1f0;
+      color: #6b1d16;
+    }
+
+    .status {
+      min-height: 22px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+      margin: 0 0 14px;
+    }
+
+    .status.ok {
+      color: var(--ok);
+    }
+
+    .status.error {
+      color: var(--danger);
+    }
+
+    .hidden {
+      display: none;
+    }
+
+    @media (max-width: 1180px) {
+      .app {
+        grid-template-columns: 220px minmax(0, 1fr);
+      }
+
+      .aside {
+        grid-column: 1 / -1;
+        border-left: 0;
+        border-top: 1px solid var(--line);
+      }
+    }
+
+    @media (max-width: 780px) {
+      .app {
+        display: block;
+      }
+
+      .sidebar {
+        border-right: 0;
+      }
+
+      .nav {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .topbar {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .actions {
+        justify-content: flex-start;
+      }
+
+      .fields {
+        grid-template-columns: 1fr;
+      }
+
+      .main,
+      .aside {
+        padding: 18px 14px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <h1>SIM 配置面板</h1>
+        <p id="configPath">正在读取配置...</p>
+      </div>
+      <nav class="nav" id="nav"></nav>
+    </aside>
+
+    <main class="main">
+      <div class="topbar">
+        <h2 id="sectionTitle">配置</h2>
+        <div class="actions">
+          <button class="btn" id="reloadBtn" type="button">重新读取</button>
+          <button class="btn" id="formatBtn" type="button">格式化 JSON</button>
+          <button class="btn primary" id="saveBtn" type="button">保存配置</button>
+        </div>
+      </div>
+      <p class="status" id="status"></p>
+      <div class="content" id="content"></div>
+    </main>
+
+    <aside class="aside">
+      <div id="summary"></div>
+      <div id="warnings"></div>
+    </aside>
+  </div>
+
+  <script>
+    const sections = [
+      { id: "basic", title: "基础", hint: "选择 workload、线程数和基础运行选项。" },
+      { id: "topology", title: "拓扑", hint: "只展示当前拓扑真正使用的字段，冗余字段会保留在 JSON 中。" },
+      { id: "network", title: "网络与 ECMP", hint: "把底层数字选项翻译成可读策略。" },
+      { id: "pfc", title: "PFC 与队列", hint: "端口队列、水位和重试相关参数。" },
+      { id: "roce", title: "RoCE", hint: "可靠传输、ACK、窗口和重传参数。" },
+      { id: "mactable", title: "MAC 表", hint: "泛洪学习表的读取和写出。" },
+      { id: "logging", title: "日志", hint: "常用日志等级和 ns-3 组件开关。" },
+      { id: "json", title: "专家 JSON", hint: "保留完整 JSON 编辑入口。" }
+    ];
+
+    const topologyOptions = [
+      ["fattree", "FatTree：k-ary FatTree，hostperleaf 不生效"],
+      ["clos", "Clos：leaf/spine，hostperleaf 生效"],
+      ["fullmesh", "FullMesh：交换机全互连"],
+      ["torus", "Torus：k x k 网格"],
+      ["external", "External：从 topology.file 读取外部拓扑"]
+    ];
+
+    const subnetOptions = [
+      [0, "无服务器内网：每台服务器 1 GPU"],
+      [1, "NVSwitch：每台服务器 subnet_k 个 GPU"],
+      [2, "GPU FullMesh：每台服务器 GPU 全互连"],
+      [3, "GPU Torus：每台服务器 subnet_k x subnet_k 个 GPU"]
+    ];
+
+    const ecmpOptions = [
+      [0, "随机转发：每包随机选等价端口"],
+      [1, "按包哈希：源/目的/包 UID 参与哈希"],
+      [2, "按流哈希：优先使用 flowTag，无 flowTag 时退回包 UID"],
+      [3, "DATA 逐流喷洒：DATA 流按负载轮询，非 DATA 随机"],
+      [4, "AllToAll FatTree 特化：按物理源目固定拆分"]
+    ];
+
+    const logLevelOptions = [
+      ["off", "关闭"],
+      ["basic", "基础"],
+      ["all", "完整"]
+    ];
+
+    const state = {
+      config: null,
+      active: "basic",
+      configPath: ""
+    };
+
+    const navEl = document.getElementById("nav");
+    const contentEl = document.getElementById("content");
+    const titleEl = document.getElementById("sectionTitle");
+    const statusEl = document.getElementById("status");
+    const summaryEl = document.getElementById("summary");
+    const warningsEl = document.getElementById("warnings");
+
+    function clone(value) {
+      return JSON.parse(JSON.stringify(value));
+    }
+
+    function pathGet(path, fallback = "") {
+      const parts = path.split(".");
+      let node = state.config;
+      for (const part of parts) {
+        if (!node || typeof node !== "object" || !(part in node)) {
+          return fallback;
+        }
+        node = node[part];
+      }
+      return node;
+    }
+
+    function pathSet(path, value) {
+      const parts = path.split(".");
+      let node = state.config;
+      for (let i = 0; i < parts.length - 1; i += 1) {
+        const part = parts[i];
+        if (!node[part] || typeof node[part] !== "object" || Array.isArray(node[part])) {
+          node[part] = {};
+        }
+        node = node[part];
+      }
+      node[parts[parts.length - 1]] = value;
+      autoUpdateMactableDir(path);
+      refreshDerived();
+      refreshRawFromConfig();
+    }
+
+    function asInt(value, fallback = 0) {
+      const parsed = Number.parseInt(value, 10);
+      return Number.isFinite(parsed) ? parsed : fallback;
+    }
+
+    function asFloat(value, fallback = 0) {
+      const parsed = Number.parseFloat(value);
+      return Number.isFinite(parsed) ? parsed : fallback;
+    }
+
+    function currentTopology() {
+      const raw = pathGet("topology.model", "fattree");
+      if (typeof raw === "number") {
+        return ["fattree", "clos", "fullmesh", "torus", "test", "hpn", "external"][raw] || "fattree";
+      }
+      const text = String(raw).toLowerCase();
+      return text === "file" ? "external" : text;
+    }
+
+    function currentSubnet() {
+      return asInt(pathGet("topology.subnet_model", 0), 0);
+    }
+
+    function sanitizeDirToken(value) {
+      let out = String(value).replace(/[^0-9A-Za-z_-]/g, "-");
+      while (out.includes("--")) out = out.replaceAll("--", "-");
+      out = out.replace(/^-+/, "").replace(/-+$/, "");
+      return out || "na";
+    }
+
+    function topologyTagName(model) {
+      return model === "file" ? "external" : model;
+    }
+
+    function scenarioTag(derived = computeDerived()) {
+      const model = topologyTagName(derived.model);
+      let tag = `topo-${model}`;
+      if (model === "fattree") {
+        tag += `_k-${derived.k}`;
+      } else if (model === "clos") {
+        tag += `_k-${derived.k}_hostperleaf-${derived.hostperleaf}`;
+      } else if (model === "fullmesh") {
+        tag += `_k-${derived.k}`;
+      } else if (model === "torus") {
+        tag += `_k-${derived.k}`;
+      } else if (model === "test") {
+        tag += `_k-${derived.k}`;
+      } else if (model === "hpn") {
+        tag += `_tor-per-plane-${derived.k}_host-per-tor-${derived.hostperleaf}`;
+      } else {
+        return null;
+      }
+      tag += `_subnet-${derived.subnet}`;
+      tag += `_subnetk-${derived.subnetK}`;
+      tag += `_gpusper-${derived.gpusPerServer}`;
+      tag += `_nvsper-${derived.nvswitchPerServer}`;
+      return sanitizeDirToken(tag);
+    }
+
+    function generatedMactableDir(derived = computeDerived()) {
+      const tag = scenarioTag(derived);
+      if (!tag) return null;
+      const load = Boolean(pathGet("mactable.load_enable", false));
+      const dump = Boolean(pathGet("mactable.dump_enable", false));
+      const variant = load || !dump ? "python" : "flood";
+      return `mactable/${tag}-${variant}`;
+    }
+
+    function autoUpdateMactableDir(changedPath = "") {
+      if (!state.config || currentTopology() === "external") return;
+      if (!changedPath.startsWith("topology.") &&
+          !changedPath.startsWith("mactable.") &&
+          changedPath !== "nvswitch_per_server") {
+        return;
+      }
+      const generated = generatedMactableDir();
+      if (!generated) return;
+      if (!state.config.mactable || typeof state.config.mactable !== "object") {
+        state.config.mactable = {};
+      }
+      state.config.mactable.dir = generated;
+    }
+
+    function setStatus(text, kind = "") {
+      statusEl.textContent = text;
+      statusEl.className = `status ${kind}`.trim();
+    }
+
+    function makeEl(tag, className, text) {
+      const el = document.createElement(tag);
+      if (className) el.className = className;
+      if (text !== undefined) el.textContent = text;
+      return el;
+    }
+
+    function renderNav() {
+      navEl.innerHTML = "";
+      for (const section of sections) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.textContent = section.title;
+        btn.className = section.id === state.active ? "active" : "";
+        btn.addEventListener("click", () => {
+          state.active = section.id;
+          render();
+        });
+        navEl.appendChild(btn);
+      }
+    }
+
+    function field(def) {
+      const wrap = makeEl("div", `field ${def.wide ? "wide" : ""}`.trim());
+      const label = document.createElement("label");
+      label.textContent = def.label;
+      wrap.appendChild(label);
+
+      let control;
+      const value = pathGet(def.path, def.defaultValue ?? "");
+      if (def.type === "select") {
+        control = document.createElement("select");
+        for (const [raw, labelText] of def.options) {
+          const option = document.createElement("option");
+          option.value = String(raw);
+          option.textContent = labelText;
+          control.appendChild(option);
+        }
+        control.value = String(value);
+      } else if (def.type === "bool") {
+        const row = makeEl("div", "toggle-row");
+        control = document.createElement("input");
+        control.type = "checkbox";
+        control.checked = Boolean(value);
+        row.appendChild(control);
+        row.appendChild(makeEl("span", "", def.toggleText || "启用"));
+        wrap.appendChild(row);
+      } else {
+        control = document.createElement("input");
+        control.type = def.type === "number" || def.type === "float" || def.type === "numericString" ? "number" : "text";
+        if (def.step) control.step = def.step;
+        if (def.min !== undefined) control.min = String(def.min);
+        control.value = value ?? "";
+        if (def.placeholder) control.placeholder = def.placeholder;
+        if (def.readOnly) control.readOnly = true;
+      }
+
+      if (def.type !== "bool") {
+        wrap.appendChild(control);
+      }
+
+      control.addEventListener("change", () => {
+        let next;
+        if (def.type === "bool") {
+          next = control.checked;
+        } else if (def.type === "number") {
+          next = asInt(control.value, asInt(def.defaultValue ?? 0));
+        } else if (def.type === "float") {
+          next = asFloat(control.value, asFloat(def.defaultValue ?? 0));
+        } else if (def.type === "numericString") {
+          next = String(asInt(control.value, asInt(def.defaultValue ?? 0)));
+        } else if (def.valueKind === "number") {
+          next = asInt(control.value, asInt(def.defaultValue ?? 0));
+        } else {
+          next = control.value;
+        }
+        pathSet(def.path, next);
+        if (def.rerender) {
+          render();
+        }
+      });
+
+      if (def.help) {
+        wrap.appendChild(makeEl("small", "", def.help));
+      }
+      return wrap;
+    }
+
+    function sectionShell(title, hint, fields) {
+      const section = makeEl("section", "section");
+      const header = makeEl("div", "section-header");
+      header.appendChild(makeEl("h3", "", title));
+      if (hint) header.appendChild(makeEl("p", "", hint));
+      section.appendChild(header);
+      const body = makeEl("div", "fields");
+      for (const item of fields) body.appendChild(item);
+      section.appendChild(body);
+      return section;
+    }
+
+    function renderBasic() {
+      return [
+        sectionShell("基础设置", "这些字段一般每次实验都会改。", [
+          field({ path: "workloadpath", label: "Workload 文件", type: "text", wide: true, help: "例如 simworkload/128_test.txt。" }),
+          field({ path: "thread", label: "Astra-Sim 线程数", type: "number", min: 1, defaultValue: 1 }),
+          field({ path: "gpu_type", label: "GPU 类型", type: "select", options: [["A100", "A100"], ["H100", "H100"]] }),
+          field({ path: "pp_schedule", label: "Pipeline schedule", type: "text", help: "当前常见值是 gpipe；不确定时保持原值。" })
+        ])
+      ];
+    }
+
+    function topologyKLabel(model) {
+      if (model === "fattree") return "FatTree k";
+      if (model === "clos") return "Clos k";
+      if (model === "fullmesh") return "FullMesh k";
+      if (model === "torus") return "Torus k";
+      if (model === "hpn") return "HPN 每平面 ToR 数";
+      if (model === "test") return "测试规模 k";
+      return "k";
+    }
+
+    function renderTopology() {
+      const model = currentTopology();
+      const fields = [
+        field({
+          path: "topology.model",
+          label: "拓扑类型",
+          type: "select",
+          options: topologyOptions,
+          rerender: true,
+          wide: true,
+          help: "切换后只显示该拓扑实际生效的字段；隐藏字段仍保留在 JSON 中。"
+        })
+      ];
+
+      if (model !== "external") {
+        fields.push(field({
+          path: "topology.k",
+          label: topologyKLabel(model),
+          type: "number",
+          min: 1,
+          defaultValue: 1,
+          help: "不同拓扑对 k 的含义不同，右侧会显示派生 GPU/交换机数量。"
+        }));
+      }
+
+      if (model === "clos" || model === "hpn") {
+        fields.push(field({
+          path: "topology.hostperleaf",
+          label: model === "hpn" ? "每个 ToR 的 host 数" : "每个 leaf 的 host 数",
+          type: "number",
+          min: 1,
+          defaultValue: 1,
+          help: "FatTree 不使用这个字段，所以 FatTree 模式下不展示。"
+        }));
+      }
+
+      if (model === "external") {
+        fields.push(field({
+          path: "topology.file",
+          label: "外部拓扑文件",
+          type: "text",
+          wide: true,
+          help: "external 模式下必填；该文件定义 GPU、交换机、外网链路和内网链路。"
+        }));
+      } else {
+        fields.push(field({
+          path: "topology.subnet_model",
+          label: "服务器内 GPU 连接方式",
+          type: "select",
+          valueKind: "number",
+          options: subnetOptions,
+          rerender: true,
+          wide: true,
+          help: "external 模式不使用这个字段。"
+        }));
+        fields.push(field({
+          path: "topology.subnet_k",
+          label: currentSubnet() === 3 ? "Torus 子网边长 subnet_k" : "每服务器 GPU 数 subnet_k",
+          type: "number",
+          min: 1,
+          defaultValue: 1,
+          help: "无服务器内网时该值基本不生效；fullmesh/NVSwitch 下表示每服务器 GPU 数。"
+        }));
+      }
+
+      fields.push(field({
+        path: "topology.switch_delay_ns_override",
+        label: "交换机处理时延覆盖 ns",
+        type: "number",
+        min: 0,
+        defaultValue: 0,
+        help: "0 或空表示使用代码默认值；当前 JSON 常用 100ns。"
+      }));
+
+      return [sectionShell("拓扑", "页面隐藏不生效字段，但不会自动删除 JSON 中的兼容字段。", fields)];
+    }
+
+    function renderNetwork() {
+      return [
+        sectionShell("网络与 ECMP", "ECMP 在 JSON 中是数字，这里用文字策略表示，保存时仍写回数字。", [
+          field({ path: "network.ecmpmodel", label: "ECMP 策略", type: "select", valueKind: "number", options: ecmpOptions, wide: true }),
+          field({ path: "network.max_jump", label: "泛洪最大跳数 max_jump", type: "number", min: 1, defaultValue: 5, help: "影响 warmup 学习范围，也影响 auto ACK timeout 的估算边界。" }),
+          field({ path: "network.mtu", label: "MTU", type: "number", min: 1, defaultValue: 4096 }),
+          field({ path: "network.normallink_rate", label: "外网链路速率", type: "text", placeholder: "224Gbps" }),
+          field({ path: "network.nvlink_rate", label: "内网/NVLink 速率", type: "text", placeholder: "2400Gbps" }),
+          field({ path: "network.normallink_delay", label: "外网链路传播时延", type: "text", placeholder: "5ns" }),
+          field({ path: "network.nvlink_delay", label: "内网/NVLink 传播时延", type: "text", placeholder: "15ns" })
+        ])
+      ];
+    }
+
+    function renderPfc() {
+      return [
+        sectionShell("PFC 与端口队列", "队列数量会显著影响短期并发流的链路调度行为。", [
+          field({ path: "pfc.drop_tail_queue_size", label: "每个子队列最大包数", type: "numericString", min: 1, defaultValue: 1000000, help: "JSON 中保持字符串，代码里按字符串传给 ns-3 queue 属性。" }),
+          field({ path: "pfc.drop_tail_queue_num", label: "PPP 轮询子队列数量", type: "numericString", min: 1, defaultValue: 16, help: "AllToAll 场景中这个值过小会造成端口 PPP 队列短期偏置。" }),
+          field({ path: "pfc.high_watermark", label: "PFC 暂停水位", type: "float", min: 0, step: "0.01", defaultValue: 0.8 }),
+          field({ path: "pfc.low_watermark", label: "PFC 恢复水位", type: "float", min: 0, step: "0.01", defaultValue: 0.2 }),
+          field({ path: "pfc.not_head_retry_ns", label: "兼容重试间隔 ns", type: "number", min: 1, defaultValue: 1, help: "当前 bridge 聚合队列模型中主要是兼容字段。", wide: true })
+        ])
+      ];
+    }
+
+    function renderRoce() {
+      const ackMode = String(pathGet("roce.ack_timeout_mode", "auto")).toLowerCase();
+      const ackFields = ackMode === "fixed"
+        ? [
+            field({
+              path: "roce.ack_timeout_mode",
+              label: "ACK timeout 模式",
+              type: "select",
+              options: [["auto", "auto：按拓扑和链路参数估算"], ["fixed", "fixed：直接使用 ack_timeout_ns"]],
+              rerender: true,
+              help: "fixed 模式下直接使用下面的固定 timeout。"
+            }),
+            field({ path: "roce.ack_timeout_ns", label: "固定 ACK timeout ns", type: "number", min: 1, defaultValue: 5000 })
+          ]
+        : [
+            field({
+              path: "roce.ack_timeout_mode",
+              label: "ACK timeout 模式",
+              type: "select",
+              options: [["auto", "auto：按拓扑和链路参数估算"], ["fixed", "fixed：直接使用 ack_timeout_ns"]],
+              rerender: true,
+              help: "auto 模式下使用拓扑和链路参数推导基础值。"
+            }),
+            field({ path: "roce.ack_timeout_factor", label: "auto timeout 安全系数", type: "float", min: 0, step: "0.1", defaultValue: 2.0 })
+          ];
+      return [
+        sectionShell("RoCE 传输", "普通用户只需要改 enable、窗口和 timeout；更少用的字段保留在专家 JSON 里。", [
+          field({ path: "roce.enable", label: "启用 RoCE 可靠传输", type: "bool", toggleText: "启用" }),
+          field({ path: "roce.data_use_write", label: "DATA 使用 WRITE 语义", type: "bool", toggleText: "使用 WRITE" }),
+          field({ path: "roce.transport_ack_enable", label: "启用传输 ACK", type: "bool", toggleText: "启用 ACK" }),
+          field({ path: "roce.sq_depth", label: "SQ 深度", type: "number", min: 1, defaultValue: 1024 }),
+          field({ path: "roce.rq_depth", label: "RQ 深度", type: "number", min: 1, defaultValue: 1024 }),
+          field({ path: "roce.transport_window_packets", label: "传输窗口包数", type: "number", min: 1, defaultValue: 32 }),
+          field({ path: "roce.reorder_window_packets", label: "乱序窗口包数", type: "number", min: 1, defaultValue: 32 }),
+          ...ackFields,
+          field({ path: "roce.max_retransmissions", label: "最大重传次数", type: "number", min: 0, defaultValue: 8 }),
+          field({ path: "roce.ether_type", label: "RoCE EtherType", type: "text", wide: true, help: "例如 0x9999；一般不需要改。" })
+        ])
+      ];
+    }
+
+    function renderMactable() {
+      const derived = computeDerived();
+      const generated = generatedMactableDir(derived);
+      if (generated && pathGet("mactable.dir", "") !== generated) {
+        if (!state.config.mactable || typeof state.config.mactable !== "object") {
+          state.config.mactable = {};
+        }
+        state.config.mactable.dir = generated;
+      }
+      const dirHelp = generated
+        ? "该目录会随拓扑、子网和 load/dump 选项自动变化。"
+        : "external 拓扑需要解析 topology.file 才能完整生成目录；这里保留手动输入。";
+      return [
+        sectionShell("MAC 表", "load 会跳过长时间泛洪；dump 会在泛洪后写出学习表。", [
+          field({ path: "mactable.load_enable", label: "加载已有 MAC 表", type: "bool", toggleText: "加载", rerender: true }),
+          field({ path: "mactable.dump_enable", label: "泛洪后导出 MAC 表", type: "bool", toggleText: "导出", rerender: true }),
+          field({ path: "mactable.dir", label: "MAC 表目录", type: "text", wide: true, readOnly: Boolean(generated), help: dirHelp })
+        ])
+      ];
+    }
+
+    function renderLogging() {
+      const components = pathGet("logging.ns3_components", {});
+      const componentFields = Object.keys(components).sort().map((key) =>
+        field({ path: `logging.ns3_components.${key}`, label: key, type: "bool", toggleText: "开启" })
+      );
+      return [
+        sectionShell("日志", "大规模运行时建议关闭详细组件日志，只保留必要摘要。", [
+          field({ path: "logging.dir", label: "日志目录", type: "text" }),
+          field({ path: "logging.simulation_log", label: "仿真日志文件", type: "text" }),
+          field({ path: "logging.nccl_log", label: "NCCL 日志文件", type: "text" }),
+          field({ path: "logging.bridge_diag", label: "Bridge 诊断开关", type: "bool", toggleText: "开启" }),
+          field({ path: "logging.log_levels.roce", label: "RoCE 日志等级", type: "select", options: logLevelOptions }),
+          field({ path: "logging.log_levels.pfc", label: "PFC 日志等级", type: "select", options: logLevelOptions })
+        ]),
+        sectionShell("ns-3 组件日志", "这些开关会影响日志量；大规模仿真慎开。", componentFields)
+      ];
+    }
+
+    function renderJson() {
+      const section = makeEl("section", "section");
+      const header = makeEl("div", "section-header");
+      header.appendChild(makeEl("h3", "", "专家 JSON"));
+      header.appendChild(makeEl("p", "", "这里是完整配置，包含页面隐藏的兼容字段。修改后点“应用 JSON 到表单”。"));
+      section.appendChild(header);
+
+      const body = makeEl("div", "fields");
+      const wrap = makeEl("div", "field wide");
+      const label = document.createElement("label");
+      label.textContent = "完整 config.json";
+      const textarea = document.createElement("textarea");
+      textarea.id = "rawJson";
+      textarea.value = JSON.stringify(state.config, null, 2);
+      wrap.appendChild(label);
+      wrap.appendChild(textarea);
+      wrap.appendChild(makeEl("small", "", "保存按钮会保存这里应用后的配置。JSON 语法错误不会写入。"));
+      body.appendChild(wrap);
+
+      const buttons = makeEl("div", "field wide");
+      const applyBtn = makeEl("button", "btn", "应用 JSON 到表单");
+      applyBtn.type = "button";
+      applyBtn.addEventListener("click", () => {
+        try {
+          const parsed = JSON.parse(textarea.value);
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+            throw new Error("根节点必须是对象");
+          }
+          state.config = parsed;
+          setStatus("JSON 已应用到表单，尚未保存到文件。", "ok");
+          render();
+        } catch (err) {
+          setStatus(`JSON 解析失败：${err.message}`, "error");
+        }
+      });
+      buttons.appendChild(applyBtn);
+      body.appendChild(buttons);
+      section.appendChild(body);
+      return [section];
+    }
+
+    function renderActiveSection() {
+      if (state.active === "basic") return renderBasic();
+      if (state.active === "topology") return renderTopology();
+      if (state.active === "network") return renderNetwork();
+      if (state.active === "pfc") return renderPfc();
+      if (state.active === "roce") return renderRoce();
+      if (state.active === "mactable") return renderMactable();
+      if (state.active === "logging") return renderLogging();
+      return renderJson();
+    }
+
+    function computeDerived() {
+      const model = currentTopology();
+      const k = asInt(pathGet("topology.k", 1), 1);
+      const subnet = currentSubnet();
+      const subnetK = asInt(pathGet("topology.subnet_k", 1), 1);
+      const hostperleaf = asInt(pathGet("topology.hostperleaf", 1), 1);
+
+      let gpusPerServer = 1;
+      let nvswitchPerServer = 1;
+      if (subnet === 1) {
+        gpusPerServer = subnetK;
+        nvswitchPerServer = asInt(pathGet("nvswitch_per_server", 1), 1);
+      } else if (subnet === 2) {
+        gpusPerServer = subnetK;
+      } else if (subnet === 3) {
+        gpusPerServer = subnetK * subnetK;
+      }
+      if (model === "external") {
+        gpusPerServer = 1;
+        nvswitchPerServer = 1;
+      }
+
+      let hosts = null;
+      let switches = null;
+      let notes = [];
+      if (model === "fattree") {
+        hosts = Math.floor(k * k * k / 4);
+        switches = Math.floor((5 * k * k) / 4);
+        if (k % 2 !== 0) notes.push("FatTree 通常要求 k 为偶数。");
+      } else if (model === "clos") {
+        hosts = k * hostperleaf;
+        switches = k + Math.floor(k / 2);
+      } else if (model === "fullmesh") {
+        hosts = k;
+        switches = k;
+      } else if (model === "torus") {
+        hosts = k * k;
+        switches = k * k;
+      } else if (model === "test") {
+        hosts = k;
+        switches = 1;
+      } else if (model === "hpn") {
+        hosts = k * hostperleaf;
+        switches = 4 * k;
+      } else {
+        notes.push("external 拓扑规模由 topology.file 决定，页面不解析拓扑文件。");
+      }
+
+      const gpus = hosts === null ? null : hosts * gpusPerServer;
+      const nvswitches = hosts === null ? null : hosts * nvswitchPerServer;
+
+      let memoryEstimate = null;
+      let memoryEstimateNote = "";
+      if (model === "fattree" && subnet === 2 && hosts !== null && gpus !== null && switches !== null) {
+        const fullmeshLinks = hosts * subnetK * (subnetK - 1) / 2;
+        const totalLinks = 2 * hosts + gpus + fullmeshLinks;
+        if (k >= 16) {
+          memoryEstimate = 1.10957348e-4 * totalLinks + 1.76924421e-6 * switches * gpus - 2.95553987;
+          memoryEstimateNote = "k>=16 时使用三组大规模数据校准模型。";
+        } else {
+          memoryEstimate = 8.41487307e-5 * totalLinks + 1.83309287e-6 * switches * gpus;
+          memoryEstimateNote = "k<16 时使用无截距量级模型，避免小规模被负截距压成 0GB。";
+        }
+      }
+
+      return { model, k, subnet, subnetK, hostperleaf, gpusPerServer, nvswitchPerServer, hosts, switches, gpus, nvswitches, memoryEstimate, memoryEstimateNote, notes };
+    }
+
+    function formatNumber(value) {
+      if (value === null || value === undefined || Number.isNaN(value)) return "未计算";
+      return new Intl.NumberFormat("zh-CN").format(Math.round(value));
+    }
+
+    function refreshDerived() {
+      if (!state.config) return;
+      const d = computeDerived();
+      summaryEl.innerHTML = "";
+
+      const block = makeEl("div", "summary-block");
+      block.appendChild(makeEl("h3", "", "派生规模"));
+      const metrics = [
+        ["拓扑", d.model],
+        ["host/server 位置", formatNumber(d.hosts)],
+        ["GPU", formatNumber(d.gpus)],
+        ["交换机", formatNumber(d.switches)]
+      ];
+      for (const [name, value] of metrics) {
+        const row = makeEl("div", "metric");
+        row.appendChild(makeEl("span", "", name));
+        row.appendChild(makeEl("span", "", String(value)));
+        block.appendChild(row);
+      }
+      summaryEl.appendChild(block);
+
+      const mem = makeEl("div", "summary-block");
+      mem.appendChild(makeEl("h3", "", "静态内存估计"));
+      if (d.memoryEstimate === null) {
+        mem.appendChild(makeEl("p", "notice", "当前只有 FatTree + GPU FullMesh 子网有校准模型。"));
+      } else {
+        const value = d.memoryEstimate;
+        const row = makeEl("div", "metric");
+        row.appendChild(makeEl("span", "", "泛洪后静态 RSS"));
+        row.appendChild(makeEl("span", "", `${Math.max(0.1, value).toFixed(1)} GB`));
+        mem.appendChild(row);
+        mem.appendChild(makeEl("p", "notice", d.memoryEstimateNote || "这是经验估计，用于配置前预判量级。"));
+      }
+      summaryEl.appendChild(mem);
+
+      const command = makeEl("div", "summary-block");
+      command.appendChild(makeEl("h3", "", "运行提示"));
+      const relPath = state.configPath || "simconfig/config.json";
+      command.appendChild(makeEl("p", "notice", `配置文件：${relPath}`));
+      summaryEl.appendChild(command);
+
+      renderWarnings(d);
+    }
+
+    function renderWarnings(derived) {
+      warningsEl.innerHTML = "";
+      const warnings = [];
+      const model = derived.model;
+      const cfg = state.config;
+      if (model === "fattree" && cfg.topology && "hostperleaf" in cfg.topology) {
+        warnings.push("当前是 FatTree，topology.hostperleaf 不生效，页面已隐藏但 JSON 中会保留。");
+      }
+      if (model !== "external" && cfg.topology && "file" in cfg.topology) {
+        warnings.push("当前不是 external，topology.file 不生效，页面已隐藏但 JSON 中会保留。");
+      }
+      if (model === "external" && !String(pathGet("topology.file", "")).trim()) {
+        warnings.push("external 拓扑需要填写 topology.file。");
+      }
+      if (pathGet("mactable.load_enable", false) && pathGet("mactable.dump_enable", false)) {
+        warnings.push("MAC 表 load 和 dump 同时开启时要确认这是你想要的行为。");
+      }
+      const low = asFloat(pathGet("pfc.low_watermark", 0.2), 0.2);
+      const high = asFloat(pathGet("pfc.high_watermark", 0.8), 0.8);
+      if (!(0 <= low && low < high && high <= 1)) {
+        warnings.push("PFC 水位非法，应满足 0 <= low < high <= 1。");
+      }
+      warnings.push(...derived.notes);
+
+      if (warnings.length === 0) {
+        warningsEl.appendChild(makeEl("div", "notice", "当前表单没有发现明显配置问题。"));
+        return;
+      }
+      for (const warning of warnings) {
+        warningsEl.appendChild(makeEl("div", "notice warn", warning));
+      }
+    }
+
+    function refreshRawFromConfig() {
+      const textarea = document.getElementById("rawJson");
+      if (textarea && document.activeElement !== textarea) {
+        textarea.value = JSON.stringify(state.config, null, 2);
+      }
+    }
+
+    function render() {
+      renderNav();
+      const section = sections.find((item) => item.id === state.active) || sections[0];
+      titleEl.textContent = section.title;
+      contentEl.innerHTML = "";
+      for (const node of renderActiveSection()) {
+        contentEl.appendChild(node);
+      }
+      refreshDerived();
+    }
+
+    async function loadConfig() {
+      setStatus("正在读取配置...");
+      const resp = await fetch("/api/config");
+      const payload = await resp.json();
+      if (!payload.ok) {
+        throw new Error((payload.errors || ["读取失败"]).join("；"));
+      }
+      state.config = clone(payload.config);
+      normalizeConfigForUi();
+      state.configPath = payload.config_path;
+      document.getElementById("configPath").textContent = payload.config_path;
+      setStatus("配置已读取。", "ok");
+      render();
+    }
+
+    function normalizeConfigForUi() {
+      if (!state.config.topology) state.config.topology = {};
+      const rawModel = state.config.topology.model;
+      if (typeof rawModel === "number") {
+        state.config.topology.model = ["fattree", "clos", "fullmesh", "torus", "test", "hpn", "external"][rawModel] || "fattree";
+      }
+      if (state.config.topology.model === "file") {
+        state.config.topology.model = "external";
+      }
+      if (state.config.roce && typeof state.config.roce.ack_timeout_mode === "boolean") {
+        state.config.roce.ack_timeout_mode = state.config.roce.ack_timeout_mode ? "auto" : "fixed";
+      }
+      const levels = state.config.logging && state.config.logging.log_levels;
+      if (levels) {
+        for (const key of ["roce", "pfc"]) {
+          if (typeof levels[key] === "number") {
+            levels[key] = levels[key] <= 0 ? "off" : levels[key] === 1 ? "basic" : "all";
+          }
+        }
+      }
+      autoUpdateMactableDir("topology.model");
+    }
+
+    async function saveConfig() {
+      setStatus("正在保存...");
+      const resp = await fetch("/api/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ config: state.config })
+      });
+      const payload = await resp.json();
+      if (!payload.ok) {
+        setStatus((payload.errors || ["保存失败"]).join("；"), "error");
+        return;
+      }
+      setStatus(`${payload.message}；备份：${payload.backup}`, "ok");
+    }
+
+    document.getElementById("reloadBtn").addEventListener("click", () => {
+      loadConfig().catch((err) => setStatus(err.message, "error"));
+    });
+
+    document.getElementById("saveBtn").addEventListener("click", () => {
+      saveConfig().catch((err) => setStatus(err.message, "error"));
+    });
+
+    document.getElementById("formatBtn").addEventListener("click", () => {
+      refreshRawFromConfig();
+      if (state.active !== "json") {
+        state.active = "json";
+        render();
+      }
+      setStatus("已切换到格式化 JSON。", "ok");
+    });
+
+    loadConfig().catch((err) => setStatus(err.message, "error"));
+  </script>
+</body>
+</html>
