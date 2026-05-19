@@ -1,6 +1,6 @@
 # RoCE 传输可靠性说明
 
-最近修改：2026-04-23
+最近修改：2026-05-19
 
 记录时间：2026-04-10
 
@@ -63,7 +63,7 @@
 
 这意味着当前 offered load 不再只是由上层 workload 一口气灌入决定，而是会被 transport window、recovery、PFC/pause 和端口准入共同限制。
 
-需要和 [topology-endpoint-bridge-model.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/topology-endpoint-bridge-model.md) 一起看的一点是：
+需要和 [拓扑端点网桥模型.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/拓扑端点网桥模型.md) 一起看的一点是：
 
 - `FlowIo` 仍然保留本地 software buffer/pause 映射
 - 但它不是 RoCE 主窗口、主 ACK、主重传状态源头
@@ -166,7 +166,7 @@ QP 空闲后，`MaybeReleaseIdleTxQp_(...)` 会检查：
 
 对应记录见：
 
-- [memory-leak-investigation.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/memory-leak-investigation.md)
+- [内存增长问题调查.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/内存增长问题调查.md)
 
 ## 10. 外部和本地参考边界
 

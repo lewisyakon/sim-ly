@@ -1,6 +1,6 @@
 # RoCE 配置与日志说明
 
-最近修改：2026-04-23
+最近修改：2026-05-19
 
 ## 1. JSON 中 `roce` 配置项说明
 
@@ -10,11 +10,11 @@
 
 - 这份文档讲的是当前代码已经支持的配置和日志。
 - 如果你想看当前 `SEND/WRITE`、`SQ/RQ/CQ`、RoCE 可见头、ACK/重传、有限乱序窗口落在哪里，请看：
-  - [roce-current-status.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-current-status.md)
-  - [roce-workflow.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-workflow.md)
-  - [roce-transport-reliability.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-transport-reliability.md)
+  - [RoCE当前状态.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/RoCE当前状态.md)
+  - [RoCE工作流.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/RoCE工作流.md)
+  - [RoCE传输可靠性.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/RoCE传输可靠性.md)
 - 如果你想看当前 GPU 端点的 inner/external bridge、`TerminalLearningOnly`、FlowIo/PFC 边界，请看：
-  - [topology-endpoint-bridge-model.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/topology-endpoint-bridge-model.md)
+  - [拓扑端点网桥模型.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/拓扑端点网桥模型.md)
 
 - `enable`（bool）
   - 含义：是否启用 RoCE 旁路逻辑。
@@ -67,7 +67,7 @@
 - `ack_timeout_factor`（double）
   - 含义：自动 timeout 模式下，乘在理论 RTT 基线上的放大系数。
   - 影响：最终 `ack_timeout_ns = ceil(ackTimeoutBaseNs * ack_timeout_factor)`。
-  - 当前经验：小规模配置里 `2.0` 通常可用；较大规模网络最近一次稳定实验使用的是 `8.0`。这说明当前自动公式更像理论下界，实际大规模运行通常还需要额外安全系数。
+  - 当前经验：这个值强依赖拓扑和 workload。近期 128 AllToAll 排查为了避免 ACK timeout 干扰队列分析，使用过很大的安全系数；不要把旧文档里的单个经验值当作通用推荐。
 
 - `ack_timeout_ns`（uint64）
   - 含义：手工指定的 ACK timeout，单位 ns。
@@ -96,6 +96,35 @@
 - `workload.auto_stop_on_finish`
   - 状态：当前代码未启用。
   - 原因：之前试过该机制，但已经回滚，保留在 JSON 里不会生效。
+
+## 2A. PPP 队列与 PFC 相关配置
+
+这些字段在 JSON 里位于 `"pfc"`，但会直接影响 RoCE 端口发送队列和 PFC 行为。
+
+- `drop_tail_queue_num`
+  - 含义：`PppRoundRobinQueue` 内部子队列数量。
+  - 当前实际影响：
+    - 物理发送队列会按该数量创建 RR 子队列。
+    - `RdmaPortEngine` 的 qid/pause/admission 也按这个数量组织。
+    - bridge ingress aggregate queue 容量会用 `NumQueues * MaxPacketsPerQueue` 计算。
+  - 当前默认分类：DATA 包按 PPP 目的 MAC hash 后 `% NumQueues`。
+  - 风险：如果目的 MAC 地址规律和队列数取模形成别名碰撞，多个 flow 会落到同一个 qid，RR 退化成该子队列内 FIFO。
+  - 最近 128 AllToAll 观察：
+    - `NumQueues=16` 时出现严重结构性碰撞，尾部约 `18.491us`。
+    - `NumQueues=13` 时碰撞被打散，尾部约 `12.108us`。
+  - 结论：改成 13 是有效实验 workaround，但长期应考虑 flow-aware qid classifier，而不是依赖特定队列数。
+
+- `drop_tail_queue_size`
+  - 含义：每个 PPP 子队列的容量。
+  - 当前 bridge ingress aggregate queue 的容量会按该值乘以 `drop_tail_queue_num` 派生。
+
+- `high_watermark` / `low_watermark`
+  - 含义：PFC pause/resume 水位。
+  - 在 bridge ingress 上按 aggregate occupancy 判断；在物理口上按对应 qid/subqueue 状态判断。
+
+- `not_head_retry_ns`
+  - 状态：兼容旧配置保留。
+  - 当前 bridge ingress 已经是 token-based drain/retry，不再使用旧的 not-head retry 队首模型。
 
 ## 3. 日志输出含义
 
@@ -137,23 +166,6 @@ all passes finished at time: ...
   - 3P 事务层口径
 - `[main] network drained`
   - 网络活动口径
-
-### 3.0A 当前不再打印的临时内存观测
-
-为了确认大规模内存增长问题，历史上曾经临时加过若干内存观测日志。当前默认输出里不再包含这些探针：
-
-```text
-[main] SendPacketEventHandlerData ...
-[MEM][PROBE] ...
-[ASTRA][MEM] ...
-```
-
-因此，如果后面分析 `simulation.log`，不要把这些历史调试日志当作当前标准输出的一部分。
-
-已知历史结论分两类：
-
-1. 早期曾确认 `PacketSentFinshed` 路径上的 `SendPacketEventHandlerData` 未释放，并已在 [Sys.cc](/home/lja/sim-ly/sim-ly/src/applications/astra-sim/system/Sys.cc) 修复。
-2. 本轮确认主要内存峰值来自 AstraSim 收尾阶段的 `dimension_utilization` CSV 统计路径，而不是 RoCE packet runtime 本身。详见 [memory-leak-investigation.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/memory-leak-investigation.md)。
 
 ### 3.1 配置与激活日志
 
@@ -372,20 +384,18 @@ TriggerSendTo_now declared now time = 500000000123456789 src=0 dst=1 tag=5 size=
 - 为什么收尾阶段看起来“网络还在动但事务是否已经闭环”
 - 某个 flow 是否停在“数据已发出但还没收到 ACT”的阶段
 
-### 3.4 中间处理过程日志（本轮已移除）
+### 3.4 PPP / PFC / 端口队列排查口径
 
-下面这批“过程观测类”日志在当前分支已删除，不应再出现在新日志中：
+当前默认不保留临时逐包 instrumentation。若需要证明某个 flow 实际落到哪个 PPP qid，应临时加窄范围日志，跑完后删除。
 
-- `[ROCE][REQ][RX]`
-- `[ROCE][REQ][WAIT_RECV_CALLBACK]`
-- `[ROCE][REQ][CALLBACK_BEGIN]`
-- `[ROCE][REQ][CALLBACK_END]`
-- `[ROCE][REQ][CALLBACK_LATE_REG_BEGIN]`
-- `[ROCE][REQ][CALLBACK_LATE_REG_END]`
-- `[ROCE][DATA][ISSUE_AFTER_REQ]`
-- `[ROCE][TXPORT]`
-- `[ROCE][SQ][POST]`
-- `[ROCE][RX][DUPLICATE_DATA_IGNORED]`
+不加临时日志时，可以先用这些现象判断是否存在队列分类问题：
+
+1. `TriggerSendTo_now` 的 DATA 触发范围是否基本不变。
+2. `FLOW_RX_DONE/FLOW_TX_DONE` 的全局 spread 是否随 `drop_tail_queue_num` 大幅变化。
+3. 日志中是否没有 `DROP/PFC/RETRANS/TIMEOUT/NO_PATH/SQ_FULL/RQ_FULL`。
+4. 如果 1-3 同时成立，优先怀疑 PPP qid 分类和子队列 FIFO 退化，而不是上层触发顺序或重传。
+
+近期 128 AllToAll 就属于这个模式：DATA 触发不变，但 16 队列到 13 队列后尾部显著下降。
 
 ### 3.5 异常 / 告警日志（当前实现）
 
@@ -451,7 +461,7 @@ TriggerSendTo_now declared now time = 500000000123456789 src=0 dst=1 tag=5 size=
 
 排查时建议按下面顺序看：
 
-1. `simulation.log` 里是否出现 `TriggerSendTo_now`。
+1. 当前配置指向的 `simlog/*.log` 里是否出现 `TriggerSendTo_now`。
 2. 是否出现 `[ROCE][ACTIVE]`。
 3. `[main] total send count` 是否大于 `0`。
 4. 是否出现 `[FLOW][REQ_DONE] / [FLOW][RX_DONE] / [FLOW][TX_DONE]` 完整闭环。

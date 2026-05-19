@@ -1,6 +1,6 @@
 # RoCE 类结构与调用关系说明
 
-最近修改：2026-04-23
+最近修改：2026-05-19
 
 这份文档回答 5 个问题：
 
@@ -423,6 +423,27 @@ bridge 不维护 QP，不维护 ACK，不维护重传。`TerminalLearningOnly` �
 4. qid 优先级、ACK 优先级和 per-qid pause-aware admission 由物理 egress queue / `RdmaPortEngine` 承担。
 
 旧的 `NotHeadRetryDelay` 和 `BridgeDiagEnable` 属性仍保留为配置兼容项，但当前不再影响 bridge ingress 调度，也不输出旧 residence 诊断。
+
+### 3.15 `PppRoundRobinQueue`
+
+`PppRoundRobinQueue` 是物理 `PointToPointNetDevice` 的发送队列，不是 bridge ingress 队列。
+
+当前职责：
+
+1. 为普通 DATA 包提供多个内部子队列。
+2. 高优先级处理非业务控制帧，以及 `REQUEST/ACT/IDLE` 这类 3P 控制包。
+3. 对 DATA 包计算 qid 并入对应子队列。
+4. `Dequeue()` 时跨非空、非暂停子队列 round-robin。
+5. 接收 PFC pause/resume 时暂停或恢复指定子队列。
+
+当前分类口径：
+
+1. 默认 `work_model=1`。
+2. DATA 包按 PPP 目的 MAC hash。
+3. `qid = hash(dst_mac) % NumQueues`。
+4. `RdmaPortEngine::ClassifyQueueId_()` 当前也按相同目的 MAC 逻辑得到 qid。
+
+这个机制能轮询，但不是 flow-aware。最近 128 AllToAll 里，`NumQueues=16` 与规律 MAC 地址形成结构性碰撞，使单源多个目的 flow 落入同一 qid，RR 退化为该子队列内 FIFO；`NumQueues=13` 打破碰撞后尾部明显下降。后续若改分类逻辑，必须同步更新 `RdmaPortEngine` 和 PPP 队列，避免 admission/pause qid 与实际入队 qid 不一致。
 
 ## 4. 当前类之间怎样耦合
 

@@ -1,6 +1,6 @@
-# RoCE Scheduler Stage 1 归档
+# RoCE 调度第一阶段归档
 
-最近修改：2026-04-23
+最近修改：2026-05-19
 
 记录时间：2026-04-10
 
@@ -8,9 +8,9 @@
 
 当前调度和发包路径请优先看：
 
-- [roce-workflow.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-workflow.md)
-- [roce-qp-and-transport.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-qp-and-transport.md)
-- [roce-current-status.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-current-status.md)
+- [RoCE工作流.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/RoCE工作流.md)
+- [队列对与传输职责.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/队列对与传输职责.md)
+- [RoCE当前状态.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/RoCE当前状态.md)
 
 ## 1. 旧 Stage 1 当时解决了什么
 
@@ -87,4 +87,4 @@ sendflowclient
 
 这两个候选方案记录在：
 
-- [roce-future-scheduling-options.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-future-scheduling-options.md)
+- [RoCE后续调度方案.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/RoCE后续调度方案.md)

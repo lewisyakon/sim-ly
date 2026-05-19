@@ -500,7 +500,7 @@ PppRoundRobinQueue<Item>::Dequeue()
           m_rrIndex = (currentIdx + 1) % m_numQueues;
           // this->Dequeued(p);
           // this->Queue<Item>::Dequeued(p);
-          
+
           NS_LOG_LOGIC("Popped " << p << " from sub-queue " << currentIdx);
           return p;
         }

@@ -1,6 +1,6 @@
-# RoCE Phase 2 设计归档
+# RoCE 第二阶段设计归档
 
-最近修改：2026-04-23
+最近修改：2026-05-19
 
 记录时间：2026-04-10
 
@@ -8,9 +8,9 @@
 
 当前实现状态请优先看：
 
-- [roce-current-status.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-current-status.md)
-- [roce-workflow.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-workflow.md)
-- [roce-qp-and-transport.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/roce-qp-and-transport.md)
+- [RoCE当前状态.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/RoCE当前状态.md)
+- [RoCE工作流.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/RoCE工作流.md)
+- [队列对与传输职责.md](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/doc/队列对与传输职责.md)
 
 ## 1. 旧 Phase 2 的原始目标
 

@@ -1,6 +1,6 @@
 # RoCE 现实匹配性审查与差距分级
 
-最近修改：2026-04-23
+最近修改：2026-05-19
 
 本文件用于记录一次冻结在 `2026-04-09` 的判断。
 
@@ -227,6 +227,23 @@
 对大消息主导的 AI 训练 workload，这个偏离通常不是第一主矛盾。
 但对小消息密集或控制包占比高的 workload，这会影响流量组成。
 
+### 4.6 PPP 子队列分类仍是目的 MAC hash
+
+当前物理发送队列 `PppRoundRobinQueue` 的 DATA 分类默认只看 PPP 目的 MAC：
+
+- [PppRoundRobinQueue.h](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/model/PppRoundRobinQueue.h)
+- [rdma-port-engine.cc](/home/lja/sim-ly/sim-ly/src/min-hop-mac-learning/model/rdma-port-engine.cc)
+
+这和现实 NIC/交换机里的 flow hashing、QoS queue、traffic class、RoCEv2 五元组哈希并不等价。
+
+近期 128 AllToAll 已经证明它会影响网络行为：
+
+1. `NumQueues=16` 时，目的 MAC 规律与取模形成碰撞，多个目的 flow 落入同一子队列。
+2. PPP RR 因为只看到一个非空 qid，退化为该 qid 内 FIFO。
+3. `NumQueues=13` 打破碰撞后，尾部从约 `18.491us` 降到约 `12.108us`。
+
+因此，当前“按流公平”不能只看上层 RoCE QP scheduler，也必须看 PPP qid 分类是否把 flow 正确分散。这个偏离会直接影响 AllToAll、incast 和多目的 burst 场景的尾延迟。
+
 ## 5. 差距分级
 
 这里的分级不是“功能有没有实现”，而是“对万卡 / 十万卡网络行为拟真的重要性”。
@@ -312,6 +329,16 @@
 2. 多出端口绑定
 3. control/data/retransmission 的更细粒度竞争
 
+### B5. 把 PPP qid 分类改成 flow-aware 口径
+
+当前 `PppRoundRobinQueue` 能做 qid 轮询，但 DATA 入队只按目的 MAC hash。近期 AllToAll 已经证明这会在特定队列数和规律 MAC 下制造严重尾部。
+
+如果后续目标是稳定研究大规模 collectives 的负载均衡，建议至少做到：
+
+1. DATA qid 分类包含 `ThreePHeader(src,dst,tag)` 或等价 flow key。
+2. `RdmaPortEngine` 与 PPP 队列使用同一套 qid 逻辑。
+3. PFC pause/admission 的 qid 与实际入队 qid 保持一致。
+
 ## 5.3 C 级：可以暂缓
 
 这些点对“网络行为相似”重要性较低，可以在当前阶段先不优先投入。
@@ -342,6 +369,7 @@
 
 - 当前已经覆盖了“无损 / 高回压网络中的 RC-like 数据面主骨架”
 - 但尚未覆盖“现实大规模部署中的 `RoCEv2 + ECN/CNP/DCQCN` 关键拥塞反馈闭环”
+- 当前 PPP 子队列分类仍可能因为目的 MAC hash 碰撞扭曲多流公平性；AllToAll/多目的 burst 结果需要显式检查该因素
 
 ## 7. 外部信源
 

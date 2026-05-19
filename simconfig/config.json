@@ -46,7 +46,7 @@
 
   "pfc": {
     "drop_tail_queue_size": "5000000",
-    "drop_tail_queue_num": "16",
+    "drop_tail_queue_num": "13",
     "high_watermark": 0.8,
     "low_watermark": 0.2,
     "not_head_retry_ns": 1
