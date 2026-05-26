@@ -41,12 +41,13 @@
   "mactable": {
     "load_enable": true,
     "dump_enable": false,
+    "computed_enable": false,
     "dir": "mactable/topo-fattree_k-8_subnet-0_subnetk-1_gpusper-1_nvsper-1-python"
   },
 
   "pfc": {
     "drop_tail_queue_size": "5000000",
-    "drop_tail_queue_num": "13",
+    "drop_tail_queue_num": "17",
     "high_watermark": 0.8,
     "low_watermark": 0.2,
     "not_head_retry_ns": 1

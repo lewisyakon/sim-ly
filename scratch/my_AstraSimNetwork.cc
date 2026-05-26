@@ -784,6 +784,10 @@ int main(int argc, char *argv[]) {
   std::cout << "simulator run " << std::endl;
   Simulator::Stop(Seconds(2000000000));
   Simulator::Run(); 
+  if (mactable_computed_enable)
+  {
+    MinHopBridgeNetDevice::PrintComputedMacTableDebugSummary(true);
+  }
 
   uint64_t eventCount = Simulator::GetEventCount();
   const uint64_t lastNetworkActivityTimeFs = GetLastNetworkActivityTimeFs();

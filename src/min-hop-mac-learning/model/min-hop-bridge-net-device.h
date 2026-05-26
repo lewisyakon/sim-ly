@@ -2,6 +2,7 @@
 #define MIN_HOP_BRIDGE_NET_DEVICE_H
 
 #include <map>
+#include <memory>
 #include <set>
 #include <vector>
 #include <fstream>
@@ -77,6 +78,7 @@ class MinHopBridgeNetDevice : public NetDevice
     void PrintLearnedState() const;
     void Print_LocalMacAddress() const;
     static void PrintFloodWindowSummary(bool printToStdout = false);
+    static void PrintComputedMacTableDebugSummary(bool printToStdout = false);
     
     void AddEntry(Mac48Address mac, const std::vector<uint32_t>& ports);
     void set_ecmp_model(int model);
@@ -87,10 +89,24 @@ class MinHopBridgeNetDevice : public NetDevice
         Aggregation = 2,
         Edge = 3
     };
+    enum class ComputedMacTableKind : uint8_t
+    {
+        Disabled = 0,
+        FatTreeCore = 1,
+        FatTreeAggregation = 2,
+        FatTreeEdge = 3,
+        FatTreeGpuInner = 4
+    };
     void SetFatTreeEcmpContext(uint32_t k,
                                uint32_t gpusPerServer,
                                EcmpTopologyLayer layer,
                                uint32_t layerIndex);
+    void SetComputedFatTreeMacTableContext(uint32_t k,
+                                           uint32_t gpusPerServer,
+                                           ComputedMacTableKind kind,
+                                           uint32_t index);
+    void SetComputedMacToGpuIndexTable(
+        std::shared_ptr<const std::map<Mac48Address, uint32_t>> table);
 
     void set_maxjump(int jump);
     
@@ -206,6 +222,8 @@ class MinHopBridgeNetDevice : public NetDevice
 
     bool Learn(Mac48Address source, Ptr<NetDevice> port, uint8_t hopCount);
     std::vector<Ptr<NetDevice>> GetLearnedState(Mac48Address source);
+    std::vector<Ptr<NetDevice>> GetLearnedStateForForwarding(Mac48Address source);
+    std::vector<Ptr<NetDevice>> GetComputedFatTreeLearnedState(Mac48Address dst) const;
     Ptr<NetDevice> ecmp(std::vector<Ptr<NetDevice> > outports,
                         Mac48Address src,
                         Mac48Address dst,
@@ -300,6 +318,12 @@ class MinHopBridgeNetDevice : public NetDevice
     uint32_t m_fatTreeGpusPerServer = 1;
     EcmpTopologyLayer m_ecmpTopologyLayer = EcmpTopologyLayer::Unknown;
     uint32_t m_fatTreeLayerIndex = 0;
+    bool m_computedMacTableEnabled = false;
+    uint32_t m_computedFatTreeK = 0;
+    uint32_t m_computedGpusPerServer = 1;
+    ComputedMacTableKind m_computedMacTableKind = ComputedMacTableKind::Disabled;
+    uint32_t m_computedBridgeIndex = 0;
+    std::shared_ptr<const std::map<Mac48Address, uint32_t>> m_computedMacToGpuIndex;
 
     int maxjump=4;
 

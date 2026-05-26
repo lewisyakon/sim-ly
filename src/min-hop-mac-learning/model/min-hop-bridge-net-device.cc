@@ -46,6 +46,20 @@ struct FloodWindowSummary
 FloodWindowSummary g_floodWindowSummary;
 std::mutex g_floodWindowSummaryMutex;
 
+struct ComputedMacTableDebugCounters
+{
+    uint64_t computedRuleForwardHits = 0;
+    uint64_t learnedTableForwardHits = 0;
+    uint64_t unknownUnicastFloodFallbacks = 0;
+    uint64_t explicitBroadcastFloods = 0;
+    uint64_t threePhaseUnsafeFloodDrops = 0;
+    uint64_t computedRuleLookupHits = 0;
+    uint64_t computedRuleLookupMisses = 0;
+};
+
+ComputedMacTableDebugCounters g_computedMacTableDebugCounters;
+std::mutex g_computedMacTableDebugMutex;
+
 void
 RecordFloodWindowTouch()
 {
@@ -102,6 +116,87 @@ TryPrintFloodWindowSummaryOnce(bool printToStdout)
     }
 }
 
+void
+PrintComputedMacTableDebugSummaryImpl(bool printToStdout)
+{
+    ComputedMacTableDebugCounters snapshot;
+    {
+        std::lock_guard<std::mutex> guard(g_computedMacTableDebugMutex);
+        snapshot = g_computedMacTableDebugCounters;
+    }
+
+    std::ostringstream oss;
+    oss << "[MACTABLE][COMPUTED][DEBUG]"
+        << " computed_rule_forward_hits=" << snapshot.computedRuleForwardHits
+        << " learned_table_forward_hits=" << snapshot.learnedTableForwardHits
+        << " unknown_unicast_flood_fallbacks=" << snapshot.unknownUnicastFloodFallbacks
+        << " explicit_broadcast_floods=" << snapshot.explicitBroadcastFloods
+        << " three_phase_unsafe_flood_drops=" << snapshot.threePhaseUnsafeFloodDrops
+        << " computed_rule_lookup_hits=" << snapshot.computedRuleLookupHits
+        << " computed_rule_lookup_misses=" << snapshot.computedRuleLookupMisses;
+    NS_LOG_UNCOND(oss.str());
+    if (printToStdout)
+    {
+        std::cout << oss.str() << std::endl;
+    }
+}
+
+void
+RecordComputedMacTableCounter(void (*increment)(ComputedMacTableDebugCounters&))
+{
+    std::lock_guard<std::mutex> guard(g_computedMacTableDebugMutex);
+    increment(g_computedMacTableDebugCounters);
+}
+
+void
+RecordComputedRuleForwardHit()
+{
+    RecordComputedMacTableCounter(
+        [](ComputedMacTableDebugCounters& counters) { ++counters.computedRuleForwardHits; });
+}
+
+void
+RecordLearnedTableForwardHit()
+{
+    RecordComputedMacTableCounter(
+        [](ComputedMacTableDebugCounters& counters) { ++counters.learnedTableForwardHits; });
+}
+
+void
+RecordUnknownUnicastFloodFallback()
+{
+    RecordComputedMacTableCounter(
+        [](ComputedMacTableDebugCounters& counters) { ++counters.unknownUnicastFloodFallbacks; });
+}
+
+void
+RecordExplicitBroadcastFlood()
+{
+    RecordComputedMacTableCounter(
+        [](ComputedMacTableDebugCounters& counters) { ++counters.explicitBroadcastFloods; });
+}
+
+void
+RecordThreePhaseUnsafeFloodDrop()
+{
+    RecordComputedMacTableCounter(
+        [](ComputedMacTableDebugCounters& counters) { ++counters.threePhaseUnsafeFloodDrops; });
+}
+
+void
+RecordComputedRuleLookupHit()
+{
+    RecordComputedMacTableCounter(
+        [](ComputedMacTableDebugCounters& counters) { ++counters.computedRuleLookupHits; });
+}
+
+void
+RecordComputedRuleLookupMiss()
+{
+    RecordComputedMacTableCounter(
+        [](ComputedMacTableDebugCounters& counters) { ++counters.computedRuleLookupMisses; });
+}
+
 uint32_t
 StableMix32(uint32_t value)
 {
@@ -118,6 +213,12 @@ void
 MinHopBridgeNetDevice::PrintFloodWindowSummary(bool printToStdout)
 {
     TryPrintFloodWindowSummaryOnce(printToStdout);
+}
+
+void
+MinHopBridgeNetDevice::PrintComputedMacTableDebugSummary(bool printToStdout)
+{
+    PrintComputedMacTableDebugSummaryImpl(printToStdout);
 }
 
 TypeId
@@ -1054,6 +1155,28 @@ MinHopBridgeNetDevice::SetFatTreeEcmpContext(uint32_t k,
     m_fatTreeLayerIndex = layerIndex;
 }
 
+void
+MinHopBridgeNetDevice::SetComputedFatTreeMacTableContext(uint32_t k,
+                                                         uint32_t gpusPerServer,
+                                                         ComputedMacTableKind kind,
+                                                         uint32_t index)
+{
+    m_computedMacTableEnabled =
+        (k >= 2 && (k % 2) == 0 && gpusPerServer > 0 &&
+         kind != ComputedMacTableKind::Disabled);
+    m_computedFatTreeK = k;
+    m_computedGpusPerServer = gpusPerServer;
+    m_computedMacTableKind = kind;
+    m_computedBridgeIndex = index;
+}
+
+void
+MinHopBridgeNetDevice::SetComputedMacToGpuIndexTable(
+    std::shared_ptr<const std::map<Mac48Address, uint32_t>> table)
+{
+    m_computedMacToGpuIndex = table;
+}
+
 void 
 MinHopBridgeNetDevice::AddEntry(Mac48Address mac, const std::vector<uint32_t>& ports){
     std::vector<LearnedState> mstate;
@@ -1522,7 +1645,7 @@ MinHopBridgeNetDevice::ForwardUnicast(Ptr<NetDevice> incomingPort,
     //              << ", protocol=" << protocol << ", src=" << src << ", dst=" << dst << ")");
 
     const bool localInjection = (incomingPort == nullptr);
-    std::vector<Ptr<NetDevice> > outPort = GetLearnedState(dst);
+    std::vector<Ptr<NetDevice> > outPort = GetLearnedStateForForwarding(dst);
     // for(auto p:outPort)
     // {
     //     in_to_out[p].insert(src);
@@ -1594,6 +1717,7 @@ MinHopBridgeNetDevice::ForwardUnicast(Ptr<NetDevice> incomingPort,
     }
     else
     {
+        RecordUnknownUnicastFloodFallback();
         RecordFloodWindowTouch();
 
         Ptr<Packet> threePhaseProbe = packet->Copy();
@@ -1665,6 +1789,7 @@ MinHopBridgeNetDevice::ForwardUnicast(Ptr<NetDevice> incomingPort,
                                   << " TIME=" << Simulator::Now().GetFemtoSeconds());
                 }
                 ++sUnknownThreePhaseUnsafeDropLogCount;
+                RecordThreePhaseUnsafeFloodDrop();
                 ++m_forwardSendFailDrops;
                 return;
             }
@@ -1715,6 +1840,7 @@ MinHopBridgeNetDevice::ForwardBroadcast(Ptr<NetDevice> incomingPort,
 {
     NS_LOG_FUNCTION_NOARGS();
     const bool localInjection = (incomingPort == nullptr);
+    RecordExplicitBroadcastFlood();
     RecordFloodWindowTouch();
 
     Ptr<Packet> floodedPacket = packet->Copy();
@@ -1864,10 +1990,118 @@ MinHopBridgeNetDevice::Learn(Mac48Address source, Ptr<NetDevice> port, uint8_t h
 }
 
 std::vector<Ptr<NetDevice>>
+MinHopBridgeNetDevice::GetComputedFatTreeLearnedState(Mac48Address dst) const
+{
+    std::vector<Ptr<NetDevice>> resultPorts;
+    if (!m_computedMacTableEnabled || !m_computedMacToGpuIndex)
+    {
+        return resultPorts;
+    }
+
+    const auto gpuIt = m_computedMacToGpuIndex->find(dst);
+    if (gpuIt == m_computedMacToGpuIndex->end())
+    {
+        return resultPorts;
+    }
+
+    const uint32_t k = m_computedFatTreeK;
+    const uint32_t half = k / 2;
+    const uint32_t gpusPerServer = m_computedGpusPerServer;
+    if (half == 0 || gpusPerServer == 0)
+    {
+        return resultPorts;
+    }
+
+    const uint32_t gpu = gpuIt->second;
+    const uint32_t server = gpu / gpusPerServer;
+    const uint32_t localGpu = gpu % gpusPerServer;
+    const uint32_t serversPerPod = half * half;
+    if (serversPerPod == 0)
+    {
+        return resultPorts;
+    }
+    const uint32_t pod = server / serversPerPod;
+    const uint32_t serverInPod = server % serversPerPod;
+    const uint32_t edge = serverInPod / half;
+    const uint32_t hostCol = serverInPod % half;
+
+    auto addPort = [&](uint32_t portIndex) {
+        if (portIndex < m_ports.size() && m_ports[portIndex])
+        {
+            resultPorts.push_back(m_ports[portIndex]);
+        }
+    };
+    auto addRange = [&](uint32_t begin, uint32_t end) {
+        for (uint32_t portIndex = begin; portIndex < end; ++portIndex)
+        {
+            addPort(portIndex);
+        }
+    };
+
+    switch (m_computedMacTableKind)
+    {
+    case ComputedMacTableKind::FatTreeCore:
+        addPort(pod);
+        break;
+    case ComputedMacTableKind::FatTreeAggregation:
+    {
+        const uint32_t aggPod = m_computedBridgeIndex / half;
+        if (pod == aggPod)
+        {
+            addPort(half + edge);
+        }
+        else
+        {
+            addRange(0, half);
+        }
+        break;
+    }
+    case ComputedMacTableKind::FatTreeEdge:
+    {
+        const uint32_t edgePod = m_computedBridgeIndex / half;
+        const uint32_t edgeInPod = m_computedBridgeIndex % half;
+        if (pod == edgePod && edge == edgeInPod)
+        {
+            addPort(half + hostCol * gpusPerServer + localGpu);
+        }
+        else
+        {
+            addRange(0, half);
+        }
+        break;
+    }
+    case ComputedMacTableKind::FatTreeGpuInner:
+    {
+        const uint32_t ownerGpu = m_computedBridgeIndex;
+        const uint32_t ownerServer = ownerGpu / gpusPerServer;
+        const uint32_t ownerLocalGpu = ownerGpu % gpusPerServer;
+        if (server == ownerServer && gpu != ownerGpu)
+        {
+            const uint32_t portIndex =
+                (localGpu < ownerLocalGpu) ? localGpu : localGpu - 1;
+            addPort(portIndex);
+        }
+        break;
+    }
+    case ComputedMacTableKind::Disabled:
+    default:
+        break;
+    }
+
+    return resultPorts;
+}
+
+std::vector<Ptr<NetDevice>>
 MinHopBridgeNetDevice::GetLearnedState(Mac48Address source)
 {
     // NS_LOG_FUNCTION(this << source);
     std::vector<Ptr<NetDevice>> resultPorts;
+
+    std::vector<Ptr<NetDevice>> computedPorts = GetComputedFatTreeLearnedState(source);
+    if (!computedPorts.empty())
+    {
+        return computedPorts;
+    }
 
     if (!m_enableLearning)
     {
@@ -1924,6 +2158,30 @@ MinHopBridgeNetDevice::GetLearnedState(Mac48Address source)
         }
     }
     return resultPorts;
+}
+
+std::vector<Ptr<NetDevice>>
+MinHopBridgeNetDevice::GetLearnedStateForForwarding(Mac48Address source)
+{
+    std::vector<Ptr<NetDevice>> computedPorts = GetComputedFatTreeLearnedState(source);
+    if (!computedPorts.empty())
+    {
+        RecordComputedRuleForwardHit();
+        RecordComputedRuleLookupHit();
+        return computedPorts;
+    }
+
+    if (m_computedMacTableEnabled)
+    {
+        RecordComputedRuleLookupMiss();
+    }
+
+    std::vector<Ptr<NetDevice>> learnedPorts = GetLearnedState(source);
+    if (!learnedPorts.empty())
+    {
+        RecordLearnedTableForwardHit();
+    }
+    return learnedPorts;
 }
 
 std::vector<Ptr<NetDevice>>

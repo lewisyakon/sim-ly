@@ -436,8 +436,12 @@
       [0, "随机转发：每包随机选等价端口"],
       [1, "按包哈希：源/目的/包 UID 参与哈希"],
       [2, "按流哈希：优先使用 flowTag，无 flowTag 时退回包 UID"],
-      [3, "DATA 逐流喷洒：DATA 流按负载轮询，非 DATA 随机"],
-      [4, "AllToAll FatTree 特化：按物理源目固定拆分"]
+      [3, "DATA 逐流喷洒：DATA 流按负载轮询，非 DATA 随机"]
+    ];
+
+    const ppScheduleOptions = [
+      ["gpipe", "GPipe"],
+      ["1f1b", "1F1B"]
     ];
 
     const logLevelOptions = [
@@ -611,10 +615,21 @@
       const value = pathGet(def.path, def.defaultValue ?? "");
       if (def.type === "select") {
         control = document.createElement("select");
+        let hasCurrentOption = false;
         for (const [raw, labelText] of def.options) {
           const option = document.createElement("option");
           option.value = String(raw);
           option.textContent = labelText;
+          if (String(raw) === String(value)) {
+            hasCurrentOption = true;
+          }
+          control.appendChild(option);
+        }
+        if (!hasCurrentOption && value !== "" && value !== null && value !== undefined) {
+          const option = document.createElement("option");
+          option.value = String(value);
+          option.textContent = `当前 JSON 使用未公开值：${value}`;
+          option.disabled = true;
           control.appendChild(option);
         }
         control.value = String(value);
@@ -683,9 +698,8 @@
       return [
         sectionShell("基础设置", "这些字段一般每次实验都会改。", [
           field({ path: "workloadpath", label: "Workload 文件", type: "text", wide: true, help: "例如 simworkload/128_test.txt。" }),
-          field({ path: "thread", label: "Astra-Sim 线程数", type: "number", min: 1, defaultValue: 1 }),
-          field({ path: "gpu_type", label: "GPU 类型", type: "select", options: [["A100", "A100"], ["H100", "H100"]] }),
-          field({ path: "pp_schedule", label: "Pipeline schedule", type: "text", help: "当前常见值是 gpipe；不确定时保持原值。" })
+          field({ path: "thread", label: "线程数", type: "number", min: 1, defaultValue: 1 }),
+          field({ path: "pp_schedule", label: "Pipeline schedule", type: "select", options: ppScheduleOptions, help: "当前代码支持 GPipe 和 1F1B。" })
         ])
       ];
     }
@@ -782,7 +796,7 @@
         sectionShell("网络与 ECMP", "ECMP 在 JSON 中是数字，这里用文字策略表示，保存时仍写回数字。", [
           field({ path: "network.ecmpmodel", label: "ECMP 策略", type: "select", valueKind: "number", options: ecmpOptions, wide: true }),
           field({ path: "network.max_jump", label: "泛洪最大跳数 max_jump", type: "number", min: 1, defaultValue: 5, help: "影响 warmup 学习范围，也影响 auto ACK timeout 的估算边界。" }),
-          field({ path: "network.mtu", label: "MTU", type: "number", min: 1, defaultValue: 4096 }),
+          field({ path: "network.mtu", label: "MTU（字节）", type: "number", min: 1, defaultValue: 4096, help: "单位：Byte。" }),
           field({ path: "network.normallink_rate", label: "外网链路速率", type: "text", placeholder: "224Gbps" }),
           field({ path: "network.nvlink_rate", label: "内网/NVLink 速率", type: "text", placeholder: "2400Gbps" }),
           field({ path: "network.normallink_delay", label: "外网链路传播时延", type: "text", placeholder: "5ns" }),

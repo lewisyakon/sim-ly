@@ -43,6 +43,7 @@
 
 #include <mutex>
 #include <map>
+#include <memory>
 #include <algorithm>
 #include <sstream>
 #include <fstream>
@@ -64,6 +65,7 @@ int ecmpmodel,max_jump,floadtime,m_mtu;
 int effective_floadtime;
 bool mactable_load_enable;
 bool mactable_dump_enable;
+bool mactable_computed_enable;
 bool bridge_diag_enable;
 std::string mactable_load_dir;
 std::string mactable_dump_dir;
@@ -210,6 +212,47 @@ FinalizeAllGpuEndpointMacsFromInnerBridge(uint32_t gpuCount)
     }
 }
 
+static inline std::shared_ptr<const std::map<Mac48Address, uint32_t>>
+BuildGpuEndpointMacToIndexTable(uint32_t gpuCount)
+{
+    auto table = std::make_shared<std::map<Mac48Address, uint32_t>>();
+    for (uint32_t gpuIndex = 0; gpuIndex < gpuCount; ++gpuIndex)
+    {
+        const GpuExternalIoLayout& ioLayout = GetGpuExternalIoLayout(gpuIndex);
+        NS_ASSERT_MSG(Mac48Address::IsMatchingType(ioLayout.endpointMac),
+                      "Invalid endpoint MAC for gpu=" << gpuIndex);
+        (*table)[ioLayout.endpointMac] = gpuIndex;
+    }
+    return table;
+}
+
+static inline void
+InstallComputedFatTreeMacTables(uint32_t gpuCount)
+{
+    if (!mactable_computed_enable)
+    {
+        return;
+    }
+    NS_ASSERT_MSG(Topology_model == 0 && subnet_model == 2,
+                  "Computed MAC tables currently support only FatTree + subnet_model=2");
+
+    auto macToGpu = BuildGpuEndpointMacToIndexTable(gpuCount);
+    auto setTable = [&](std::vector<Ptr<MinHopBridgeNetDevice>>& devices) {
+        for (const auto& dev : devices)
+        {
+            if (dev)
+            {
+                dev->SetComputedMacToGpuIndexTable(macToGpu);
+            }
+        }
+    };
+
+    setTable(coreDevices);
+    setTable(aggregationDevices);
+    setTable(edgeDevices);
+    setTable(SubNetDevices);
+}
+
 static inline void
 ApplyBridgePfcWatermarks(const Ptr<MinHopBridgeNetDevice>& dev)
 {
@@ -301,7 +344,7 @@ GetEffectiveFloodTime();
 static inline void
 InstallGpuWarmupClients(NodeContainer& nodes, uint32_t gpuCount)
 {
-    if (mactable_load_enable)
+    if (mactable_load_enable || mactable_computed_enable)
     {
         return;
     }
@@ -1574,6 +1617,7 @@ bool ReadConf(std::string network_conf)
   auto pfc_low_global_bak       = g_pfcLowWatermark;
   auto mactable_load_enable_bak = mactable_load_enable;
   auto mactable_dump_enable_bak = mactable_dump_enable;
+  auto mactable_computed_enable_bak = mactable_computed_enable;
   auto bridge_diag_enable_bak   = bridge_diag_enable;
   auto mactable_load_dir_bak    = mactable_load_dir;
   auto mactable_dump_dir_bak    = mactable_dump_dir;
@@ -1615,6 +1659,7 @@ bool ReadConf(std::string network_conf)
     g_pfcLowWatermark = pfc_low_global_bak;
     mactable_load_enable = mactable_load_enable_bak;
     mactable_dump_enable = mactable_dump_enable_bak;
+    mactable_computed_enable = mactable_computed_enable_bak;
     bridge_diag_enable = bridge_diag_enable_bak;
     mactable_load_dir = mactable_load_dir_bak;
     mactable_dump_dir = mactable_dump_dir_bak;
@@ -1690,6 +1735,10 @@ bool ReadConf(std::string network_conf)
     if (JHas(mt, "dump_enable"))
     {
       JGetBool(mt, "dump_enable", mactable_dump_enable);
+    }
+    if (JHas(mt, "computed_enable"))
+    {
+      JGetBool(mt, "computed_enable", mactable_computed_enable);
     }
     JGetStr(mt, "dir", mactable_load_dir);
     JGetStr(mt, "load_dir", mactable_load_dir);
@@ -1990,6 +2039,31 @@ bool ReadConf(std::string network_conf)
     mactable_dump_enable = !mactable_load_enable;
   }
 
+  if (mactable_computed_enable)
+  {
+    if (mactable_load_enable)
+    {
+      std::cerr << "[Config] mactable.computed_enable and mactable.load_enable "
+                   "are mutually exclusive.\n";
+      RollbackConfig();
+      return false;
+    }
+    if (mactable_dump_enable)
+    {
+      std::cerr << "[Config] mactable.dump_enable is not supported with "
+                   "mactable.computed_enable.\n";
+      RollbackConfig();
+      return false;
+    }
+    if (Topology_model != 0 || subnet_model != 2)
+    {
+      std::cerr << "[Config] mactable.computed_enable currently supports only "
+                   "FatTree + subnet_model=2.\n";
+      RollbackConfig();
+      return false;
+    }
+  }
+
   if ((mactable_load_enable || mactable_dump_enable) && mactable_load_dir.empty())
   {
     mactable_load_dir = "mactable";
@@ -2006,7 +2080,7 @@ bool ReadConf(std::string network_conf)
         AppendScenarioVariantTagIfMissing(mactableBaseDir, mactableScenarioTag, "flood");
   }
 
-  effective_floadtime = mactable_load_enable ? 1 : floadtime;
+  effective_floadtime = (mactable_load_enable || mactable_computed_enable) ? 1 : floadtime;
   effective_floadtime = std::max(1, effective_floadtime);
   g_roce_cfg.transportWindowPackets = std::max<uint32_t>(1, g_roce_cfg.transportWindowPackets);
   g_roce_cfg.reorderWindowPackets = std::max<uint32_t>(1, g_roce_cfg.reorderWindowPackets);
@@ -2059,6 +2133,7 @@ void SetConfig(){
     DropTailQueue_num="16";
     mactable_load_enable=false;
     mactable_dump_enable=false;
+    mactable_computed_enable=false;
     bridge_diag_enable=false;
     mactable_load_dir="mactable";
     mactable_dump_dir="mactable";
@@ -2262,6 +2337,14 @@ void SetupNetwork(){
                                        gpus_per_server,
                                        MinHopBridgeNetDevice::EcmpTopologyLayer::Core,
                                        i);
+            if (mactable_computed_enable)
+            {
+                dev->SetComputedFatTreeMacTableContext(
+                    k_fattree,
+                    gpus_per_server,
+                    MinHopBridgeNetDevice::ComputedMacTableKind::FatTreeCore,
+                    i);
+            }
             dev->Set_switchDelay(NanoSeconds(switch_delay));
             dev->SetMtu(m_mtu);
             ApplyBridgePfcWatermarks(dev);
@@ -2276,6 +2359,14 @@ void SetupNetwork(){
                                        gpus_per_server,
                                        MinHopBridgeNetDevice::EcmpTopologyLayer::Aggregation,
                                        i);
+            if (mactable_computed_enable)
+            {
+                dev->SetComputedFatTreeMacTableContext(
+                    k_fattree,
+                    gpus_per_server,
+                    MinHopBridgeNetDevice::ComputedMacTableKind::FatTreeAggregation,
+                    i);
+            }
             dev->Set_switchDelay(NanoSeconds(switch_delay));
             dev->SetMtu(m_mtu);
             ApplyBridgePfcWatermarks(dev);
@@ -2290,6 +2381,14 @@ void SetupNetwork(){
                                        gpus_per_server,
                                        MinHopBridgeNetDevice::EcmpTopologyLayer::Edge,
                                        i);
+            if (mactable_computed_enable)
+            {
+                dev->SetComputedFatTreeMacTableContext(
+                    k_fattree,
+                    gpus_per_server,
+                    MinHopBridgeNetDevice::ComputedMacTableKind::FatTreeEdge,
+                    i);
+            }
             dev->Set_switchDelay(NanoSeconds(switch_delay));
             dev->SetMtu(m_mtu);
             ApplyBridgePfcWatermarks(dev);
@@ -2368,6 +2467,14 @@ void SetupNetwork(){
                             Ptr<Node> gpuNode = hosts.Get(gpuindex);
                             Ptr<MinHopBridgeNetDevice> innerBridge =
                                 CreateGpuSubnetBridge(gpuNode,1);
+                            if (mactable_computed_enable)
+                            {
+                                innerBridge->SetComputedFatTreeMacTableContext(
+                                    k_fattree,
+                                    gpus_per_server,
+                                    MinHopBridgeNetDevice::ComputedMacTableKind::FatTreeGpuInner,
+                                    gpuindex);
+                            }
                             SubNetDevices.push_back(innerBridge);
                             Ptr<MinHopBridgeNetDevice> externalBridge =
                                 CreateGpuExternalBridge(gpuNode);
@@ -2458,6 +2565,7 @@ void SetupNetwork(){
         }
         
         FinalizeAllGpuEndpointMacsFromInnerBridge(numGPUs);
+        InstallComputedFatTreeMacTables(numGPUs);
         // 配置 PacketSocket 应用层 ---
         PacketSocketHelper packetSocketHelper;
         packetSocketHelper.Install(hosts); // 为所有主机安装 PacketSocket
