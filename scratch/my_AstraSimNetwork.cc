@@ -565,30 +565,30 @@ void GetGlobalStart()
 }
 
 /*
-/*
-mpirun -np 4 --map-by ppr:4:node:PE=2 --bind-to none \
-  /mnt/nfs/cloud/sim-ly/build/scratch/ns3.44-my_AstraSimNetwork-default
-
-mpirun \
-  --wdir /mnt/nfs/cloud/sim-ly \
-  --launch-agent "/usr/local/bin/mpi-docker-agent /usr/bin/orted" \
-  --mca btl_tcp_if_include ztkse63itn \
-  --mca oob_tcp_if_include ztkse63itn \
-  -np 2 --host lab206:2 --map-by ppr:2:node:PE=2 --bind-to none \
-  /mnt/nfs/cloud/sim-ly/build/scratch/ns3.44-my_AstraSimNetwork-default : \
-  -np 2 --host lab254:2 --map-by ppr:2:node:PE=2 --bind-to none \
-  /mnt/nfs/cloud/sim-ly/build/scratch/ns3.44-my_AstraSimNetwork-default
-
-mpirun \
+env -u DISPLAY -u XAUTHORITY mpirun \
   --wdir /mnt/nfs/cloud/hybrid \
   --launch-agent "/usr/local/bin/mpi-docker-agent /usr/bin/orted" \
-  --mca btl_tcp_if_include ztkse63itn \
-  --mca oob_tcp_if_include ztkse63itn \
-  -np 1 --host lab206:1 --map-by ppr:1:node:PE=16 --bind-to none \
-  /mnt/nfs/cloud/hybrid/build/scratch/ns3.44-my_AstraSimNetwork-default : \
-  -np 1 --host lab254:1 --map-by ppr:1:node:PE=16 --bind-to none \
-  /mnt/nfs/cloud/hybrid/build/scratch/ns3.44-my_AstraSimNetwork-default : \
-  -np 2 --host lab188:2 --map-by ppr:2:node:PE=32 --bind-to none \
+  --mca oob_tcp_if_include 10.201.0.0/16 \
+  --mca btl_tcp_if_include 10.201.0.0/16 \
+  --mca btl tcp,self \
+  --host lab188:1,lab206:1,lab254:1,lab133:1 \
+  -np 4 \
+  --map-by ppr:1:node \
+  --bind-to none \
+  --tag-output \
+  /bin/hostname
+
+env -u DISPLAY -u XAUTHORITY mpirun \
+  --wdir /mnt/nfs/cloud/hybrid \
+  --launch-agent "/usr/local/bin/mpi-docker-agent /usr/bin/orted" \
+  --mca oob_tcp_if_include 10.201.0.0/16 \
+  --mca btl_tcp_if_include 10.201.0.0/16 \
+  --mca btl tcp,self \
+  --host lab188:2,lab206:1,lab254:1,lab133:1 \
+  -np 5 \
+  --map-by slot:PE=16 \
+  --bind-to none \
+  -x OMP_NUM_THREADS=16 \
   /mnt/nfs/cloud/hybrid/build/scratch/ns3.44-my_AstraSimNetwork-default
 */
 

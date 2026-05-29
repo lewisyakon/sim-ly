@@ -1168,6 +1168,10 @@ MinHopBridgeNetDevice::SetComputedFatTreeMacTableContext(uint32_t k,
     m_computedGpusPerServer = gpusPerServer;
     m_computedMacTableKind = kind;
     m_computedBridgeIndex = index;
+    if(m_computedMacTableEnabled)
+    {
+        m_enableLearning = false;
+    }
 }
 
 void

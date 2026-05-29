@@ -1,12 +1,12 @@
 {
-  "workloadpath": "simworkload/128_test.txt",
-  "thread": 1,
+  "workloadpath": "simworkload/108000_scaled_safe.txt",
+  "thread": 16,
   "gpu_type": "A100",                
   "nvswitch_per_server": 1,
   "pp_schedule": "gpipe",
 
   "network": {
-    "ecmpmodel": 4,                  
+    "ecmpmodel": 2,                  
     "max_jump": 5,
     "mtu": 4096,
     "normallink_rate": "224Gbps",
@@ -21,28 +21,28 @@
 
   "logging": {
     "dir": "simlog",
-    "simulation_log": "128_random_test.log",
-    "nccl_log": "128_random_test.log",
-    "bridge_diag": true,
+    "simulation_log": "108000_scaled_safe.log",
+    "nccl_log": "108000_scaled_safe.log",
+    "bridge_diag": false,
     "log_levels": {
-      "roce": "all",
-      "pfc": "all"
+      "roce": "off",
+      "pfc": "off"
     },
     "ns3_components": {
-      "send_flow_client": true,
-      "rdma_port_engine": true,
+      "send_flow_client": false,
+      "rdma_port_engine": false,
       "generic_simulation": true,
-      "min_hop_bridge_net_device": true,
-      "point_to_point_net_device": true,
-      "ppp_round_robin_queue": true
+      "min_hop_bridge_net_device": false,
+      "point_to_point_net_device": false,
+      "ppp_round_robin_queue": false
     }
   },
 
   "mactable": {
-    "load_enable": true,
+    "load_enable": false,
     "dump_enable": false,
-    "computed_enable": false,
-    "dir": "mactable/topo-fattree_k-8_subnet-0_subnetk-1_gpusper-1_nvsper-1-python"
+    "computed_enable": true,
+    "dir": "mactable"
   },
 
   "pfc": {
@@ -56,9 +56,9 @@
   "topology": {
     "model": "fattree",
     "file": "simtopo/external-fattree-k4-gpu4-fullmesh.topo",
-    "k": 8,
-    "subnet_model": 0,              
-    "subnet_k": 1,                             
+    "k": 60,
+    "subnet_model": 2,              
+    "subnet_k": 2,                             
     "hostperleaf": 2,                            
     "switch_delay_ns_override": 100 
   },

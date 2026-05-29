@@ -2509,6 +2509,14 @@ void SetupNetwork(){
                             Ptr<Node> gpuNode = hosts.Get(gpuindex);
                             Ptr<MinHopBridgeNetDevice> innerBridge =
                                 CreateGpuSubnetBridge(gpuNode,1);
+                            if (mactable_computed_enable)
+                            {
+                                innerBridge->SetComputedFatTreeMacTableContext(
+                                    k_fattree,
+                                    gpus_per_server,
+                                    MinHopBridgeNetDevice::ComputedMacTableKind::FatTreeGpuInner,
+                                    gpuindex);
+                            }
                             SubNetDevices.push_back(innerBridge);
                             Ptr<MinHopBridgeNetDevice> externalBridge =
                                 CreateGpuExternalBridge(gpuNode);
