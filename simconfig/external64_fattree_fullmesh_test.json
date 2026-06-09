@@ -1,0 +1,81 @@
+{
+  "workloadpath": "simworkload/microAllReduce64_external_fattree.txt",
+  "thread": 1,
+  "gpu_type": "A100",
+  "nvswitch_per_server": 1,
+  "pp_schedule": "gpipe",
+
+  "network": {
+    "ecmpmodel": 4,
+    "max_jump": 5,
+    "mtu": 4096,
+    "normallink_rate": "224Gbps",
+    "nvlink_rate": "2400Gbps",
+    "normallink_delay": "5ns",
+    "nvlink_delay": "15ns"
+  },
+
+  "workload": {
+    "floadtime_s": 3
+  },
+
+  "logging": {
+    "dir": "simlog",
+    "simulation_log": "external64_fattree_fullmesh_test.log",
+    "nccl_log": "external64_fattree_fullmesh_test.log",
+    "bridge_diag": true,
+    "log_levels": {
+      "roce": "off",
+      "pfc": "off"
+    },
+    "ns3_components": {
+      "send_flow_client": true,
+      "rdma_port_engine": false,
+      "generic_simulation": true,
+      "min_hop_bridge_net_device": true,
+      "point_to_point_net_device": false,
+      "ppp_round_robin_queue": false
+    }
+  },
+
+  "mactable": {
+    "load_enable": false,
+    "dump_enable": false,
+    "computed_enable": false,
+    "dir": "mactable"
+  },
+
+  "pfc": {
+    "drop_tail_queue_size": "5000000",
+    "drop_tail_queue_num": "17",
+    "high_watermark": 0.8,
+    "low_watermark": 0.2,
+    "not_head_retry_ns": 1
+  },
+
+  "topology": {
+    "model": "external",
+    "file": "simtopo/external-fattree-k4-gpu4-fullmesh.topo",
+    "k": 4,
+    "subnet_model": 0,
+    "subnet_k": 1,
+    "hostperleaf": 2,
+    "switch_delay_ns_override": 100
+  },
+
+  "roce": {
+    "enable": true,
+    "mode": "rc_3phase",
+    "data_use_write": true,
+    "sq_depth": 1024,
+    "rq_depth": 1024,
+    "transport_ack_enable": true,
+    "transport_window_packets": 500000,
+    "reorder_window_packets": 400000,
+    "ack_timeout_mode": "auto",
+    "ack_timeout_factor": 10000.0,
+    "ack_timeout_ns": 10,
+    "max_retransmissions": 8,
+    "ether_type": "0x9999"
+  }
+}

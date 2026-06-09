@@ -339,7 +339,7 @@ sendflowclient::ProcessThreePhasePayload_(Ptr<Packet> p,
     p->RemoveHeader(FTHeader);
     AstraSim::sim_request now_request;
     FTHeader.ToFlowTag(now_request.flowTag);
-    uint32_t PacketNum=FTHeader.get_packetnum();
+    uint64_t PacketNum=FTHeader.get_packetnum();
     if (m_request.find(flowKey)==m_request.end()) m_request[flowKey]=now_request;
     if (m_dataPacketsExpected.find(flowKey)==m_dataPacketsExpected.end()){
       m_dataPacketsExpected[flowKey]=PacketNum;

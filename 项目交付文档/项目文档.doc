@@ -1,0 +1,467 @@
+<!doctype html><html><head><meta charset='utf-8'><style>body{font-family:'Microsoft YaHei',SimSun,Arial;line-height:1.55}pre{background:#f5f5f5;padding:8pt;white-space:pre-wrap}table{border-collapse:collapse;width:100%}td,th{border:1px solid #999;padding:4pt}.list{margin-left:18pt}</style></head><body><h1>大规模细粒度数据中心网络仿真平台第三阶段技术文档</h1>
+<p>项目名称：大规模细粒度数据中心网络仿真 文档类型：第三阶段项目技术文档 文档版本：草案 日期：2026-06-01</p>
+<h2>目录</h2>
+<p class='list'>1. 引言</p>
+<p>1.1 研究背景与应用需求 1.2 研究目标 1.3 相关技术背景 1.4 本阶段工作范围与主要贡献</p>
+<p class='list'>2. 技术路线</p>
+<p>2.1 上层训练负载与集合通信建模路线 2.2 网络侧细粒度仿真路线 2.3 RoCE 网络行为建模路线 2.4 配置、日志与可复现实验路线</p>
+<p class='list'>3. 实现方案</p>
+<p>3.1 总体实现架构 3.2 配置文件与可视化配置面板 3.3 Astra-Sim 接入与三阶段业务流 3.4 RoCE 逻辑和端口实现 3.5 可靠传输机制实现 3.6 PFC、bridge 与物理队列实现 3.7 拓扑与端点模型实现 3.8 MAC 表与路径选择实现 3.9 日志与诊断体系实现 3.10 当前模型边界</p>
+<p class='list'>4. 仿真实验</p>
+<p>4.1 实验环境与公共配置 4.2 RoCE 主路径闭环验证实验 4.3 128 GPU AllToAll 队列分类影响实验 4.4 External topology 功能验证实验 4.5 现实匹配性与日志诊断分析 4.6 综合分析与小结</p>
+<h2>1. 引言</h2>
+<p>随着大语言模型、多模态模型和推荐模型规模持续增长，AI 训练系统对算力集群的规模、互联带宽和通信稳定性提出了更高要求。当前主流训练系统通常通过多机多卡协同完成训练任务，单个模型训练过程会同时包含数据并行、张量并行、流水线并行、专家并行等多种并行策略，并由 AllReduce、AllToAll、ReduceScatter、AllGather 等集合通信原语支撑跨 GPU 的参数同步、激活交换和梯度规约。在这类系统中，网络已经不再只是提供基本连通性的基础设施，而是决定训练吞吐、尾延迟、资源利用率和系统扩展性的关键因素。</p>
+<p>本项目面向大规模细粒度数据中心网络仿真需求，继承 SIMAI / Astra-Sim 的上层训练负载建模能力，并在 ns-3 网络侧补充数据中心拓扑、MAC 学习、ECMP、PFC、RoCE-like 传输和日志诊断能力。第三阶段重点围绕 RoCE 网络行为展开，目标是在不完整复刻 RNIC 内部实现的前提下，把会影响网络可见行为的关键机制下沉到仿真器中，从而支撑对万卡、十万卡 AI 集群网络行为的进一步研究。</p>
+<h3>1.1 研究背景与应用需求</h3>
+<p>近年来，AI 模型的参数规模和训练数据规模不断扩大。单机多卡已经难以满足大模型训练对显存容量、计算吞吐和训练周期的需求，实际工程中通常需要将训练任务扩展到数百、数千乃至更多 GPU 上。随着训练规模扩大，网络侧通信开销在端到端训练时间中的占比不断上升。即使单条链路带宽较高，集合通信中的突发注入、多路径负载不均、队列拥塞、PFC 回压、重传恢复和尾部流延迟仍可能成为训练性能瓶颈。</p>
+<p>从训练并行策略看，数据并行依赖频繁的梯度规约，典型通信原语是 AllReduce 或 ReduceScatter；张量并行会在每层计算过程中引入细粒度通信；流水线并行需要跨阶段传递激活和梯度；专家并行则常通过 AllToAll 完成 token 或 expert 路由。这些通信模式在网络侧呈现出不同的空间分布、时间依赖和消息大小特征。例如 AllReduce 往往受环形或树形依赖链影响，而 AllToAll 更容易在短时间内形成多源多目的突发，对 ECMP、队列分类和交换机缓冲提出更高要求。</p>
+<p>从网络技术看，AI 集群常采用高速以太网或 InfiniBand 等互联方案。基于以太网的 RDMA 方案 RoCE 在数据中心中应用广泛，其低 CPU 开销和低延迟特性适合训练通信，但 RoCE 的网络行为并不等同于普通无状态流量。一个可用于网络研究的 RoCE 仿真模型至少需要考虑 QP、PSN、发送窗口、ACK、超时重传、乱序处理、PFC pause、端口队列和路径选择等因素。否则，仿真结果容易退化为“应用层无限注入 + 链路带宽排队”的简单模型，难以解释大规模集群中的拥塞扩散、尾延迟和流间公平性问题。</p>
+<p>在真实集群上直接开展大规模网络实验成本极高。首先，大规模 GPU 集群和高速交换网络资源昂贵，难以长期占用用于对比实验。其次，生产集群通常承载多租户任务，实验环境难以保持可控和可复现。再次，拓扑、链路速率、路由策略、队列机制和流控参数一旦涉及真实设备修改，就会产生较高运维风险。因此，构建一个能够同时覆盖训练 workload、集合通信、网络拓扑和传输协议行为的仿真平台，是进行大规模 AI 集群网络设计和优化的重要前置条件。</p>
+<p>本项目正是在上述背景下展开。前期阶段已经完成了基本拓扑、workload 接入、集合通信负载生成和部分网络侧机制。第三阶段进一步聚焦 RoCE，尝试将影响网络可见行为的传输机制纳入 ns-3 细粒度仿真中，使平台能够更可靠地支撑后续的万卡/十万卡网络性能分析。</p>
+<h3>1.2 研究目标</h3>
+<p>本阶段研究目标不是重新实现一个完整训练框架，也不是逐周期模拟 GPU 内核，而是在已有 SIMAI / Astra-Sim 和 ns-3 基础上，提高网络侧行为的真实性和可解释性。具体目标如下。</p>
+<p>第一，保持上层训练负载建模能力。项目继续利用 Astra-Sim 对训练 workload、集合通信原语和调度事件的抽象能力，将复杂训练过程转化为网络侧可处理的通信事务。这样可以复用前期阶段在混合并行、集合通信和 workload 文件格式方面的工作成果。</p>
+<p>第二，完善数据中心网络拓扑和端点模型。项目需要支持 FatTree、Clos、FullMesh、Torus 等内置拓扑，并通过 external topology v1 支持用户输入边列表形式的自定义拓扑。同时，GPU 端点需要表达节点内部高带宽互联和外部后端网络端口，因此第三阶段继续完善 `innerBridge + externalBridge` 的端点模型。</p>
+<p>第三，构建面向网络行为的 RoCE-like 传输模型。第三阶段重点是在端口侧实现最小 QP/SQ/RQ/CQ、传输层 ACK、每 QP 未确认窗口、超时重传、有界乱序缓存和感知 PFC pause 的端口准入，使仿真不再只依赖上层三阶段业务语义，而能表达传输层对注入速率、恢复过程和接收资源的约束。</p>
+<p>第四，接通 PFC、bridge、物理队列和 RoCE 运行时。RoCE 在无损以太网络中通常与 PFC、队列和端口调度强相关。本阶段目标之一是让 bridge 队列水位、PauseHeader、PointToPointNetDevice 的 QueuePauseState、RdmaPortEngine 的 qid 准入和 PPP 子队列调度形成可观察闭环。</p>
+<p>第五，建立可复现实验和日志诊断体系。平台需要通过统一 JSON 配置、本地配置 UI、主程序收尾日志、flow 事务日志、RoCE 传输日志、PFC/bridge 日志和 ECMP 日志，支撑从“现象”到“机制”的定位过程。尤其是在大规模 AllToAll 等突发通信中，必须能够区分问题来自上层依赖图、ECMP、PPP 队列分类、PFC、重传恢复还是 MAC 学习。</p>
+<p>第六，明确模型边界。当前项目追求的是网络行为相似，而不是完整 RNIC 内部复刻。因此文档和实验需要明确：当前模型是 `PFC-aware RC-like RoCE` 近似模型，不是完整 RoCEv2 over UDP/IP，也不包含完整 ECN/CNP/DCQCN 闭环。</p>
+<h3>1.3 相关技术背景</h3>
+<h4>1.3.1 NS-3</h4>
+<p>NS-3 是面向网络研究的离散事件仿真平台，核心使用 C++ 实现。其基本建模单元包括 Node、NetDevice、Channel、Application、Queue 等。与只进行流级估算的模型相比，NS-3 更适合表达链路传播时延、序列化时延、队列排队、设备发送状态、事件调度和协议交互等细粒度网络行为。</p>
+<p>本项目在 ns-3 中使用 PointToPointNetDevice 表达物理链路端口，使用自定义 MinHopBridgeNetDevice 表达交换机和 GPU bridge，使用 PppRoundRobinQueue 表达物理发送队列。由于项目目标是数据中心和 AI 集群网络，而非通用互联网协议栈，因此大量新增逻辑集中在 `src/min-hop-mac-learning/` 中。</p>
+<h4>1.3.2 Astra-Sim</h4>
+<p>Astra-Sim 是面向分布式深度学习训练系统的仿真框架，能够将训练 workload、集合通信和系统调度转化为事件序列。它的优势在于能够从训练系统角度描述通信原语和并行策略，而不需要在网络侧手工编写每一条点到点流。</p>
+<p>本项目将 Astra-Sim 作为上层 workload 驱动，网络侧通过 `scratch/my_entry.h` 与 `sendflowclient` 接收 `sim_send` / `sim_recv` 事件。这样可以把训练负载中的 AllReduce、AllToAll 等集合通信映射为网络侧可观察的点到点事务，并继续利用 ns-3 对底层网络行为进行细粒度模拟。</p>
+<h4>1.3.3 RoCE/RDMA</h4>
+<p>RoCE 是在以太网上承载 RDMA 语义的一类技术。现实中的 RDMA 通信通常围绕 QP 展开，QP 包含 SQ、RQ、CQ 和状态机等资源。可靠连接类传输还涉及 PSN、有序接收、ACK、重传、超时、接收资源和完成记录等机制。RoCE 部署在以太网上时，还常与 PFC、ECN、CNP、DCQCN 等无损网络和拥塞控制机制耦合。</p>
+<p>当前项目没有完整实现 RNIC verbs，也没有完整 RoCEv2 over UDP/IP 与 DCQCN。第三阶段采用的是面向网络行为的 `RC-like` 近似路线：保留会直接影响网络队列、回压、重传、乱序和尾延迟的关键行为，将它们放入 ns-3 端口运行时中；对不会直接影响当前网络侧实验目标的 RNIC 内部细节进行简化。</p>
+<h4>1.3.4 数据中心网络拓扑</h4>
+<p>数据中心和 AI 集群常见拓扑包括 FatTree、Clos、FullMesh、Torus 以及厂商自定义拓扑。FatTree 和 Clos 通过多层交换结构提供多路径和较高的二分带宽；FullMesh 和 Torus 更适合表达特定规模或节点内互联；External topology 则允许用户通过拓扑文件描述更复杂或外部生成的连接关系。</p>
+<p>本项目既保留内置拓扑构建逻辑，也引入 external topology v1。外部拓扑文件使用边列表表达 GPU、交换机、外网链路和内网链路，使用户能够通过脚本生成拓扑并接入当前仿真器。</p>
+<h4>1.3.5 AI 集群网络关键问题</h4>
+<p>AI 训练通信具有突发性强、模式固定、同步依赖明显的特点。AllReduce 可能受环或树依赖限制；AllToAll 容易形成短时间内多源多目的突发；incast 和多目的 burst 会放大队列分类、PFC 和 ECMP 的影响。对于这类 workload，平均链路利用率不足以解释尾部完成时间，必须结合 flow 完成时间分布、PFC 活跃度、重传日志、队列分类和路径选择进行分析。</p>
+<h3>1.4 本阶段工作范围与主要贡献</h3>
+<p>第三阶段工作可以概括为：在已有 Astra-Sim workload 和 ns-3 网络构建基础上，重点完善 RoCE 网络行为、端口级传输运行时、PFC 与队列调度、外部拓扑输入和日志诊断体系。</p>
+<p>本阶段主要贡献包括：</p>
+<p class='list'>1. 将 RoCE-like 报文级运行时从 `sendflowclient` 业务层下沉到端口侧 `RdmaPortEngine`。</p>
+<p class='list'>2. 实现端口绑定的 `QpRuntime`，显式维护最小 QP 状态、发送队列、接收资源和完成队列。</p>
+<p class='list'>3. 实现传输层 ACK、每 QP 未确认窗口、超时重传、乱序缓存和完成记录。</p>
+<p class='list'>4. 实现感知 PFC pause 的端口准入，使 RoCE 运行时能识别对应 qid 是否被暂停，以及该 qid 的在途报文数量。</p>
+<p class='list'>5. 梳理 GPU 端点的 `innerBridge + externalBridge` 模型，并接入 external topology v1。</p>
+<p class='list'>6. 建立覆盖配置、日志、RoCE 工作流、现实匹配性和仿真实验的文档体系。</p>
+<p class='list'>7. 通过 128 GPU AllToAll 实验识别 PPP 子队列分类退化问题，明确后续面向 flow 的 qid 分类器改进方向。</p>
+<h2>2. 技术路线</h2>
+<p>本项目第三阶段采用分层解耦的技术路线：上层继续使用 Astra-Sim 表达训练 workload 和集合通信，下层使用 ns-3 表达网络拓扑、链路和事件调度，中间通过 `sendflowclient` 将训练通信事务转化为网络侧三阶段业务流，再通过 RoCE 逻辑层和端口运行时实现传输行为。整体路线可以概括为：</p>
+<pre><code>训练 workload / 集合通信
+  -&gt; Astra-Sim 事件
+  -&gt; sendflowclient 三阶段事务
+  -&gt; RoceTransportEngine 逻辑 QP 和发送任务映射
+  -&gt; RdmaPortEngine 端口侧报文运行时
+  -&gt; bridge / ECMP / PFC / PPP 子队列
+  -&gt; ns-3 离散事件仿真</code></pre>
+<p>该路线的核心思想是：上层保持训练语义，底层补足网络行为，二者通过明确的 flow、tag、src、dst 和回调关系连接起来。这样既避免在网络侧重新实现训练框架，也避免把网络仿真简化为无传输约束的流量注入。</p>
+<h3>2.1 上层训练负载与集合通信建模路线</h3>
+<p>训练负载建模仍沿用 Astra-Sim 的 workload 文件。workload 文件描述模型层、通信原语、消息大小、并行组、GPU 数和执行阶段。例如当前 `simworkload/128_test.txt` 声明 `all_gpus: 128`，并包含 `ALLREDUCE` 和 `ALLTOALL_EP` 两类通信原语。这些原语经过 Astra-Sim 调度后，会转化为一组带有 `src`、`dst`、`tag`、`size` 的点到点通信事务。</p>
+<p>网络侧并不直接理解训练层语义，而是通过 `scratch/my_entry.h` 接收 Astra-Sim 下发的 `sim_send` / `sim_recv`。随后 `sendflowclient` 以三阶段业务协议组织事务：</p>
+<p class='list'>1. `REQUEST`：用于控制接收侧和业务回调。</p>
+<p class='list'>2. `DATA`：承载实际数据传输。</p>
+<p class='list'>3. `ACT`：用于发送侧最终完成闭环。</p>
+<p>该路线保留了上层训练事件和网络侧 flow 的对应关系。日志中的 `TriggerSendTo_now` 表示 Astra-Sim 已经下发点到点事务；`REQ_DONE`、`RX_DONE`、`TX_DONE` 分别表示 REQUEST 发出、接收侧收齐 DATA、发送侧收到 ACT。通过这些日志，可以把训练负载中的集合通信阶段映射到网络侧完成时间和尾部行为。</p>
+<p>采用这一建模方式的优点是：复杂集合通信仍由 Astra-Sim 负责展开，网络侧只需要处理统一的点到点事务和报文级运行时；同时，网络侧仍然能通过 `tag/src/dst` 识别 flow，为 ECMP、qid 分类器和日志统计提供稳定键。</p>
+<h3>2.2 网络侧细粒度仿真路线</h3>
+<p>网络侧采用 ns-3 作为离散事件仿真底座。拓扑构建、链路安装、bridge 绑定、应用安装和全局配置主要在 `scratch/my_common.h` 中完成。项目对 ns-3 原生 PointToPointNetDevice、queue 和 bridge 机制进行了扩展，使其能够表达 AI 集群后端网络中的 MAC 学习、PFC、ECMP 和端口调度行为。</p>
+<p>网络侧拓扑路线分为两类：</p>
+<p class='list'>1. 内置拓扑：通过 C++ 代码生成 FatTree、Clos、FullMesh、Torus 等结构。</p>
+<p class='list'>2. 外部拓扑：通过 external topology v1 文件读取 GPU、交换机、外网链路和内网链路。</p>
+<p>GPU 端点统一采用 `innerBridge + optional externalBridge` 模型。`innerBridge` 表达节点内部高带宽互联域，`externalBridge` 表达面向后端网络的外部端口集合。交换机节点使用 `MinHopBridgeNetDevice` 表达转发和学习行为，链路使用 PointToPointHelper 安装，并通过 `PppRoundRobinQueue` 提供物理发送队列。</p>
+<p>MAC 学习和路径选择采用 warmup/flood 机制建立转发表。对于大规模重复实验，项目支持 MAC 表 load/dump 和 FatTree 计算式 MAC 表，以降低 warmup 成本。ECMP 则通过 `network.ecmpmodel` 控制，可选择随机、按包哈希、按流哈希、DATA 逐流喷洒以及专项实验模式。</p>
+<p>该路线的关键是把网络侧行为留在 ns-3 事件系统中，而不是在上层用解析公式估算。链路速率、传播时延、交换处理延迟、队列容量、PFC 水位、端口忙闲状态和报文序列化时间都会通过事件调度影响最终日志时间。</p>
+<h3>2.3 RoCE 网络行为建模路线</h3>
+<p>RoCE 建模路线采用“网络行为优先”的原则。真实 RoCE/RDMA 系统包含复杂 RNIC 内部资源、verbs API、QP bringup、内存注册、CQ poll、SRQ、RNR、RoCEv2/UDP/IP、ECN/CNP/DCQCN 等机制。如果试图一次性完整复刻，会显著增加仿真复杂度，并影响大规模实验可运行性。因此第三阶段选择先实现对网络可见行为影响最大的部分。</p>
+<p>当前模型重点实现以下机制：</p>
+<p class='list'>1. QP、PSN 和接收侧期望序号：表达可靠连接中的顺序状态。</p>
+<p class='list'>2. 发送队列、接收资源和完成队列最小模型：表达发送任务、接收资源和完成记录。</p>
+<p class='list'>3. 每 QP 未确认窗口：约束单个 QP 的在途报文数。</p>
+<p class='list'>4. 传输层 ACK：释放未确认报文并驱动窗口前进。</p>
+<p class='list'>5. 超时、重传和恢复：表达报文缺口后的恢复成本。</p>
+<p class='list'>6. 有界乱序缓存：表达乱序接收和窗口溢出。</p>
+<p class='list'>7. 感知 pause 的端口准入：让 PFC pause 直接阻止对应 qid 发送。</p>
+<p class='list'>8. 报文分片与可见 RoCE 头开销：让 MTU、链路占用和分片数量更接近真实传输。</p>
+<p>为了保持职责清晰，RoCE 实现分为两层：</p>
+<p class='list'>1. `RoceTransportEngine`：逻辑层，负责将业务流和阶段映射到 QPN、操作码、发送类别和 `workId`。</p>
+<p class='list'>2. `RdmaPortEngine`：端口运行时，负责报文分片、ACK、重传、乱序处理、QP 状态、完成记录和端口准入。</p>
+<p>这种分层避免 `sendflowclient` 继续承担报文级运行时，也避免 `RoceTransportEngine` 同时处理业务逻辑和物理端口状态。最终形成“业务层、逻辑层、端口层、物理队列层”的清晰边界。</p>
+<p>当前路线明确保留若干简化：主路径不是完整 RoCEv2 over UDP/IP，没有 ECN/CNP/DCQCN 闭环，RQ 不是完整 posted receive/RNR 语义，CQ 也不是上层唯一完成驱动。因此当前模型的准确定位是 `PFC-aware RC-like RoCE` 近似模型。</p>
+<h3>2.4 配置、日志与可复现实验路线</h3>
+<p>为支撑大规模实验复现，项目采用统一 JSON 配置和分层日志体系。</p>
+<p>配置路线包括：</p>
+<p class='list'>1. 所有关键实验参数集中放在 `simconfig/config.json`。</p>
+<p class='list'>2. 配置按 `network`、`topology`、`pfc`、`roce`、`mactable`、`logging` 等分组管理。</p>
+<p class='list'>3. 本地配置 UI 负责把常用字段可视化，同时保留专家 JSON 入口。</p>
+<p class='list'>4. 配置保存时生成备份，减少误改风险。</p>
+<p class='list'>5. 通过 `--network_conf` 支持同一代码运行不同配置文件。</p>
+<p>日志路线包括：</p>
+<p class='list'>1. `[main]`：输出 `network drained`、`last FLOW_TX_DONE`、`total send count`、`total events` 等全局指标。</p>
+<p class='list'>2. `[FLOW]`：输出 `REQ_DONE`、`RX_DONE`、`TX_DONE`，用于判断业务事务闭环。</p>
+<p class='list'>3. `[ROCE]`：输出配置、激活、ACK、RTO、RTX、乱序处理、SQ/RQ/CQ 等传输信息。</p>
+<p class='list'>4. `[PFC]`：输出 pause/resume 水位和传播行为。</p>
+<p class='list'>5. `[BRIDGE]`：输出 NO_PATH、terminal drop、bridge drop summary 等路径和转发信息。</p>
+<p class='list'>6. `[ECMP]`：输出候选端口、选路动作和 flow tuple，用于解释多路径分布。</p>
+<p>实验分析遵循从上到下的诊断顺序：先确认上层是否下发 flow，再确认 RoCE 运行时是否激活，再看业务事务是否闭环，最后根据异常类型进入传输恢复、PFC、MAC 学习、ECMP 或队列分类分析。128 GPU AllToAll 队列分类问题就是沿着这一诊断路线定位到目的 MAC hash 与队列数取模碰撞，而不是停留在“尾部流慢”的表面现象。</p>
+<h2>3. 实现方案</h2>
+<h3>3.1 总体实现架构</h3>
+<p>第三阶段实现后的仿真主路径可以表示为：</p>
+<pre><code>Astra-Sim workload
+  -&gt; scratch/my_AstraSimNetwork.cc
+  -&gt; scratch/my_entry.h
+  -&gt; sendflowclient
+  -&gt; RoceTransportEngine
+  -&gt; RdmaPortEngine
+  -&gt; PointToPointNetDevice
+  -&gt; PppRoundRobinQueue
+  -&gt; ns-3 事件调度器</code></pre>
+<p>其中各层职责如下：</p>
+<p class='list'>1. `scratch/my_AstraSimNetwork.cc`：仿真主入口，负责命令行参数、配置文件路径、日志路径、运行收尾和主程序级统计。</p>
+<p class='list'>2. `scratch/my_entry.h`：Astra-Sim 与网络侧的胶水层，负责把上层 `sim_send` / `sim_recv` 接入 `sendflowclient`。</p>
+<p class='list'>3. `sendflowclient`：应用入口和三阶段业务层，负责 `REQUEST/DATA/ACT` 事务语义、回调管理和 flow 级日志。</p>
+<p class='list'>4. `RoceTransportEngine`：RoCE 逻辑层，负责将业务流和阶段映射到 QPN、操作码、发送类别、`workId` 和三阶段状态。</p>
+<p class='list'>5. `RdmaPortEngine`：端口侧 RoCE 报文运行时，负责 QP 状态、发送队列、接收资源、完成队列、报文分片、ACK、重传、乱序处理和感知 pause 的端口准入。</p>
+<p class='list'>6. `MinHopBridgeNetDevice`：负责 MAC 学习、flood、ECMP、bridge ingress queue、PFC 阈值判断和 outPort 解析。</p>
+<p class='list'>7. `PointToPointNetDevice + PppRoundRobinQueue`：负责真实物理口发送、per-qid 子队列、round-robin 出队和 pause 状态传播。</p>
+<p>第三阶段最关键的架构变化是：RoCE 报文级运行时不再由 `sendflowclient` 直接承担，而是下沉到每个物理端口的 `RdmaPortEngine`。这样可以将传输窗口、ACK、重传、乱序和 PFC pause 等行为放到更接近真实网络设备的位置。</p>
+<h3>3.2 配置文件与可视化配置面板</h3>
+<p>默认配置文件为：</p>
+<pre><code>simconfig/config.json</code></pre>
+<p>主要配置分组包括：</p>
+<table><tr><th>分组</th><th>作用</th></tr><tr><td>顶层字段</td><td>workload 路径、线程数、GPU 类型、pipeline schedule 等</td></tr><tr><td>`network`</td><td>ECMP、MTU、普通链路速率、NVLink 速率、链路时延、最大跳数</td></tr><tr><td>`topology`</td><td>拓扑类型、规模参数、external 文件、服务器内 GPU 子网</td></tr><tr><td>`pfc`</td><td>PPP 子队列数量、队列容量、PFC 高低水位</td></tr><tr><td>`roce`</td><td>RoCE 使能、QP 深度、ACK、窗口、重传、乱序窗口、timeout</td></tr><tr><td>`mactable`</td><td>MAC 表 load、dump、computed 以及目录</td></tr><tr><td>`logging`</td><td>日志目录、日志文件名、RoCE/PFC/ns-3 component 日志开关</td></tr></table>
+<p>配置解析主要位于 `scratch/my_common.h`。入口程序 `scratch/my_AstraSimNetwork.cc` 支持默认读取 `simconfig/config.json`，也支持通过 `--network_conf` 或 `-c` 指定其他配置文件。</p>
+<p>第三阶段还实现了轻量本地网页配置面板：</p>
+<pre><code>python3 tools/config-ui/server.py --host 127.0.0.1 --port 8765</code></pre>
+<p>该面板读取并写回 `simconfig/config.json`，按“基础、拓扑、网络与 ECMP、PFC 与队列、RoCE、MAC 表、日志、专家 JSON”分组展示字段。其设计原则是：</p>
+<p class='list'>1. 普通用户只看到常用字段。</p>
+<p class='list'>2. 不同拓扑下隐藏不生效字段。</p>
+<p class='list'>3. 保存前生成 `simconfig/config.json.bak`。</p>
+<p class='list'>4. 隐藏字段不删除，保证旧配置和专家配置能继续 round-trip。</p>
+<p class='list'>5. 对历史兼容字段保留专家入口，避免 UI 简化破坏已有实验。</p>
+<h3>3.3 Astra-Sim 接入与三阶段业务流</h3>
+<p>上层 Astra-Sim 将集合通信分解为点到点通信事务后，通过 `scratch/my_entry.h` 进入网络侧。网络侧仍保留三阶段业务协议：</p>
+<p class='list'>1. `REQUEST`：接收端请求或控制阶段。</p>
+<p class='list'>2. `DATA`：真正的数据传输阶段。</p>
+<p class='list'>3. `ACT`：发送端最终完成通知阶段。</p>
+<p>`sendflowclient` 负责维护 callback 和事务状态，并输出如下日志：</p>
+<pre><code>TriggerSendTo_now declared now time = ...
+[FLOW][REQ_DONE] ...
+[FLOW][RX_DONE] ...
+[FLOW][TX_DONE] ...</code></pre>
+<p>这些日志分别表示：</p>
+<p class='list'>1. 上层已经下发一条点到点事务。</p>
+<p class='list'>2. REQUEST 控制 work 已经真正发出。</p>
+<p class='list'>3. 接收端已经收齐 DATA 分片。</p>
+<p class='list'>4. 发送端已经收到 ACT，业务事务闭环。</p>
+<p>需要注意的是，`ACT` 是三阶段业务控制报文，不是 RoCE 传输层 ACK。第三阶段实现中，传输层 ACK 已经下沉到 `RdmaPortEngine`，用于释放未确认报文和驱动重传恢复。</p>
+<h3>3.4 RoCE 逻辑和端口实现</h3>
+<p>第三阶段将 RoCE 相关逻辑拆成两层：`RoceTransportEngine` 和 `RdmaPortEngine`。前者负责把业务层的三阶段通信转成 RoCE 传输任务，后者负责在具体物理端口上执行这些任务。简单说，`RoceTransportEngine` 回答“这次业务发送应该使用哪一条 RoCE 状态”，`RdmaPortEngine` 回答“这条 RoCE 状态下的报文应该怎样切分、排队、确认、重传和完成”。</p>
+<p>`RoceTransportEngine` 位于 `sendflowclient` 和端口运行时之间。`sendflowclient` 看到的是 Astra-Sim 下发的点到点业务流，业务流可用 `flow = {tag, src, dst}` 表示，其中 `src` 和 `dst` 是发送、接收 GPU 编号，`tag` 是上层集合通信展开后携带的通信标识。同一个 `tag` 在不同源、目的之间可能重复，因此不能只用 `tag` 作为传输状态的唯一键。</p>
+<p>`RoceTransportEngine` 的主要职责包括：</p>
+<p class='list'>1. 根据 `flow = {tag, src, dst}` 和当前所属阶段分配 QPN。</p>
+<p class='list'>2. 将 `REQUEST`、`DATA`、`ACT` 映射为 RoCE 操作码。</p>
+<p class='list'>3. 为每一次业务发送任务分配 `workId`。</p>
+<p class='list'>4. 决定发送类别 `txClass`，使控制报文和数据报文能被端口侧区分。</p>
+<p class='list'>5. 维护三阶段业务状态机。</p>
+<p>这里的 QP 是 Queue Pair 的缩写，可以理解为一条可靠传输状态的载体；QPN 是 QP Number，用来标识具体使用哪一个 QP。当前仿真器中的 QPN 不是通过真实网卡建链过程产生的，也不模拟完整 RNIC 连接管理，而是根据业务流和阶段生成的稳定编号。这样做的目的，是让不同业务流、不同三阶段报文拥有相互隔离的发送窗口、接收顺序和确认状态。</p>
+<p>操作码用于说明当前报文的传输语义。例如 `REQUEST` 和 `ACT` 是控制类报文，`DATA` 是真正承载业务数据的报文。`workId` 用于在日志和完成回调中追踪一次业务发送任务。`txClass` 用于区分控制类和数据类发送，后续端口可以据此采用不同队列或不同优先级。三阶段状态机则负责保证 `REQUEST -&gt; DATA -&gt; ACT` 的业务闭环没有被 RoCE 传输细节打乱。</p>
+<p>因此，`RoceTransportEngine` 不直接发包，也不直接处理 ACK、重传和乱序。它只负责把业务语义整理成端口可以执行的 RoCE 发送任务。真正的端口行为由 `RdmaPortEngine` 承担。</p>
+<p>`RdmaPortEngine` 是第三阶段最核心的新增类。它绑定在每个实际的 `PointToPointNetDevice` 上，代表该物理端口的 RoCE 运行时逻辑。一个 GPU 或交换节点可能有多个物理端口，因此也会有多个端口运行时；每个运行时只管理自己绑定端口上的发送、接收、队列准入和传输状态。</p>
+<p>在每个端口内部，`RdmaPortEngine` 以 QP 为单位维护运行时状态，主要包括发送队列、接收资源、完成队列、已发送但尚未确认的报文、重传定时器和乱序缓存。</p>
+<p>发送队列 SQ 表示 Send Queue，用来保存业务层提交但尚未全部发完的发送任务。这里的一个 SQ 条目不是一个 MTU 大小的网络包，而是一次业务发送任务。端口运行时会根据 MTU 将这个任务切成多个 RoCE 报文，并为每个报文填写 QPN、PSN、操作码、`workId` 等头部字段。PSN 是 Packet Sequence Number，即报文序号，用于接收侧判断报文是否按序到达。</p>
+<p>接收资源 RQ 表示 Receive Queue。在当前实现中，RQ 不是完整的 verbs `post_recv` 模型，而是一个简化的接收资源限制。接收普通 RoCE 报文前，端口运行时会先检查该 QP 的接收资源是否已经达到上限。如果已经满了，报文不会继续推进协议状态，并会输出 `[ROCE][RQ][FULL]` 日志。这一简化虽然不等同于真实 RNIC 的 RNR 机制，但已经能表达“接收端资源不足会影响传输”的网络行为。</p>
+<p>完成队列 CQ 表示 Completion Queue，用于记录发送完成和接收完成。当前 CQ 主要服务于端口运行时统计和诊断，不是业务层唯一的完成驱动。业务层是否完成仍以三阶段 `ACT` 闭环为主。因此，看到 CQ 完成并不等价于 Astra-Sim 业务事务已经完全结束；判断业务完成仍应查看 `[FLOW][TX_DONE]`。</p>
+<p>已发送但尚未确认的报文会进入未确认表。接收侧按 PSN 检查报文顺序，接受后返回传输层 ACK。发送侧收到 ACK 后，从未确认表中清除已经被确认的报文，并释放发送窗口。如果 ACK 长时间没有回来，重传定时器会触发，将最老的未确认报文放入重传队列。乱序缓存用于保存提前到达的未来序号报文，等缺失 PSN 到达后再连续释放给上层。</p>
+<p>从一次 `DATA` 发送看，完整路径如下：</p>
+<pre><code>sendflowclient 生成 DATA 业务动作
+  -&gt; RoceTransportEngine 选择 QPN、操作码、workId、txClass
+  -&gt; RdmaPortEngine::PostSend 写入对应 QP 的发送队列
+  -&gt; RdmaPortEngine 按 MTU 切分为多个 RoCE 报文
+  -&gt; 端口侧检查发送窗口、PFC pause 和 qid 准入
+  -&gt; PointToPointNetDevice 发出报文
+  -&gt; 接收端 RdmaPortEngine 检查 RQ、PSN 和乱序缓存
+  -&gt; 接收端发出传输层 ACK，并在可交付时上送 DATA
+  -&gt; 发送端收到 ACK，释放未确认报文和发送窗口</code></pre>
+<p>这种拆分使 RoCE 模型的边界更清晰：业务层继续表达 `REQUEST/DATA/ACT`，逻辑层负责选择 QP 和报文语义，端口层负责报文级传输行为，物理队列层负责真实出队和 PFC 约束。后续无论是增强重传、增加拥塞控制，还是改进队列分类，都可以在对应层内扩展，而不需要把所有逻辑继续堆在 `sendflowclient` 中。</p>
+<h3>3.5 可靠传输机制实现</h3>
+<h4>3.5.1 报文分片与 RoCE 头开销</h4>
+<p>`RdmaPortEngine` 在端口侧执行报文分片。`RoceSimHeader` 会根据操作码返回等效可见 RoCE 头开销：</p>
+<table><tr><th>操作码</th><th>可见传输头开销</th></tr><tr><td>SEND</td><td>12B</td></tr><tr><td>WRITE / READ_REQ</td><td>28B</td></tr><tr><td>ACK / READ_RESP</td><td>16B</td></tr></table>
+<p>这部分开销会进入 MTU 预算，从而影响分片数量、链路占用和排队时延。</p>
+<h4>3.5.2 传输层 ACK</h4>
+<p>接收侧普通报文被 QP 接收状态接受后，会生成传输层 ACK。ACK 使用控制类发送，并通过内部分发标记识别为传输层 ACK。</p>
+<p>发送侧收到 ACK 后：</p>
+<p class='list'>1. 读取 ACK 携带的确认序号 `ackPsn`。</p>
+<p class='list'>2. 清除该 QP 上 `psn &lt;= ackPsn` 的未确认报文。</p>
+<p class='list'>3. 未确认表清空时取消重传定时器。</p>
+<p class='list'>4. 未确认表未清空时重新设置重传定时器。</p>
+<p class='list'>5. 如果 ACK 覆盖恢复目标 PSN，则退出恢复状态。</p>
+<p class='list'>6. 继续驱动发送调度器和待发送队列。</p>
+<h4>3.5.3 发送窗口</h4>
+<p>每个 QP 通过 `transport_window_packets` 限制在途报文数。当未确认报文数达到窗口上限时，该 QP 会进入阻塞集合，直到 ACK 释放窗口。</p>
+<p>这使上层注入量受传输状态约束，不再是 workload 一次性无限注入。</p>
+<h4>3.5.4 超时与重传</h4>
+<p>当前每个 QP 使用一个“最老未确认报文”定时器。超时后：</p>
+<p class='list'>1. 找到最老的未确认报文。</p>
+<p class='list'>2. 如果重传次数未达到 `max_retransmissions`，将该报文标记为待重传。</p>
+<p class='list'>3. 设置恢复目标 PSN。</p>
+<p class='list'>4. 阻塞该 QP 继续发送新的普通报文。</p>
+<p class='list'>5. 由正常端口发送路径重新发送该报文。</p>
+<p class='list'>6. 只有报文真正重发成功时，才增加 retry 计数。</p>
+<p>最后一点对 PFC 场景很重要。如果端口被 pause，定时器可能触发，但报文并不会立刻重发成功；当前实现不会在 pause 期间把重试次数快速消耗完。</p>
+<h4>3.5.5 乱序处理</h4>
+<p>接收侧按 `expectedRxPsn` 推进：</p>
+<p class='list'>1. `psn &lt; expectedRxPsn`：旧包或重复包，不上送。</p>
+<p class='list'>2. `psn == expectedRxPsn`：推进接收状态，产生接收完成记录。</p>
+<p class='list'>3. `expectedRxPsn &lt; psn &lt; expectedRxPsn + reorder_window_packets`：进入乱序缓存。</p>
+<p class='list'>4. `psn &gt;= expectedRxPsn + reorder_window_packets`：触发乱序窗口溢出，不无限缓存。</p>
+<p>当缺口补齐后，连续可交付的缓存报文会被释放给 `sendflowclient::ProcessThreePhasePayload_`。</p>
+<h3>3.6 PFC、bridge 与物理队列实现</h3>
+<h4>3.6.1 Bridge ingress queue</h4>
+<p>当前 `MinHopBridgeNetDevice` 的 ingress 不再是旧的 per-qid 队列，而是每个 ingress port 一个 aggregate queue。每个包入队后分配独立 token，经过 `switch_delay` 后独立 drain/retry。</p>
+<p>该模型表达的是“包进入 bridge 后的处理延迟和有限缓冲”，不在 ingress 侧重复实现 per-qid 调度。per-qid 调度仍由物理发送队列和 RoCE 端口运行时承担。</p>
+<h4>3.6.2 PFC 分层</h4>
+<p>PFC 当前分为两层：</p>
+<p class='list'>1. bridge / 本地注入层：根据 ingress queue 和 egress queue 水位触发 pause/resume。</p>
+<p class='list'>2. 物理口 / RoCE 运行时层：`PointToPointNetDevice` 更新 `QueuePauseState`，`RdmaPortEngine` 感知 qid pause/resume，并阻止或恢复对应 qid 的发送准入。</p>
+<p>本地注入场景下，bridge 通过 `FlowIo::PauseNodeQueue(...)` 和 `ResumeNodeQueue(...)` 控制本地软件发送队列。非本地 ingress 场景下，bridge 构造 `PauseHeader` 向上游物理口回发 pause/resume。</p>
+<h4>3.6.3 PPP 子队列与 Round-Robin</h4>
+<p>`PppRoundRobinQueue` 是物理口发送队列。当前默认 DATA 分类按目的 MAC hash 后对 `NumQueues` 取模，出队时跨非空、非暂停子队列 round-robin。</p>
+<p>该机制能表达多队列发送，但也带来一个关键风险：如果多个 flow 因目的 MAC 规律和队列数取模碰撞落入同一 qid，则 RR 只能看到一个非空子队列，实际退化为该 qid 内 FIFO。128 GPU AllToAll 实验已经暴露该问题。</p>
+<h3>3.7 拓扑与端点模型实现</h3>
+<h4>3.7.1 内置拓扑</h4>
+<p>当前支持 FatTree、Clos、FullMesh、Torus 和历史 HPN/test 分支。正式实验主要使用 FatTree、Clos 和 external topology。</p>
+<p>FatTree 中 `topology.k` 表示 k-ary FatTree 参数。Clos 中 `topology.k` 表示 leaf 数，`hostperleaf` 表示每个 leaf 下挂的 host/server 位置数。</p>
+<p>服务器内 GPU 子网由 `subnet_model` 和 `subnet_k` 表达：</p>
+<table><tr><th>`subnet_model`</th><th>含义</th></tr><tr><td>0</td><td>无服务器内网</td></tr><tr><td>1</td><td>NVSwitch</td></tr><tr><td>2</td><td>GPU FullMesh</td></tr><tr><td>3</td><td>GPU Torus</td></tr></table>
+<h4>3.7.2 GPU 端点双 bridge</h4>
+<p>当前 GPU 端点统一支持：</p>
+<pre><code>GPU node
+  -&gt; innerBridge
+  -&gt; optional externalBridge</code></pre>
+<p>`innerBridge` 表达 GPU 内部高带宽域，`externalBridge` 表达 GPU 面向后端网络的外部出入口。endpoint MAC 统一取 `innerBridge` 的 MAC。</p>
+<p>外侧 bridge 不是普通 transit bridge，而是端点外部出入口和学习载体。`TerminalLearningOnly` 允许外侧 bridge 学习必要 MAC 信息，但不承担普通 transit 转发。</p>
+<p>该设计为未来多 rail、多口端点和更复杂的内外网组合保留扩展空间。</p>
+<h4>3.7.3 External topology v1</h4>
+<p>External topology v1 使用行式文本边列表：</p>
+<pre><code>N M
+K
+Q0 P0
+...
+V
+Q0 P0
+...</code></pre>
+<p>含义如下：</p>
+<p class='list'>1. `N`：GPU 数量。</p>
+<p class='list'>2. `M`：交换机数量。</p>
+<p class='list'>3. `K`：外网链路数量。</p>
+<p class='list'>4. 后续 `K` 行：外网 normal_link。</p>
+<p class='list'>5. `V`：内网链路数量。</p>
+<p class='list'>6. 后续 `V` 行：内网 nvlink。</p>
+<p>编号规则：</p>
+<pre><code>GPU:    0, 1, ..., N-1
+Switch: N, N+1, ..., N+M-1</code></pre>
+<p>外网允许 GPU-Switch、Switch-GPU、Switch-Switch，不允许 GPU-GPU。内网只允许 GPU-GPU。</p>
+<p>External v1 不支持每条链路单独速率/延迟，不自动计算图直径，也不自动推导 `max_jump`。因此 external 实验需要用户显式检查 `network.max_jump` 和 ACK timeout 是否覆盖实际路径。</p>
+<h3>3.8 MAC 表与路径选择实现</h3>
+<p>MAC 表相关配置位于 `mactable`：</p>
+<pre><code>&quot;mactable&quot;: {
+  &quot;load_enable&quot;: false,
+  &quot;dump_enable&quot;: false,
+  &quot;computed_enable&quot;: true,
+  &quot;dir&quot;: &quot;mactable&quot;
+}</code></pre>
+<p>三种方式的含义：</p>
+<p class='list'>1. `load_enable`：从已有目录加载 MAC 表，减少 warmup/flood 成本。</p>
+<p class='list'>2. `dump_enable`：在 flood 学习后导出 MAC 表，供后续实验复用。</p>
+<p class='list'>3. `computed_enable`：使用计算式 MAC 表能力。当前只支持 FatTree + `subnet_model=2`，且不能与 load/dump 同时启用。</p>
+<p>ECMP 由 `network.ecmpmodel` 控制：</p>
+<table><tr><th>值</th><th>含义</th></tr><tr><td>0</td><td>随机转发</td></tr><tr><td>1</td><td>按包哈希</td></tr><tr><td>2</td><td>按流哈希</td></tr><tr><td>3</td><td>DATA 逐流喷洒</td></tr><tr><td>4</td><td>AllToAll / FatTree 专项拆分</td></tr></table>
+<p>其中 4 是当前代码中存在的专项实验模式，不是通用 ECMP 策略。普通实验应优先使用 0..3，并根据 workload 和拓扑确认其路径分布。</p>
+<h3>3.9 日志与诊断体系实现</h3>
+<p>日志体系分为以下层次：</p>
+<p class='list'>1. 主程序日志：`network drained`、`last FLOW_TX_DONE`、`total send count`、`total events`。</p>
+<p class='list'>2. Flow 事务日志：`TriggerSendTo_now`、`REQ_DONE`、`RX_DONE`、`TX_DONE`。</p>
+<p class='list'>3. RoCE 传输日志：`ROCE CFG`、`ROCE ACTIVE`、ACK、RTO、RTX、乱序处理、SQ/RQ/CQ。</p>
+<p class='list'>4. Bridge/PFC 日志：`NO_PATH`、terminal drop、PFC pause/resume、bridge drop summary。</p>
+<p class='list'>5. ECMP 日志：路径选择、candidate ports、selected outPort、flow tuple。</p>
+<p>这些日志可以用于回答三类问题：</p>
+<p class='list'>1. 上层是否下发了 flow。</p>
+<p class='list'>2. RoCE 路径是否激活并完成事务闭环。</p>
+<p class='list'>3. 慢尾部来自传输恢复、PFC、路径选择、队列分类，还是 workload 依赖图。</p>
+<h3>3.10 当前模型边界</h3>
+<p>当前模型可称为服务网络仿真的 `RC-like` RoCE 近似模型，不能称为完整现实 RoCEv2/RNIC 模型。</p>
+<p>已经具备的网络行为包括：</p>
+<p class='list'>1. QP / PSN / 有序接收。</p>
+<p class='list'>2. 每 QP 未确认窗口。</p>
+<p class='list'>3. 传输层 ACK。</p>
+<p class='list'>4. 超时、重传和恢复状态。</p>
+<p class='list'>5. 有界乱序缓存。</p>
+<p class='list'>6. 感知 PFC pause 的端口准入。</p>
+<p class='list'>7. 绑定在物理端口上的报文级运行时。</p>
+<p>仍保留的主要简化包括：</p>
+<p class='list'>1. 不是完整 verbs 级 QP 生命周期。</p>
+<p class='list'>2. 没有完整 PD/MR/SRQ 资源模型。</p>
+<p class='list'>3. RQ 不是完整 posted receive + RNR 语义。</p>
+<p class='list'>4. CQ 不是上层唯一完成驱动。</p>
+<p class='list'>5. 主路径不是现实常见 RoCEv2 over UDP/IP。</p>
+<p class='list'>6. 没有完整 ECN/CNP/DCQCN 拥塞控制闭环。</p>
+<p class='list'>7. 多 rail striping 和多端口 QP 绑定仍未进入主逻辑。</p>
+<h2>4. 仿真实验</h2>
+<p>本章重点记录第三阶段实现后的主要验证实验和结论。实验数据来自当前工作区已有日志、阶段内验证记录和 `src/min-hop-mac-learning/doc/` 下已整理的现象说明。</p>
+<h3>4.1 实验环境与公共配置</h3>
+<h4>4.1.1 运行环境</h4>
+<p>项目运行入口：</p>
+<pre><code>time ./ns3 run my_AstraSimNetwork.cc --command-template &quot;mpirun -np 1 %s&quot;</code></pre>
+<p>如需指定配置文件：</p>
+<pre><code>time ./ns3 run &quot;my_AstraSimNetwork.cc --network_conf=simconfig/your_config.json&quot; --command-template &quot;mpirun -np 1 %s&quot;</code></pre>
+<p>主要配置文件：</p>
+<pre><code>simconfig/config.json</code></pre>
+<p>主要日志目录：</p>
+<pre><code>simlog/</code></pre>
+<h4>4.1.2 公共 RoCE 配置</h4>
+<p>当前 128 GPU RoCE 相关实验使用的关键配置包括：</p>
+<table><tr><th>配置项</th><th>示例值</th></tr><tr><td>`roce.enable`</td><td>`true`</td></tr><tr><td>`roce.mode`</td><td>`rc_3phase`</td></tr><tr><td>`roce.data_use_write`</td><td>`true`</td></tr><tr><td>`roce.sq_depth`</td><td>`1024`</td></tr><tr><td>`roce.rq_depth`</td><td>`1024`</td></tr><tr><td>`roce.transport_ack_enable`</td><td>`true`</td></tr><tr><td>`roce.transport_window_packets`</td><td>`500000`</td></tr><tr><td>`roce.reorder_window_packets`</td><td>`400000`</td></tr><tr><td>`roce.ack_timeout_mode`</td><td>`auto`</td></tr><tr><td>`roce.ack_timeout_factor`</td><td>`10000.0`</td></tr><tr><td>`roce.max_retransmissions`</td><td>`8`</td></tr><tr><td>`roce.ether_type`</td><td>`0x9999`</td></tr></table>
+<p>其中 `transport_window_packets`、`reorder_window_packets` 和 `ack_timeout_factor` 是偏保守的实验设置，目的是在队列和路径分析时减少超时/重传对结果的干扰，不应直接作为所有实验的推荐默认值。</p>
+<h4>4.1.3 观察指标</h4>
+<p>主要观察指标如下：</p>
+<p class='list'>1. `ROCE_ACTIVE` 数量：确认 RoCE 运行时是否在目标节点上激活。</p>
+<p class='list'>2. `FLOW_REQ_DONE / FLOW_RX_DONE / FLOW_TX_DONE` 数量：确认业务事务是否形成闭环。</p>
+<p class='list'>3. `network drained`：网络侧最后一次活动时间。</p>
+<p class='list'>4. `last FLOW_TX_DONE`：最后一个业务事务闭环时间。</p>
+<p class='list'>5. `RTO / RTX / REORDER_OVERFLOW / SQ_FULL / RQ_FULL / NO_PATH / DROP`：用于判断异常来源。</p>
+<p class='list'>6. `RX_DONE / TX_DONE spread`：用于判断尾部完成时间差异。</p>
+<h3>4.2 RoCE 主路径闭环验证实验</h3>
+<h4>4.2.1 实验目的</h4>
+<p>本实验验证第三阶段 RoCE 主路径是否能够完成从 Astra-Sim 下发 flow 到 RoCE 端口运行时、再回到三阶段业务闭环的完整流程。</p>
+<p>重点验证：</p>
+<p class='list'>1. RoCE 配置能被正确读取。</p>
+<p class='list'>2. 128 个 GPU 节点的 RoCE 运行时能激活。</p>
+<p class='list'>3. `REQUEST/DATA/ACT` 事务能完成闭环。</p>
+<p class='list'>4. ACK、乱序处理和重传机制没有在正常路径中异常触发。</p>
+<p class='list'>5. 主程序能输出网络侧和业务侧收尾时间。</p>
+<h4>4.2.2 实验设置</h4>
+<p>实验日志：</p>
+<pre><code>simlog/128_test.log</code></pre>
+<p>workload：</p>
+<pre><code>simworkload/128_test.txt</code></pre>
+<p>workload 头部声明：</p>
+<pre><code>all_gpus: 128</code></pre>
+<p>workload 中包含：</p>
+<p class='list'>1. `ALLREDUCE 524288`</p>
+<p class='list'>2. `ALLTOALL_EP 3276800`</p>
+<p>拓扑配置：</p>
+<table><tr><th>配置项</th><th>值</th></tr><tr><td>`topology.model`</td><td>`fattree`</td></tr><tr><td>`topology.k`</td><td>`4`</td></tr><tr><td>`topology.subnet_model`</td><td>`2`</td></tr><tr><td>`topology.subnet_k`</td><td>`8`</td></tr><tr><td>`network.mtu`</td><td>`4096`</td></tr><tr><td>`network.normallink_rate`</td><td>`224Gbps`</td></tr><tr><td>`network.nvlink_rate`</td><td>`2400Gbps`</td></tr><tr><td>`roce.enable`</td><td>`true`</td></tr></table>
+<h4>4.2.3 实验结果</h4>
+<p>从 `simlog/128_test.log` 中提取的关键结果如下：</p>
+<table><tr><th>指标</th><th>结果</th></tr><tr><td>`ROCE_ACTIVE`</td><td>`128`</td></tr><tr><td>`FLOW_REQ_DONE`</td><td>`896`</td></tr><tr><td>`FLOW_RX_DONE`</td><td>`896`</td></tr><tr><td>`FLOW_TX_DONE`</td><td>`896`</td></tr><tr><td>`RTO`</td><td>`0`</td></tr><tr><td>`RTX`</td><td>`0`</td></tr><tr><td>`REORDER_OVERFLOW`</td><td>`0`</td></tr><tr><td>`SQ_FULL`</td><td>`0`</td></tr><tr><td>`RQ_FULL`</td><td>`0`</td></tr><tr><td>`NO_PATH`</td><td>`0`</td></tr><tr><td>`DROP`</td><td>`0`</td></tr><tr><td>`network drained since_workload_start`</td><td>`21.556 us`</td></tr><tr><td>`last FLOW_TX_DONE since_workload_start`</td><td>`21.014 us`</td></tr><tr><td>`total send count`</td><td>`896`</td></tr><tr><td>`total events`</td><td>`1,973,875`</td></tr></table>
+<p>`FLOW_RX_DONE` 的时间范围约为 `3.034 us` 到 `20.447 us`，spread 约 `17.413 us`。`FLOW_TX_DONE` 的时间范围约为 `4.062 us` 到 `21.003 us`，spread 约 `16.941 us`。</p>
+<h4>4.2.4 实验分析</h4>
+<p>该实验说明：</p>
+<p class='list'>1. RoCE 运行时在 128 个 GPU 节点上均被激活，配置解析和端口初始化路径正常。</p>
+<p class='list'>2. `REQ_DONE/RX_DONE/TX_DONE` 数量一致，说明三阶段事务形成完整闭环。</p>
+<p class='list'>3. `RTO/RTX/REORDER_OVERFLOW/SQ_FULL/RQ_FULL/NO_PATH/DROP` 均为 0，说明该实验没有被重传、乱序窗口溢出、队列资源不足或路径缺失干扰。</p>
+<p class='list'>4. `network drained` 晚于 `last FLOW_TX_DONE` 约 `0.542 us`，符合“网络侧最后活动时间”和“业务事务闭环时间”两个口径存在差异的预期。</p>
+<p class='list'>5. 实验验证了第三阶段 RoCE 主路径已经能够稳定承接上层 workload，并通过端口侧 QP 运行状态完成网络传输。</p>
+<h3>4.3 128 GPU AllToAll 队列分类影响实验</h3>
+<h4>4.3.1 实验目的</h4>
+<p>本实验用于分析 PPP 子队列分类方式对 128 GPU AllToAll 尾部完成时间的影响。</p>
+<p>问题来源是：当前 `PppRoundRobinQueue` 默认按目的 MAC hash 将 DATA 包分配到子队列。如果目的 MAC 地址规律与 `drop_tail_queue_num` 取模发生结构性碰撞，多个目的 flow 会进入同一子队列，round-robin 只能在队列间轮询，无法在同一子队列内部提供逐流公平。</p>
+<h4>4.3.2 实验设置</h4>
+<p>实验对象：</p>
+<pre><code>simworkload/128_test.txt</code></pre>
+<p>关键变量：</p>
+<pre><code>pfc.drop_tail_queue_num</code></pre>
+<p>对比设置包括阶段内记录的 16 队列旧结果和 13 队列结果。二者保持 workload 与主要网络配置一致，只改变 PPP 子队列数量，用于观察子队列分类碰撞对尾部完成时间的影响。</p>
+<h4>4.3.3 实验结果</h4>
+<p>阶段内记录的对比结果如下：</p>
+<table><tr><th>指标</th><th>16 队列旧结果</th><th>13 队列结果</th></tr><tr><td>`network drained`</td><td>`18.491 us`</td><td>`12.108 us`</td></tr><tr><td>`last FLOW_TX_DONE`</td><td>`17.949 us`</td><td>`11.566 us`</td></tr><tr><td>`RX_DONE` 全局 spread</td><td>`14.364 us`</td><td>`0.952 us`</td></tr><tr><td>`TX_DONE` 全局 spread</td><td>`13.596 us`</td><td>`0.829 us`</td></tr><tr><td>每个 dst 的 `RX_DONE` spread 平均值</td><td>`4.150 us`</td><td>`0.256 us`</td></tr><tr><td>每个 dst 的 `TX_DONE` spread 平均值</td><td>`4.067 us`</td><td>`0.224 us`</td></tr></table>
+<p>此外，当前工作区的专项诊断日志 `simlog/128_random_test.log` 显示：</p>
+<table><tr><th>指标</th><th>结果</th></tr><tr><td>`ROCE_ACTIVE`</td><td>`128`</td></tr><tr><td>`FLOW_REQ_DONE`</td><td>`3378`</td></tr><tr><td>`FLOW_RX_DONE`</td><td>`3362`</td></tr><tr><td>`FLOW_TX_DONE`</td><td>`3362`</td></tr><tr><td>`RTO`</td><td>`0`</td></tr><tr><td>`RTX`</td><td>`0`</td></tr><tr><td>`REORDER_OVERFLOW`</td><td>`0`</td></tr><tr><td>`SQ_FULL`</td><td>`0`</td></tr><tr><td>`RQ_FULL`</td><td>`0`</td></tr><tr><td>`NO_PATH`</td><td>`0`</td></tr><tr><td>`DROP`</td><td>`36`</td></tr><tr><td>`network drained since_workload_start`</td><td>`48.265 us`</td></tr><tr><td>`last FLOW_TX_DONE since_workload_start`</td><td>`48.151 us`</td></tr></table>
+<p>该日志使用了当前工作区的专项配置，包括 `ecmpmodel=4` 和 `drop_tail_queue_num=17`。由于出现了 bridge drop summary，该日志更适合作为专项诊断材料，而不作为基础正确性基线。</p>
+<h4>4.3.4 实验分析</h4>
+<p>对比结果表明：</p>
+<p class='list'>1. 上层 DATA 触发节奏不是主要差异来源。阶段内排查确认，改变队列数并不会改变上层 DATA 触发范围。</p>
+<p class='list'>2. 16 队列下，目的 MAC 地址规律与 `%16` 形成别名碰撞，使多个目的 flow 落入同一 PPP 子队列。</p>
+<p class='list'>3. 当多个 flow 进入同一 qid 时，PPP RR 在队列间仍然轮询，但同一 qid 内部退化为 FIFO，因此尾部流被显著拉长。</p>
+<p class='list'>4. 13 队列打破了这一特定别名碰撞，使全局 spread 和每目的 spread 显著下降。</p>
+<p class='list'>5. 队列数本身不是长期机制。`13` 或 `17` 只能看作特定 workload 下的 workaround，不应作为通用算法。</p>
+<p>该实验给出的核心结论是：后续应优先改进 qid classifier，而不是继续手工调队列数量。短期可行方案是新增 flow-aware qid classifier，使 DATA 包分类至少包含 `ThreePHeader(src,dst,tag)`，并保证 `RdmaPortEngine::ClassifyQueueId_()` 与 `PppRoundRobinQueue::CalculateQueueIndex()` 使用一致逻辑。</p>
+<h3>4.4 External topology 功能验证实验</h3>
+<h4>4.4.1 实验目的</h4>
+<p>本实验验证 external topology v1 能否通过文本边列表构建 GPU、交换机、外网链路和内网链路，并保持 Astra-Sim workload、MAC 学习和 flow 事务路径可用。</p>
+<p>重点验证：</p>
+<p class='list'>1. `.topo` 文件能够正确解析 GPU 数、交换机数、外网边和内网边。</p>
+<p class='list'>2. 每个 GPU 能创建标准 `innerBridge + externalBridge` 端点。</p>
+<p class='list'>3. 外网 GPU 端口加入 external bridge，交换机端口加入 switch bridge。</p>
+<p class='list'>4. 内网 GPU-GPU 链路加入 inner bridge。</p>
+<p class='list'>5. workload 下发后，flow 事务能够完成。</p>
+<h4>4.4.2 实验设置</h4>
+<p>实验日志：</p>
+<pre><code>simlog/external-fattree-k4-gpu4-fullmesh.log</code></pre>
+<p>拓扑文件：</p>
+<pre><code>simtopo/external-fattree-k4-gpu4-fullmesh.topo</code></pre>
+<p>workload：</p>
+<pre><code>simworkload/microAllReduce64_external_fattree.txt</code></pre>
+<p>workload 头部声明：</p>
+<pre><code>all_gpus: 64</code></pre>
+<p>workload 内容为 64 GPU external FatTree + 4-GPU fullmesh 子网下的 micro AllReduce。</p>
+<h4>4.4.3 实验结果</h4>
+<p>从 `simlog/external-fattree-k4-gpu4-fullmesh.log` 中提取的关键结果如下：</p>
+<table><tr><th>指标</th><th>结果</th></tr><tr><td>`FLOW_REQ_DONE`</td><td>`1208`</td></tr><tr><td>`FLOW_RX_DONE`</td><td>`1181`</td></tr><tr><td>`FLOW_TX_DONE`</td><td>`1181`</td></tr><tr><td>`RTO`</td><td>`0`</td></tr><tr><td>`RTX`</td><td>`0`</td></tr><tr><td>`REORDER_OVERFLOW`</td><td>`0`</td></tr><tr><td>`SQ_FULL`</td><td>`0`</td></tr><tr><td>`RQ_FULL`</td><td>`0`</td></tr><tr><td>`NO_PATH`</td><td>`0`</td></tr><tr><td>`DROP`</td><td>`0`</td></tr><tr><td>`RX_DONE` spread</td><td>约 `6612.917 us`</td></tr><tr><td>`TX_DONE` spread</td><td>约 `6613.258 us`</td></tr></table>
+<h4>4.4.4 实验分析</h4>
+<p>实验结果说明：</p>
+<p class='list'>1. external topology 构建出的 64 GPU 拓扑能够承接 Astra-Sim workload。</p>
+<p class='list'>2. 日志中没有 `NO_PATH` 和 `DROP`，说明在该实验配置下，MAC 学习和路径解析没有出现明显失败。</p>
+<p class='list'>3. `FLOW_RX_DONE` 与 `FLOW_TX_DONE` 数量一致，说明已经收齐 DATA 的 flow 都完成了发送侧业务闭环。</p>
+<p class='list'>4. `REQ_DONE` 数量高于 `RX_DONE/TX_DONE`，需要结合 workload 分阶段控制流理解，不能简单用三者一一对应判断错误。</p>
+<p class='list'>5. 该实验主要验证 external topology 的构建和 flow 路径可用性，不作为 RoCE 传输正确性基线。</p>
+<p>External topology 当前仍有边界：v1 文件不表达每链路速率、延迟、plane/rail/pod 层级，也不自动计算 `max_jump`。因此在更复杂外部拓扑下，仍需手工检查 `network.max_jump`、warmup 时间和 ACK timeout。</p>
+<h3>4.5 现实匹配性与日志诊断分析</h3>
+<h4>4.5.1 RoCE 现实匹配性分析</h4>
+<p>根据代码路径和实验日志，当前实现已经具备下列现实 RoCE 网络行为的近似：</p>
+<p class='list'>1. QP、PSN 和接收侧期望序号。</p>
+<p class='list'>2. 每 QP 未确认窗口。</p>
+<p class='list'>3. 累积 ACK。</p>
+<p class='list'>4. 超时、重传和恢复状态。</p>
+<p class='list'>5. 有界乱序缓存。</p>
+<p class='list'>6. 感知 PFC pause 的端口准入。</p>
+<p class='list'>7. 绑定物理端口的报文运行时。</p>
+<p>这些机制使当前模型不再是“只有 RoCE 名字的业务旁路”，而是具备实际传输约束的 `RC-like` 模型。</p>
+<p>但仍不能把当前模型称为完整现实 RoCEv2。主要差距包括：</p>
+<p class='list'>1. 当前主路径使用自定义二层 EtherType，不是 RoCEv2 over UDP/IP。</p>
+<p class='list'>2. 没有 ECN mark、CNP 回传和 DCQCN rate adaptation。</p>
+<p class='list'>3. RQ 不是完整 posted receive / RNR 语义。</p>
+<p class='list'>4. CQ 还不是上层唯一完成驱动。</p>
+<p class='list'>5. QP bringup 被自动压缩。</p>
+<p class='list'>6. 多 rail striping 尚未进入主逻辑。</p>
+<p>因此，对外表述应为：当前版本是面向网络行为仿真的 `PFC-aware RC-like RoCE` 近似模型。</p>
+<h4>4.5.2 日志诊断分析</h4>
+<p>第三阶段形成了较完整的日志诊断流程：</p>
+<p class='list'>1. 先看 `TriggerSendTo_now`，确认上层是否下发 flow。</p>
+<p class='list'>2. 再看 `[ROCE][ACTIVE]`，确认 RoCE 运行时是否激活。</p>
+<p class='list'>3. 再看 `REQ_DONE/RX_DONE/TX_DONE`，确认业务事务是否闭环。</p>
+<p class='list'>4. 若闭环慢，看 `RTO/RTX/REORDER_OVERFLOW`，判断是否是传输层恢复过程。</p>
+<p class='list'>5. 若没有重传但尾部慢，看 `drop_tail_queue_num`、qid 分类和 `RX_DONE/TX_DONE` spread。</p>
+<p class='list'>6. 若出现路径问题，看 `NO_PATH`、MAC 表 load/dump/computed、External topology 的 `max_jump`。</p>
+<p class='list'>7. 若出现 pause 或队列问题，看 PFC 日志、bridge queue 和 per-qid inflight。</p>
+<p>这一诊断流程已经在 AllToAll 队列分类问题中发挥作用：排查过程不是停留在“前驱流慢”这类表面现象，而是定位到目的 MAC hash 与队列数量之间的结构性碰撞。</p>
+<h3>4.6 综合分析与小结</h3>
+<p>第三阶段实验和排查结果表明：</p>
+<p class='list'>1. RoCE 主路径已经具备完整闭环能力，128 GPU 实验中可以完成 896 条 flow 事务，并且没有 RTO、RTX、DROP、NO_PATH、SQ/RQ full 等异常。</p>
+<p class='list'>2. RoCE 运行时已经成功下沉到物理端口侧，QP/SQ/RQ/CQ、ACK、重传、乱序处理和感知 PFC pause 的端口准入均有明确实现位置。</p>
+<p class='list'>3. PPP 子队列分类是当前影响 AllToAll 尾部的重要因素。目的 MAC hash 在特定队列数下会发生结构性碰撞，导致 RR 退化。</p>
+<p class='list'>4. External topology v1 已经能够支撑外部拓扑构建和 flow 路径验证，但仍需要人工设置 `max_jump` 等参数。</p>
+<p class='list'>5. 当前模型适合作为网络行为仿真的 `RC-like` RoCE 近似模型；若要对标现实大规模 RoCEv2 部署，还需要继续补充 ECN/CNP/DCQCN、RoCEv2 外层、flow-aware 队列分类和多 rail striping。</p>
+<p>后续工作建议优先级如下：</p>
+<p class='list'>1. 实现可配置 flow-aware qid classifier，解决 PPP 子队列分类退化问题。</p>
+<p class='list'>2. 保持 `RdmaPortEngine` 与 `PppRoundRobinQueue` 的 qid 分类一致，避免 admission/pause 与实际入队队列不一致。</p>
+<p class='list'>3. 完善 external topology v2，支持注释、每链路参数、图直径推导和拓扑合理性检查。</p>
+<p class='list'>4. 在 RoCE 主路径稳定后，再评估是否引入 RoCEv2/UDP/IP、ECN/CNP/DCQCN。</p>
+<p class='list'>5. 建立 smoke、medium、large、stress 分层实验集，支撑万卡/十万卡规模前的逐级验证。</p></body></html>

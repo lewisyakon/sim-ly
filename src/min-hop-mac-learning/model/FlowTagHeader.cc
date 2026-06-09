@@ -25,10 +25,10 @@ FlowTagHeader::GetSerializedSize() const
   // version(1) + nvls(1) + pad(2)
   // + 7 * int32 (channel..receiver, tag_id)
   // + flow_size (8)
+  // + packetnum(8)
   // + vec_len (4)
   // 变长区：tree_flow_list.size() * 4
-  // + packetnum(4)
-  uint32_t base = 1 + 1 + 2 + 4u*7 + 8 + 4 + 4;
+  uint32_t base = 1 + 1 + 2 + 4u*7 + 8 + 8 + 4;
   return base + static_cast<uint32_t>(4 * tree_flow_list.size());
 }
 
@@ -49,7 +49,7 @@ FlowTagHeader::Serialize(Buffer::Iterator i) const
   i.WriteHtonU32(static_cast<uint32_t>(receiver_node));
   i.WriteHtonU64(static_cast<uint64_t>(flow_size));
   i.WriteHtonU32(static_cast<uint32_t>(tag_id));
-  i.WriteHtonU32(static_cast<uint32_t>(packetnum));
+  i.WriteHtonU64(packetnum);
 
   // 变长列表：先写长度，再写每个元素
   i.WriteHtonU32(static_cast<uint32_t>(tree_flow_list.size()));
@@ -73,7 +73,7 @@ FlowTagHeader::Deserialize(Buffer::Iterator i)
   receiver_node   = static_cast<int32_t>(i.ReadNtohU32());
   flow_size       = i.ReadNtohU64();
   tag_id          = static_cast<int32_t>(i.ReadNtohU32());
-  packetnum       = static_cast<uint32_t>(i.ReadNtohU32());
+  packetnum       = i.ReadNtohU64();
 
   uint32_t n = i.ReadNtohU32();
   tree_flow_list.clear();
@@ -145,11 +145,11 @@ FlowTagHeader::ToFlowTag(AstraSim::ncclFlowTag& t) const
   t.pQps = nullptr; // 由上层通过键（tag/channel/...）重建
 }
 void
-FlowTagHeader::set_packetnum(uint32_t num){
+FlowTagHeader::set_packetnum(uint64_t num){
   packetnum=num;
 }
-uint32_t
-FlowTagHeader::get_packetnum(){
+uint64_t
+FlowTagHeader::get_packetnum() const{
   return packetnum;
 }
 

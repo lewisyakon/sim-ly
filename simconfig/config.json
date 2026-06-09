@@ -39,10 +39,10 @@
   },
 
   "mactable": {
-    "load_enable": true,
+    "load_enable": false,
     "dump_enable": false,
-    "computed_enable": false,
-    "dir": "mactable/topo-fattree_k-8_subnet-0_subnetk-1_gpusper-1_nvsper-1-python"
+    "computed_enable": true,
+    "dir": "mactable"
   },
 
   "pfc": {
@@ -56,9 +56,9 @@
   "topology": {
     "model": "fattree",
     "file": "simtopo/external-fattree-k4-gpu4-fullmesh.topo",
-    "k": 8,
-    "subnet_model": 0,              
-    "subnet_k": 1,                             
+    "k": 4,
+    "subnet_model": 2,
+    "subnet_k": 8,
     "hostperleaf": 2,                            
     "switch_delay_ns_override": 100 
   },

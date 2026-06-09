@@ -56,7 +56,7 @@ struct task1 {
   double schTime; 
 };
 map<std::pair<int, int>, int64_t> nodeHash;
-extern uint32_t numHosts,gpus_per_server,Topology_model;
+extern uint32_t numHosts,numGPUs,gpus_per_server,Topology_model;
 
 
 ns3::FlowSendMode check_out_or_iner(int src,int dst){//0表示在外部，1表示内部,3表示显示制定nvswitch,4表示无条件送原地址,5表示送本地交换机
@@ -68,7 +68,7 @@ ns3::FlowSendMode check_out_or_iner(int src,int dst){//0表示在外部，1表�
   if (src < 0 || dst < 0) return FlowSendMode::External;//疑似错误源目，无条件外送
   const uint32_t srcRank = static_cast<uint32_t>(src);
   const uint32_t dstRank = static_cast<uint32_t>(dst);
-  if (srcRank>numHosts or dstRank>numHosts) return FlowSendMode::External;//疑似错误源目，无条件外送
+  if (srcRank>=numGPUs or dstRank>=numGPUs) return FlowSendMode::External;//疑似错误源目，无条件外送
   else if (srcRank/gpus_per_server == dstRank/gpus_per_server) return FlowSendMode::Internal;
        else return FlowSendMode::External;
 }

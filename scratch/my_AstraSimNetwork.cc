@@ -734,7 +734,7 @@ int main(int argc, char *argv[]) {
       systems[j ]->nvswitch_id = node2nvswitch[j];
       systems[j ]->num_gpus = nodes_num - nvswitch_num;
       if (overlayCfg.enable) {
-        overlayInjectors[j] =
+          overlayInjectors[j] =
             new AstraSim::OverlayCollectiveInjector(systems[j], overlayCfg);
       }
     }
@@ -784,10 +784,6 @@ int main(int argc, char *argv[]) {
   std::cout << "simulator run " << std::endl;
   Simulator::Stop(Seconds(2000000000));
   Simulator::Run(); 
-  if (mactable_computed_enable)
-  {
-    MinHopBridgeNetDevice::PrintComputedMacTableDebugSummary(true);
-  }
 
   uint64_t eventCount = Simulator::GetEventCount();
   const uint64_t lastNetworkActivityTimeFs = GetLastNetworkActivityTimeFs();

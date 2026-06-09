@@ -78,7 +78,6 @@ class MinHopBridgeNetDevice : public NetDevice
     void PrintLearnedState() const;
     void Print_LocalMacAddress() const;
     static void PrintFloodWindowSummary(bool printToStdout = false);
-    static void PrintComputedMacTableDebugSummary(bool printToStdout = false);
     
     void AddEntry(Mac48Address mac, const std::vector<uint32_t>& ports);
     void set_ecmp_model(int model);
@@ -222,7 +221,6 @@ class MinHopBridgeNetDevice : public NetDevice
 
     bool Learn(Mac48Address source, Ptr<NetDevice> port, uint8_t hopCount);
     std::vector<Ptr<NetDevice>> GetLearnedState(Mac48Address source);
-    std::vector<Ptr<NetDevice>> GetLearnedStateForForwarding(Mac48Address source);
     std::vector<Ptr<NetDevice>> GetComputedFatTreeLearnedState(Mac48Address dst) const;
     Ptr<NetDevice> ecmp(std::vector<Ptr<NetDevice> > outports,
                         Mac48Address src,

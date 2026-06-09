@@ -46,20 +46,6 @@ struct FloodWindowSummary
 FloodWindowSummary g_floodWindowSummary;
 std::mutex g_floodWindowSummaryMutex;
 
-struct ComputedMacTableDebugCounters
-{
-    uint64_t computedRuleForwardHits = 0;
-    uint64_t learnedTableForwardHits = 0;
-    uint64_t unknownUnicastFloodFallbacks = 0;
-    uint64_t explicitBroadcastFloods = 0;
-    uint64_t threePhaseUnsafeFloodDrops = 0;
-    uint64_t computedRuleLookupHits = 0;
-    uint64_t computedRuleLookupMisses = 0;
-};
-
-ComputedMacTableDebugCounters g_computedMacTableDebugCounters;
-std::mutex g_computedMacTableDebugMutex;
-
 void
 RecordFloodWindowTouch()
 {
@@ -116,86 +102,6 @@ TryPrintFloodWindowSummaryOnce(bool printToStdout)
     }
 }
 
-void
-PrintComputedMacTableDebugSummaryImpl(bool printToStdout)
-{
-    ComputedMacTableDebugCounters snapshot;
-    {
-        std::lock_guard<std::mutex> guard(g_computedMacTableDebugMutex);
-        snapshot = g_computedMacTableDebugCounters;
-    }
-
-    std::ostringstream oss;
-    oss << "[MACTABLE][COMPUTED][DEBUG]"
-        << " computed_rule_forward_hits=" << snapshot.computedRuleForwardHits
-        << " learned_table_forward_hits=" << snapshot.learnedTableForwardHits
-        << " unknown_unicast_flood_fallbacks=" << snapshot.unknownUnicastFloodFallbacks
-        << " explicit_broadcast_floods=" << snapshot.explicitBroadcastFloods
-        << " three_phase_unsafe_flood_drops=" << snapshot.threePhaseUnsafeFloodDrops
-        << " computed_rule_lookup_hits=" << snapshot.computedRuleLookupHits
-        << " computed_rule_lookup_misses=" << snapshot.computedRuleLookupMisses;
-    NS_LOG_UNCOND(oss.str());
-    if (printToStdout)
-    {
-        std::cout << oss.str() << std::endl;
-    }
-}
-
-void
-RecordComputedMacTableCounter(void (*increment)(ComputedMacTableDebugCounters&))
-{
-    std::lock_guard<std::mutex> guard(g_computedMacTableDebugMutex);
-    increment(g_computedMacTableDebugCounters);
-}
-
-void
-RecordComputedRuleForwardHit()
-{
-    RecordComputedMacTableCounter(
-        [](ComputedMacTableDebugCounters& counters) { ++counters.computedRuleForwardHits; });
-}
-
-void
-RecordLearnedTableForwardHit()
-{
-    RecordComputedMacTableCounter(
-        [](ComputedMacTableDebugCounters& counters) { ++counters.learnedTableForwardHits; });
-}
-
-void
-RecordUnknownUnicastFloodFallback()
-{
-    RecordComputedMacTableCounter(
-        [](ComputedMacTableDebugCounters& counters) { ++counters.unknownUnicastFloodFallbacks; });
-}
-
-void
-RecordExplicitBroadcastFlood()
-{
-    RecordComputedMacTableCounter(
-        [](ComputedMacTableDebugCounters& counters) { ++counters.explicitBroadcastFloods; });
-}
-
-void
-RecordThreePhaseUnsafeFloodDrop()
-{
-    RecordComputedMacTableCounter(
-        [](ComputedMacTableDebugCounters& counters) { ++counters.threePhaseUnsafeFloodDrops; });
-}
-
-void
-RecordComputedRuleLookupHit()
-{
-    RecordComputedMacTableCounter(
-        [](ComputedMacTableDebugCounters& counters) { ++counters.computedRuleLookupHits; });
-}
-
-void
-RecordComputedRuleLookupMiss()
-{
-    RecordComputedMacTableCounter(
-        [](ComputedMacTableDebugCounters& counters) { ++counters.computedRuleLookupMisses; });
-}
 
 uint32_t
 StableMix32(uint32_t value)
@@ -213,12 +119,6 @@ void
 MinHopBridgeNetDevice::PrintFloodWindowSummary(bool printToStdout)
 {
     TryPrintFloodWindowSummaryOnce(printToStdout);
-}
-
-void
-MinHopBridgeNetDevice::PrintComputedMacTableDebugSummary(bool printToStdout)
-{
-    PrintComputedMacTableDebugSummaryImpl(printToStdout);
 }
 
 TypeId
@@ -1168,6 +1068,10 @@ MinHopBridgeNetDevice::SetComputedFatTreeMacTableContext(uint32_t k,
     m_computedGpusPerServer = gpusPerServer;
     m_computedMacTableKind = kind;
     m_computedBridgeIndex = index;
+    if (m_computedMacTableEnabled)
+    {
+        m_enableLearning = false;
+    }
 }
 
 void
@@ -1645,7 +1549,7 @@ MinHopBridgeNetDevice::ForwardUnicast(Ptr<NetDevice> incomingPort,
     //              << ", protocol=" << protocol << ", src=" << src << ", dst=" << dst << ")");
 
     const bool localInjection = (incomingPort == nullptr);
-    std::vector<Ptr<NetDevice> > outPort = GetLearnedStateForForwarding(dst);
+    std::vector<Ptr<NetDevice> > outPort = GetLearnedState(dst);
     // for(auto p:outPort)
     // {
     //     in_to_out[p].insert(src);
@@ -1717,7 +1621,6 @@ MinHopBridgeNetDevice::ForwardUnicast(Ptr<NetDevice> incomingPort,
     }
     else
     {
-        RecordUnknownUnicastFloodFallback();
         RecordFloodWindowTouch();
 
         Ptr<Packet> threePhaseProbe = packet->Copy();
@@ -1789,7 +1692,6 @@ MinHopBridgeNetDevice::ForwardUnicast(Ptr<NetDevice> incomingPort,
                                   << " TIME=" << Simulator::Now().GetFemtoSeconds());
                 }
                 ++sUnknownThreePhaseUnsafeDropLogCount;
-                RecordThreePhaseUnsafeFloodDrop();
                 ++m_forwardSendFailDrops;
                 return;
             }
@@ -1840,7 +1742,6 @@ MinHopBridgeNetDevice::ForwardBroadcast(Ptr<NetDevice> incomingPort,
 {
     NS_LOG_FUNCTION_NOARGS();
     const bool localInjection = (incomingPort == nullptr);
-    RecordExplicitBroadcastFlood();
     RecordFloodWindowTouch();
 
     Ptr<Packet> floodedPacket = packet->Copy();
@@ -2158,30 +2059,6 @@ MinHopBridgeNetDevice::GetLearnedState(Mac48Address source)
         }
     }
     return resultPorts;
-}
-
-std::vector<Ptr<NetDevice>>
-MinHopBridgeNetDevice::GetLearnedStateForForwarding(Mac48Address source)
-{
-    std::vector<Ptr<NetDevice>> computedPorts = GetComputedFatTreeLearnedState(source);
-    if (!computedPorts.empty())
-    {
-        RecordComputedRuleForwardHit();
-        RecordComputedRuleLookupHit();
-        return computedPorts;
-    }
-
-    if (m_computedMacTableEnabled)
-    {
-        RecordComputedRuleLookupMiss();
-    }
-
-    std::vector<Ptr<NetDevice>> learnedPorts = GetLearnedState(source);
-    if (!learnedPorts.empty())
-    {
-        RecordLearnedTableForwardHit();
-    }
-    return learnedPorts;
 }
 
 std::vector<Ptr<NetDevice>>

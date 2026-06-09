@@ -31,6 +31,7 @@ extern FlowPhyRdma flow_rdma;
 
 namespace AstraSim {
 std::atomic<bool> NcclTreeFlowModel::g_flow_inCriticalSection(false);
+
 NcclTreeFlowModel::NcclTreeFlowModel(
     ComType type,
     int id,
